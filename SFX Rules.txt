@@ -1,0 +1,181 @@
+MoviePrompterAI uses lower-case parentheses ( ) exclusively for SFX.
+
+---
+
+1. SFX FORMAT RULE (MANDATORY)
+
+Any text inside parentheses ( ) MUST:
+- Be lower-case only
+- Use underscore-separated tokens
+- Match the approved SFX Whitelist
+- Represent an audible sound
+
+Parentheses must NEVER contain:
+- Character names
+- Locations
+- Dialogue
+- Narrative phrases
+- Emotions or mood
+
+---
+
+2. CASE DISTINCTION RULE
+
+- Characters: Capitalized Proper Names (HENRY KANE)
+- Locations: Underlined (_Metro Hall_)
+- Objects: Bracketed [console]
+- Actions: Asterisked *grab*
+- SFX: Lower-case parentheses (metal_clang)
+
+Case is semantically meaningful and must be preserved.
+
+---
+
+3. NO IDENTITY CREATION RULE
+
+SFX:
+- Do NOT create characters
+- Do NOT create objects
+- Do NOT create vehicles
+- Do NOT create environments
+
+SFX only annotate sound.
+
+---
+
+4. VALIDATION PASS (REQUIRED)
+
+After scene generation:
+- Scan all parentheses
+- Reject any entry that is:
+  - Capitalized
+  - Multi-word prose
+  - Not in the SFX Whitelist
+- Replace invalid entries or remove them
+
+---
+
+EXPECTED RESULT:
+
+- Zero SFX/character collisions
+- Clean parsing
+- Deterministic audio timelines
+- Screenplay-style scene output
+
+1. HUMAN / PHYSICAL SFX
+(footsteps)
+(running_footsteps)
+(breathing)
+(heavy_breathing)
+(grunt)
+(gasp)
+(cough)
+(scream)
+(shout)
+(whisper)
+(laugh)
+(cry)
+(panting)
+(struggle)
+(body_fall)
+(impact_body)
+
+2. OBJECT / PROP SFX
+(metal_clang)
+(metal_scrape)
+(wood_creak)
+(chair_scrape)
+(door_open)
+(door_close)
+(door_slam)
+(lock_click)
+(unlock_click)
+(button_press)
+(lever_pull)
+(glass_shatter)
+(object_drop)
+(object_slide)
+(chain_rattle)
+
+3. VEHICLE SFX
+(engine_start)
+(engine_idle)
+(engine_rev)
+(engine_shutdown)
+(engine_roar)
+(engine_whine)
+(engine_fail)
+(thrust_engage)
+(thrust_disengage)
+(landing_gear_deploy)
+(landing_gear_retract)
+(docking_clamp)
+(metal_groan)
+(hull_stress)
+
+4. ENVIRONMENTAL / ATMOSPHERIC SFX
+(rumble)
+(distant_rumble)
+(shake)
+(creaking_structure)
+(wind_howl)
+(air_vent)
+(steam_hiss)
+(alarm)
+(siren)
+(warning_tone)
+(electric_buzz)
+(power_down)
+(power_up)
+(lights_flicker)
+
+5. WEAPONS / COMBAT SFX
+(gunshot)
+(laser_fire)
+(energy_blast)
+(explosion)
+(impact_metal)
+(impact_concrete)
+(ricochet)
+(reload_click)
+(weapon_charge)
+(weapon_overheat)
+
+6. ELECTRONIC / UI SFX
+(beep)
+(double_beep)
+(error_tone)
+(confirmation_tone)
+(scanner_ping)
+(hologram_activate)
+(hologram_deactivate)
+(data_stream)
+(signal_lost)
+(signal_restored)
+
+7. FORBIDDEN INSIDE ( ) ❌
+
+These must never be used as SFX:
+
+(silence)
+(tension)
+(drama)
+(fear)
+(anticipation)
+(relief)
+(music)
+(score)
+(mood)
+(emotion)
+
+Example (Correct)
+(alarm)
+The {Stellar Wanderer} begins to *tremble*.
+(metal_groan)
+HENRY *grabs* the [console].
+(engine_fail)
+
+Example (Incorrect)
+(Meanwhile)
+(Henry)
+(Tension builds)

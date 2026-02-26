@@ -1,0 +1,279 @@
+PRIME DIRECTIVE FOR VIDEO PROMPTS
+
+A video prompt must never redefine identity.
+It may only animate what the first frame already locked.
+
+If identity changes here, continuity is already dead.
+
+STEP 1: REQUIRED INPUTS (HARD DEPENDENCIES)
+
+Cursor must enforce that a video prompt can only be generated if the following already exist:
+
+✅ A first-frame image
+
+✅ Stored identity blocks for all entities
+
+✅ A stored environment block
+
+If any are missing → abort generation.
+
+STEP 2: VIDEO PROMPT IS BUILT FROM FIXED + VARIABLE BLOCKS
+
+Every video prompt must be assembled from five blocks, in this exact order.
+
+Only one block is allowed to vary meaningfully.
+
+VIDEO PROMPT BLOCK STRUCTURE (MANDATORY)
+BLOCK A — VIDEO DECLARATION & CONTINUITY LOCK
+
+This tells Higgsfield how to behave globally.
+
+Cursor must always include:
+
+"A continuous cinematic video clip based on the provided first frame image,
+preserving all visual identity exactly as established,
+no redesigns,
+no substitutions,
+no new entities,"
+
+
+This line is doing heavy psychological work on the model.
+
+BLOCK B — DURATION & SHOT INTEGRITY
+
+This prevents hidden cuts and resets.
+
+Rules:
+
+Duration must be explicit
+
+Shot continuity must be explicit
+
+Cuts must be forbidden unless intentional
+
+Template:
+
+"duration: [X] seconds,
+single uninterrupted shot,
+no scene cuts,
+no temporal jumps,"
+
+BLOCK C — ENVIRONMENT REASSERTION (STATIC CONTEXT)
+
+The environment must be restated to prevent drift.
+
+Rules:
+
+Inject environment block verbatim
+
+No environmental changes unless scripted
+
+Template:
+
+"[ENVIRONMENT_BLOCK],
+environment remains consistent throughout the shot,"
+
+BLOCK D — IDENTITY REINSERTION (IMMUTABLE)
+
+This is non-negotiable.
+
+Rules:
+
+ALL relevant identity blocks must be injected
+
+Verbatim reuse only
+
+No paraphrasing
+
+No omissions
+
+Template:
+
+"featuring
+[IDENTITY_BLOCK_CHARACTER_01],
+[IDENTITY_BLOCK_VEHICLE_01],
+[IDENTITY_BLOCK_OBJECT_01],"
+
+
+Even if an entity barely moves, it must be named.
+
+BLOCK E — ACTION, MOTION & INTENT (THE ONLY FLEXIBLE PART)
+
+This is where story happens — but under restraint.
+
+STEP 3: RULES FOR ACTION & MOTION (CRITICAL)
+
+Cursor must follow these rules when generating motion:
+
+1. Motion must be continuous
+
+No teleporting.
+No instant repositioning.
+
+Bad:
+
+“the car suddenly appears ahead”
+
+Good:
+
+“the car gradually advances forward”
+
+2. Spatial relationships must be explicit
+
+Every action must define:
+
+Relative position
+
+Distance changes
+
+Direction
+
+Example structure:
+
+"maintaining close distance behind,
+moving forward along the same axis,
+remaining centered within the frame"
+
+3. Intent must be stated, not outcomes
+
+Bad:
+
+“successfully overtakes”
+
+Good:
+
+“attempts to overtake by edging toward the center line”
+
+Let Higgsfield try.
+Do not let it decide.
+
+4. No new visual traits allowed
+
+Cursor must block:
+
+New clothing
+
+New damage
+
+New accessories
+
+New lighting sources
+
+Motion ≠ mutation.
+
+STEP 4: CAMERA BEHAVIOR BLOCK (VERY IMPORTANT)
+
+The camera is a silent entity.
+If it is not defined, Higgsfield will improvise — badly.
+
+CAMERA BLOCK TEMPLATE
+
+Cursor must always include:
+
+"camera behavior:
+[position relative to subject],
+[movement type],
+[motion stability],
+[lens feel],
+camera remains locked to subject,
+no perspective jumps"
+
+Examples:
+
+low rear tracking camera
+
+slow lateral pan
+
+handheld with subtle shake
+
+steady gimbal movement
+
+STEP 5: GLOBAL VIDEO CONSTRAINTS
+
+These must be appended to every video prompt.
+
+"photorealistic motion,
+consistent scale,
+natural physics,
+realistic speed perception,
+no visual artifacts,
+no morphing,
+no identity drift"
+
+
+Yes — saying “no morphing” actually helps.
+
+STEP 6: WHAT VIDEO PROMPTS MUST NEVER DO
+
+Cursor must strip or reject:
+
+❌ Re-describing identity
+❌ Introducing new entities
+❌ Sudden lighting changes
+❌ Time jumps
+❌ Dreamlike transitions
+❌ Abstract phrasing
+❌ Metaphorical language
+
+This is engineering, not poetry.
+
+STEP 7: COMPLETE VIDEO PROMPT ASSEMBLY (ABSTRACT TEMPLATE)
+
+Here is the full abstract template Cursor should assemble programmatically:
+
+A continuous cinematic video clip based on the provided first frame image,
+preserving all visual identity exactly as established,
+no redesigns,
+no substitutions,
+no new entities,
+
+duration: [X] seconds,
+single uninterrupted shot,
+no scene cuts,
+no temporal jumps,
+
+[ENVIRONMENT_BLOCK],
+environment remains consistent throughout the shot,
+
+featuring
+[IDENTITY_BLOCKS — verbatim],
+
+[action and motion description with explicit spatial relationships and intent],
+
+camera behavior:
+[defined camera position and movement],
+no perspective jumps,
+
+photorealistic motion,
+consistent scale,
+natural physics,
+realistic speed perception,
+no morphing,
+no identity drift
+
+
+Cursor should treat this as non-negotiable structure.
+
+MENTAL MODEL TO EMBED IN CURSOR
+
+Put this in the system prompt:
+
+“The AI is a continuity supervisor animating a frozen photograph.
+It must move reality forward without changing what reality is.”
+
+FINAL TRUTH (THIS IS IMPORTANT)
+
+The first frame creates reality.
+The video prompt is only allowed to move it.
+
+If your app enforces this separation cleanly:
+
+Higgsfield stops reinventing
+
+Consistency becomes the default
+
+Your storyboard stops fighting the model
+
+You are not prompting a video generator.
+
+You are animating a captured moment without letting it escape.

@@ -1,0 +1,38 @@
+# Virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Build / distribution artifacts
+build/
+dist/
+installer_output/
+*.spec
+
+# Sensitive files (API keys, credentials)
+API KEY.txt
+API KEYS.txt
+config.json
+
+# Debug / log files
+debug_*.log
+debug_*.json
+debug_*.txt
+
+# Test / scratch data
+test.json
+test2.json
+*.zip
+
+# Story files (user data)
+Haunted Hilarity.json
+
+# IDE / OS
+.cursor/
+.vscode/
+*.swp
+Thumbs.db
+Desktop.ini

@@ -1,0 +1,249 @@
+We are enforcing a strict Action Verb Whitelist for MoviePrompterAI.
+
+Action markup (* *):
+- Represents visible, camera-capturable motion or state change
+- Must use ONLY approved verbs
+- Must NOT express internal thoughts or emotions
+
+---
+
+1. ACTION MARKUP RULE (MANDATORY)
+
+Any text inside *asterisks* MUST:
+- Be a single action verb or verb phrase
+- Exist in the approved Action Verb Whitelist
+- Describe something visually observable
+
+If a verb is not on the whitelist:
+→ It MUST NOT be used as action markup.
+
+---
+
+2. ENTITY RELATIONSHIP RULE
+
+Actions:
+- Animate existing entities
+- Do NOT create characters, objects, vehicles, or environments
+
+No identity extraction may be triggered by actions alone.
+
+---
+
+3. REWRITE RULE
+
+If a sentence contains:
+- Internal emotion
+- Mental state
+- Abstract description
+
+Rewrite it into:
+- Physical action
+- Environmental response
+- Or remove it entirely
+
+---
+
+4. VALIDATION PASS (REQUIRED)
+
+After scene generation:
+- Scan all *action* markup
+- Verify every action verb exists in the whitelist
+- If not:
+  - Replace with closest valid action
+  - Or remove markup
+
+---
+
+EXPECTED RESULT:
+
+- All actions are explicit and visual
+- Motion prompts are reliable
+- No emotional or abstract leakage
+- Scene content behaves like a screenplay, not prose
+
+1. CHARACTER ACTIONS (Physical, Visible)
+
+Use when a human character performs the action.
+
+walk
+run
+enter
+exit
+sit
+stand
+lean
+turn
+look
+reach
+grab
+hold
+release
+open
+close
+push
+pull
+pick up
+drop
+throw
+kneel
+rise
+step
+approach
+retreat
+brace
+gesture
+nod
+shake head
+aim
+fire
+strike
+fall
+collide
+crawl
+climb
+jump
+duck
+roll
+
+2. OBJECT ACTIONS (State Change or Interaction Result)
+
+Use when an object changes state due to interaction or force.
+
+open
+close
+lock
+unlock
+activate
+deactivate
+power on
+power off
+light up
+dim
+spark
+crack
+break
+shatter
+slide
+fall
+topple
+spill
+detach
+attach
+vibrate
+collapse
+
+3. VEHICLE ACTIONS (Motion, Control, Status)
+
+Use when a vehicle moves or changes operational state.
+
+start
+stop
+accelerate
+decelerate
+launch
+land
+dock
+undock
+ascend
+descend
+hover
+drift
+bank
+turn
+roll
+engage
+disengage
+power up
+power down
+tremble
+shake
+lurch
+stall
+glide
+cruise
+impact
+explode
+
+4. ENVIRONMENTAL ACTIONS (Set / World Events)
+
+Use when the environment itself changes.
+
+rumble
+collapse
+flood
+ignite
+burn
+smolder
+darken
+brighten
+flicker
+fill with smoke
+clear
+shake
+echo
+seal
+open
+close
+lock down
+power failure
+alarm sounds
+
+5. CAMERA / VISUAL ACTIONS (Optional but Powerful)
+
+These do not affect story canon, only presentation.
+
+pan
+tilt
+zoom
+pull back
+push in
+cut
+fade in
+fade out
+hold
+shake
+track
+reveal
+whip pan
+
+(These should stay optional and clearly separated from story action.)
+
+6. STRICTLY FORBIDDEN AS ACTIONS ❌
+
+These must NEVER appear inside * * action markup.
+
+feel
+think
+realize
+decide
+hope
+fear
+remember
+regret
+sense
+consider
+believe
+wonder
+hesitate (unless rewritten as visible pause)
+
+How Action Markup Must Be Used
+
+Format:
+
+*action verb*
+
+Rules:
+
+One action per markup
+Must come from the whitelist
+Must be visually observable
+Must apply to an existing entity
+
+Example (Correct)
+The {Stellar Wanderer} begins to *tremble*.
+HENRY *grabs* the [console] and *braces*.
+Lights *flicker* across _Cockpit_.
+
+Example (Incorrect)
+HENRY *realizes* something is wrong.
+The ship *feels* unstable.

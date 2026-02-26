@@ -1,0 +1,190 @@
+What your current structure already covers well
+
+Your tiers map very cleanly onto how people actually make AI video content right now.
+
+Short — 3 Acts, 9–15 scenes
+
+This is perfect for:
+
+Social media narratives (TikTok, Reels, Shorts)
+
+Proof-of-concept films
+
+Trailers, teasers, mood pieces
+
+Music-video-style storytelling
+
+Horror vignettes / twist endings
+
+In AI video terms:
+
+9–15 scenes = manageable prompt volume
+
+Keeps render costs sane
+
+Easy to iterate
+
+This tier will probably be your most-used option.
+
+Medium — 3 Acts, 15–24 scenes
+
+This hits the sweet spot for:
+
+YouTube short films
+
+Episodic pilots
+
+Brand films with narrative
+
+Documentary-style recreations
+
+Game / series proof-of-concepts
+
+From an AI generation perspective:
+
+Enough scenes to establish character, escalation, and payoff
+
+Still feasible for solo creators
+
+Ideal for chaptered outputs
+
+This is your “serious creator” tier.
+
+Long — 5 Acts, 30–50 scenes
+
+This is ambitious — and that’s good.
+
+Best for:
+
+Feature-length planning (even if not fully rendered)
+
+Episodic breakdowns
+
+Visual novels
+
+Interactive or branching narratives
+
+Studio-level pre-visualisation
+
+Important reality check:
+
+Very few users will fully render 30–50 AI video scenes
+
+But many will want this for:
+
+Planning
+
+Partial generation
+
+Pitch decks
+
+Story bibles
+
+So this tier works — but it’s more strategic than practical for full video output.
+
+The missing tier: Micro / Atomic storytelling
+
+This is the gap.
+
+You currently don’t serve:
+
+Ads
+
+Loops
+
+One-minute horror
+
+Music visualisers
+
+AI cinematic shots
+
+Single-scene narratives
+
+What users actually want here:
+
+1 Act, 1–5 scenes
+
+Examples:
+
+“One terrifying moment”
+
+“A dream sequence”
+
+“A single dramatic confrontation”
+
+“A looping background story”
+
+“A visual metaphor”
+
+AI video tools thrive on:
+
+Short, punchy, repeatable outputs
+
+Minimal prompt fatigue
+
+Fast iteration
+
+Recommendation:
+
+Add a Micro option:
+
+Micro: 1 Act, 1–5 scenes
+
+This will:
+
+Dramatically widen your audience
+
+Lower friction for first-time users
+
+Be perfect for testing prompts
+
+Serve social media creators directly
+
+One more thing: Length ≠ Structure
+
+Advanced users will eventually want:
+
+Scene count control independent of acts
+
+Or at least preset intent modes, like:
+
+“Short Film”
+
+“Trailer”
+
+“Episodic”
+
+“Montage”
+
+“Looping Visual”
+
+You don’t need this now, but your backend should quietly support it.
+
+Verdict
+Does your current setup cover most uses?
+
+Yes — about 80–85%.
+
+Will adding one more tier future-proof it?
+
+Absolutely.
+
+Ideal final lineup:
+
+Micro: 1 Act, 1–5 scenes
+
+Short: 3 Acts, 9–15 scenes
+
+Medium: 3 Acts, 15–24 scenes
+
+Long: 5 Acts, 30–50 scenes
+
+That lineup matches:
+
+Human attention spans
+
+AI rendering limits
+
+Creator budgets
+
+Platform realities

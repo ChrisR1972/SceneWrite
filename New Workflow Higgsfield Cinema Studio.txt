@@ -1,0 +1,88 @@
+New Workflow: Higgsfield Cinema Studio 2.0 Three-Layer System
+Core Principle
+Higgsfield does not use one prompt to control everything. It runs on three separate prompt layers, each handling a single visual job. Mixing them causes visual drift, identity breaks, and camera jumps. Your app now enforces this separation.
+Layer	What It Controls	Higgsfield Tool
+Keyframe (Hero Frame)	Static scene: shot, lighting, environment, lens, mood	Popcorn
+Identity	Faces, costumes, character traits	Soul ID / Seedream
+Video (Motion)	Camera movement, acting, dialogue, timing	Veo / Sora / Kling
+Step 1: Configure Project Settings
+Open the Story Settings tab and set your project-wide defaults:
+Aspect Ratio — choose from 16:9, 9:16, 1:1, 4:3, 21:9, or the new 2.35:1 Cinema Wide
+Higgsfield Model — the video generation backend for export:
+DoP Standard — general-purpose, high quality
+DoP Preview — faster, for iteration
+Kling 2.1 Pro — best for realistic human motion
+Seedance Pro — best for character animation
+Default Focal Length — 8mm (ultra-wide) to 50mm (portrait), default 35mm
+Identity Lock Strength — how strictly character appearances are enforced (relaxed / standard / strict)
+These settings apply to all segments and are baked into exports.
+Step 2: Write Your Screenplay and Generate Storyboard
+Use the existing screenplay workflow (premise, framework, scene content) and generate storyboard items as before. Each storyboard item now has additional optics fields.
+Step 3: Edit Each Storyboard Item
+Open a storyboard item. The editor is now organised into clear sections:
+Section 1: Scene Setup
+Set the technical parameters for this segment:
+Duration — 1-30 seconds
+Scene Type — action, dialogue, establishing, etc.
+Shot Type — Wide, Medium, Close-Up, Over the Shoulder, Bird's Eye, Dutch Angle, etc.
+Camera Motion — this replaces the old free-text camera notes. Pick a specific Cinema Studio 2.0 verb:
+Static, Slow Dolly In/Out, Orbit, Tracking, Handheld Shake, Crash Zoom, FPV/Drone, Pan Left/Right, Tilt Up/Down, Crane Up/Down, Push In, Pull Out
+Focal Length — 8mm to 50mm (simulates real camera optics)
+Aperture — Shallow Depth of Field, Deep Focus, Cinematic Bokeh, Natural
+Mood — select a preset or type a custom mood (e.g., "Moody and tense", "Warm and hopeful")
+Lighting — select a preset or type custom (e.g., "Golden hour", "Neon-lit", "Backlit silhouette")
+Section 2: Storyline
+Write 2-4 sentences describing what happens in this segment. This is the narrative foundation that drives all three prompt layers.
+Section 3: Dialogue
+Format character dialogue as:
+CHARACTER: "Dialogue text here"
+Multiple characters on separate lines. The system will automatically bind speakers to their image slots in the video prompt.
+Section 4: Image Mapping
+Hero Frame (Required) — upload the starting image for this segment. This is the anchor that Higgsfield animates from.
+End Frame (Optional) — for start-to-end frame precision (Cinema Studio will interpolate between them)
+Image 1 / 2 / 3 — upload reference images for entities (characters, objects, vehicles) and assign each to a screenplay entity via the dropdown
+The validation status will show "Ready for generation" when the hero frame is uploaded and all image slots with uploads have entity assignments.
+Section 5: Prompt Layers (the output)
+Click "Generate All Prompts" to compile all three layers from your scene setup, storyline, and image mapping.
+The result appears in three tabs:
+Tab 1: Keyframe (Hero Frame)
+Static scene description — no motion verbs
+Includes shot type, lighting, environment, lens details, mood
+This prompt generates your hero frame image in Popcorn
+Editable — you can fine-tune it
+Tab 2: Identity (Soul ID)
+Read-only — auto-generated from your entity assignments
+Contains identity locks (which image slot represents which character) and wardrobe overrides
+This keeps faces and clothing stable across frames
+Tab 3: Video (Motion)
+Camera movement, action, dialogue, audio
+Camera verbs like "dolly in", "orbit", "handheld" are encouraged here
+Editable — you can fine-tune it
+Use the Copy buttons on each tab or "Copy All Prompts" to copy everything at once.
+Section 6: Audio (optional)
+Collapsible section for sound design notes: audio intent, free-form notes, and source (generated / post / none).
+Step 4: Export
+Go to File > Export and choose a format:
+Format	Use Case
+Export as JSON	General-purpose storyboard data with all 3 prompt layers
+Export as CSV	Tabular format for spreadsheets
+Export for Higgsfield API	API-ready JSON — each segment has model_id, image_path, keyframe_prompt, identity_prompt, video_prompt, optics, and reference_images
+Export Prompts Only	Plain text with labeled Keyframe / Identity / Video blocks per segment
+The Higgsfield API export produces JSON structured like this per segment:
+{  "segment_number": 1,  "model_id": "higgsfield-ai/dop/standard",  "duration": 5,  "aspect_ratio": "16:9",  "image_path": "path/to/hero-frame.jpg",  "image_url": null,  "keyframe_prompt": "Medium Shot of John standing...",  "identity_prompt": "IDENTITY LOCK:\nImage 1 represents JOHN...",  "video_prompt": "CAMERA: Slow Dolly In.\n\nACTION:\n...",  "reference_images": {    "image_1": {      "entity_name": "JOHN",      "entity_type": "character",      "image_path": "path/to/john.jpg"    }  },  "optics": {    "focal_length_mm": 35,    "aperture_style": "cinematic_bokeh",    "camera_motion": "slow_dolly_in",    "shot_type": "medium"  }}
+Step 5: Use with Higgsfield
+The workflow on the Higgsfield platform side:
+Generate the hero frame — use the Keyframe Prompt with Popcorn to create your starting image (or upload one you've already created)
+Apply identity — use the Identity Prompt with Soul ID / Seedream to lock character appearances
+Animate — use the Video Prompt with your chosen model (DoP, Kling, Seedance) to generate the video clip from the hero frame
+Each segment maps to one API call: POST https://platform.higgsfield.ai/{model_id} with image_url + prompt + duration
+The API client (core/higgsfield_api_client.py) is available for programmatic submission if you want to automate this in the future. It handles the full async lifecycle: submit, poll status, handle webhooks, and cancel requests.
+Key Differences from the Old Workflow
+Before	After
+One monolithic "Master Prompt" mixing everything	Three separate layers (keyframe, identity, video)
+Camera verbs blocked from prompts	Camera verbs required in video layer
+Free-text "Camera Movement" box	Structured dropdown with 16 Cinema Studio presets
+No lens/optics settings	Focal length (8-50mm) + aperture style
+No mood/lighting fields	Dedicated mood and lighting selectors
+Export had text prompts only	Export includes model ID, optics, reference images, API config
+No Higgsfield model selection	Choose DoP, Kling, or Seedance per project

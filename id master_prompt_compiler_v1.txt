@@ -1,0 +1,174 @@
+id: master_prompt_compiler_v1
+goal: >
+  Create a Master Prompt Compiler that assembles all validated
+  storyboard components into a single clean cinematic prompt
+  string ready for direct paste into an AI video generator.
+
+core_requirements:
+
+  - Must read structured storyboard data
+  - Must respect single-shot or multi-shot mode
+  - Must include identity, wardrobe, composition, motion, dialogue, audio
+  - Must inject image bindings clearly
+  - Must remove all internal metadata
+  - Must output ONE continuous formatted prompt
+  - Must prevent drift and duplication
+
+architecture:
+
+  create_module: MasterPromptCompiler
+
+  input:
+    - storyboard_item
+    - story_settings
+    - image_mappings
+    - generation_mode (single_shot | multi_shot_cluster)
+
+  output:
+    - master_prompt_string
+
+process_flow:
+
+  1_validate_inputs:
+    - ensure Environment Start image exists
+    - ensure at least 1 uploaded Image has assigned entities (if required for storyboard item)
+    - ensure dialogue formatting is correct (if required for storyboard item)
+    - ensure SFX formatting is lowercase in parentheses
+    - block generation if validation fails
+
+  2_build_identity_block:
+    - iterate image_mappings
+    - if entity type == character:
+        append:
+          "Image X represents CHARACTER NAME.
+           Maintain identical facial features, body proportions,
+           hairstyle, and skin tone. Do not alter identity."
+    - if entity type == prop or vehicle:
+        append:
+          "Image X represents PROP NAME.
+           Do not reinterpret as a character."
+
+  3_build_wardrobe_block:
+    - for each character in scene:
+        if wardrobe override exists:
+          append wardrobe bullet list
+          append:
+            "This replaces the default outfit for this scene only."
+        else:
+          append:
+            "Wardrobe remains as canonical reference."
+
+  4_build_environment_block:
+    - append:
+        "Environment Start Frame: [description]"
+    - if environment_end exists:
+        append:
+          "Environment End Frame: [description]"
+    - append composition details:
+        - character positioning
+        - prop positioning
+        - depth layering
+        - camera shot type
+    - explicitly exclude camera movement
+
+  5_build_motion_layer:
+
+    if generation_mode == single_shot:
+        append continuous action paragraph
+
+    if generation_mode == multi_shot_cluster:
+        append:
+          "INTERNAL SHOTS:"
+        for each shot:
+            append:
+              "Shot X (duration seconds):"
+              - motion only
+              - escalation beats
+              - no identity restatement
+              - no wardrobe restatement
+
+  6_build_dialogue_block:
+    if dialogue exists:
+        append:
+          "DIALOGUE:"
+        for each dialogue line:
+            append:
+              "Image X (CHARACTER) says:"
+              "\"Exact dialogue from storyboard.\""
+
+  7_build_audio_block:
+    based on story_settings.audio:
+
+      case no_audio:
+        append:
+          "No audio."
+
+      case sfx_only:
+        append:
+          "Sound Effects:"
+          list SFX (lowercase in parentheses)
+          append:
+            "No music."
+
+      case music_only:
+        append:
+          "Music:"
+          describe tone
+          append:
+            "No sound effects."
+
+      case full_audio:
+        append dialogue (already inserted)
+        append SFX list
+        append music description
+
+  8_compile_master_prompt:
+
+    concatenate blocks in strict order:
+
+      IDENTITY LOCK
+      WARDROBE
+      ENVIRONMENT & COMPOSITION
+      MOTION / INTERNAL SHOTS
+      DIALOGUE
+      AUDIO
+
+    ensure:
+      - no duplicate identity blocks
+      - no duplicate wardrobe descriptions
+      - no JSON
+      - no markdown
+      - no internal variable names
+      - no editor-only metadata
+
+  9_output:
+    return master_prompt_string
+
+ui_integration:
+
+  - Add "Generate Master Prompt" button inside storyboard item.
+  - Display output in read-only expandable text area.
+  - Add "Copy to Clipboard" button.
+  - Do not auto-send to generator (user pastes manually).
+
+multi_shot_specific_rules:
+
+  - Identity and wardrobe blocks appear once at cluster start.
+  - Environment appears once at cluster start.
+  - Internal shots contain only motion progression.
+  - Dialogue appears inside relevant shot section if needed.
+  - Audio block applies to full cluster unless explicitly overridden.
+
+final_requirement:
+
+  The Master Prompt must read like a clean cinematic instruction document,
+  not a system dump.
+
+  It must be directly usable by:
+    - Higgsfield
+    - Runway
+    - Pika
+    - Sora-style generators
+    - Any image + prompt video model
+
+  The result must feel authored, not assembled.

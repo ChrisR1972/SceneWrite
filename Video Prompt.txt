@@ -1,0 +1,20 @@
+Video Prompt
+
+Use reference Image 1
+Maintain identical facial features, body proportions, hairstyle, and skin tone.
+
+Wardrobe for this scene:
+- Dark oil-stained mechanic overalls
+- Heavy leather gloves
+- Steel-toe boots
+- Headlamp secured with elastic strap
+This replaces the default outfit for this scene only.
+
+Environment: Interior of the Abandoned Mill.
+Camera: Wide establishing shot.
+Image 1 in foreground
+
+Image 1 adjusts the strap of his headlamp and steps cautiously forward.
+Broken glass crunches under her boots.
+
+Image 1 speaks the following line verbatim, with no paraphrasing or changes: "Let's hope this works" Dialogue constraint: spoken dialogue must match the provided text exactly, no paraphrasing, no substitutions, no additional words

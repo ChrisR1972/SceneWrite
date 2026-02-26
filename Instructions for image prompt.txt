@@ -1,0 +1,300 @@
+THE PRIME DIRECTIVE (hard-code this)
+
+The first frame prompt is responsible for defining identity, not action.
+Action belongs to later storyboard items.
+
+The first frame must:
+
+Lock who / what exists
+
+Lock what they look like
+
+Lock where they are
+
+Lock how they are lit
+
+Lock what they are NOT
+
+It must not:
+
+Advance narrative
+
+Describe motion
+
+Describe outcomes
+
+STEP 1: ENTITY EXTRACTION (from the scene)
+Instruction to Cursor:
+
+From the generated scene text, extract all persistent entities and classify them into four buckets:
+
+CHARACTERS (humans, creatures, humanoids)
+
+VEHICLES (cars, bikes, aircraft, boats)
+
+OBJECTS (weapons, tools, props, key items)
+
+ENVIRONMENT (location, weather, architecture, time of day)
+
+Each extracted entity must receive:
+
+A unique internal ID
+
+A stored identity block
+
+A reference to the first-frame image prompt
+
+STEP 2: BUILD AN IDENTITY BLOCK (GENERAL, THEME-AGNOSTIC)
+Instruction to Cursor:
+
+For every entity, generate an over-specific identity block using the same universal schema, regardless of genre.
+
+This ensures consistency whether it’s:
+
+Horror
+
+Sci-fi
+
+Romance
+
+Crime
+
+Fantasy
+
+Documentary-style realism
+
+UNIVERSAL IDENTITY BLOCK SCHEMA
+
+Cursor must always fill all fields, even if inferred.
+
+A. Classification
+Type / Category
+
+
+Examples:
+
+“adult human male”
+
+“mid-size SUV”
+
+“handheld object”
+
+“interior room”
+
+B. Physical Form & Silhouette
+Overall shape, proportions, posture, size impression
+
+
+Examples:
+
+tall, narrow, compact, bulky, angular, rounded
+
+C. Surface & Material Behavior (CRITICAL)
+Color + texture + how it reacts to light
+
+
+Examples:
+
+matte black absorbing light
+
+brushed silver reflecting highlights
+
+worn leather with soft sheen
+
+D. Key Identifying Features
+Distinct features that define recognition
+
+
+Examples:
+
+facial structure, clothing layers
+
+headlights, wheels, handles
+
+scratches, patterns, seams
+
+E. Negative Constraints (MANDATORY)
+Explicitly state what is NOT present
+
+
+Examples:
+
+no logos
+
+no text
+
+no damage
+
+no accessories
+
+no visible branding
+
+This prevents AI “helpfulness.”
+
+F. Condition & State
+Clean, worn, damaged, pristine, aged, new
+
+G. Style / Era / Design Language
+Modern, outdated, utilitarian, minimalist, ornate, industrial
+
+H. Identity Lock Phrase
+
+Cursor must prefix every block with:
+
+"the same [ENTITY TYPE] with..."
+
+
+This phrase must be reused verbatim forever.
+
+STEP 3: ENVIRONMENT BLOCK (FIRST FRAME ONLY)
+
+The environment is also an entity.
+
+Instruction to Cursor:
+
+Generate an over-specific static environment block that defines:
+
+Geography / setting type
+
+Architecture or natural features
+
+Time of day
+
+Weather
+
+Lighting direction & quality
+
+Cultural or regional cues (if any)
+
+No motion. No action.
+
+ENVIRONMENT BLOCK TEMPLATE
+"a static establishing frame set in [location type],
+with [physical surroundings],
+[time of day],
+[weather],
+[lighting description],
+grounded realistic environment,
+no motion"
+
+STEP 4: FIRST-FRAME PROMPT ASSEMBLY (THIS IS KEY)
+Instruction to Cursor:
+
+The first-frame prompt must always be assembled in this exact order:
+
+FIRST FRAME PROMPT STRUCTURE
+1. Image Intent Declaration
+"A highly detailed cinematic first frame image,"
+
+2. Camera Lock
+"static camera,
+no motion,
+no action,
+no movement,
+stable framing,"
+
+
+This is non-negotiable.
+
+3. Environment Block
+
+(Injected verbatim)
+
+4. Entity Identity Blocks
+
+Insert every identity block for:
+
+Characters
+
+Vehicles
+
+Objects
+
+They must all exist in the frame, even if partially.
+
+5. Spatial Relationships (STATIC ONLY)
+"entities positioned in clear spatial relationship,
+foreground / midground / background defined,
+no overlapping identities"
+
+6. Global Visual Constraints
+"photorealistic detail,
+natural lighting,
+consistent scale,
+realistic textures,
+no stylization,
+no abstraction"
+
+IMPORTANT: WHAT IS NOT ALLOWED IN FIRST FRAME
+
+Cursor must reject or strip:
+
+Verbs implying motion (walking, driving, running)
+
+Emotional beats
+
+Narrative outcomes
+
+Camera movement
+
+Action language
+
+This frame freezes reality so Higgsfield has something solid to hallucinate from.
+
+STEP 5: STORE & REUSE (CONSISTENCY ENGINE)
+Instruction to Cursor:
+
+Once generated:
+
+Store identity blocks in memory
+
+Store environment block for the scene
+
+Reuse identity blocks verbatim in every storyboard item
+
+Never regenerate identity unless explicitly forced by the user
+
+Later storyboard prompts may:
+
+Add motion
+
+Add camera movement
+
+Add intent
+
+But must always inject the same identity blocks.
+
+STEP 6: FAILSAFES (YOU WANT THESE)
+
+Hard rules Cursor must enforce:
+
+❌ Never describe an entity without its identity block
+
+❌ Never paraphrase identity text
+
+❌ Never generate a new identity when one exists
+
+✅ Always include negative constraints
+
+✅ Always anchor Higgsfield to the first-frame image
+
+MENTAL MODEL (PUT THIS IN CURSOR’S SYSTEM PROMPT)
+
+“The AI’s role is not to imagine freely.
+It is to lock identity so imagination cannot drift.”
+
+You are not guiding creativity.
+You are removing degrees of freedom.
+
+FINAL NOTE (THIS IS THE REAL SECRET)
+
+If your app does this correctly:
+
+Higgsfield will behave as if it remembers
+
+Consistency will feel intentional
+
+Drift will become rare instead of constant
+
+You are not fixing Higgsfield.
+You are building a scaffold it cannot escape from.
