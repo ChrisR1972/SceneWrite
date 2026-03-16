@@ -74,8 +74,15 @@ function copyDirRecursive(src, dest) {
   for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
     const srcPath = path.join(src, entry.name);
     const destPath = path.join(dest, entry.name);
-    if (entry.isDirectory()) copyDirRecursive(srcPath, destPath);
-    else fs.copyFileSync(srcPath, destPath);
+    const lstat = fs.lstatSync(srcPath);
+    if (lstat.isSymbolicLink()) {
+      const target = fs.readlinkSync(srcPath);
+      try { fs.symlinkSync(target, destPath); } catch { /* skip if symlink fails */ }
+    } else if (lstat.isDirectory()) {
+      copyDirRecursive(srcPath, destPath);
+    } else {
+      fs.copyFileSync(srcPath, destPath);
+    }
   }
 }
 
