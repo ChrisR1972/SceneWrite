@@ -5,7 +5,7 @@
   "website": "",
   "description": "AI-powered screenplay writing tool with cinematic grammar, storyboard generation, and multi-platform video prompt export",
   "license": "",
-  "icon": "",
+  "icon": "SceneWrite_Logo.ico",
 
   "files": [
     { "source": "./dist/SceneWrite/**", "dest": "{app}" }

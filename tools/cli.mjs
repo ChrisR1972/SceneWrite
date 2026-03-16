@@ -235,9 +235,13 @@ async function buildWindows(project, stagingDir, outputDir, logFn) {
   const hasLicense = pages.includes('license') && !!licenseFile;
   const hasDir = pages.includes('directory') && project.installer?.allowCustomDir !== false;
 
+  const welcomeText = project.installer?.welcomeText || '';
+  const finishText = project.installer?.finishText || '';
+
   const L = [];
   L.push(
     '!include "MUI2.nsh"', '',
+    'ManifestDPIAware true', '',
     `!define PRODUCT_NAME ${nsisString(appName)}`,
     `!define PRODUCT_VERSION ${nsisString(appVersion)}`,
     `!define PRODUCT_PUBLISHER ${nsisString(project.publisher || '')}`,
@@ -253,12 +257,20 @@ async function buildWindows(project, stagingDir, outputDir, logFn) {
   if (project.windows.requireAdmin) L.push('Function .onInit', '  SetShellVarContext all', 'FunctionEnd', '');
 
   for (const page of pages) {
-    if (page === 'welcome') { L.push('!define MUI_WELCOMEPAGE_TITLE "Welcome to ${PRODUCT_NAME} Setup"', '!insertmacro MUI_PAGE_WELCOME', ''); }
+    if (page === 'welcome') {
+      L.push('!define MUI_WELCOMEPAGE_TITLE "Welcome to ${PRODUCT_NAME} Setup"');
+      if (welcomeText) L.push(`!define MUI_WELCOMEPAGE_TEXT ${nsisString(welcomeText)}`);
+      L.push('!insertmacro MUI_PAGE_WELCOME', '');
+    }
     else if (page === 'license' && hasLicense) { L.push(`!insertmacro MUI_PAGE_LICENSE "${path.basename(licenseFile)}"`, ''); }
     else if (page === 'directory' && hasDir) { L.push('!insertmacro MUI_PAGE_DIRECTORY', ''); }
     else if (page === 'components') { L.push('!insertmacro MUI_PAGE_COMPONENTS', ''); }
     else if (page === 'install') { L.push('!insertmacro MUI_PAGE_INSTFILES', ''); }
-    else if (page === 'finish') { L.push('!define MUI_FINISHPAGE_TITLE "Completing ${PRODUCT_NAME} Setup"', '!insertmacro MUI_PAGE_FINISH', ''); }
+    else if (page === 'finish') {
+      L.push('!define MUI_FINISHPAGE_TITLE "Completing ${PRODUCT_NAME} Setup"');
+      if (finishText) L.push(`!define MUI_FINISHPAGE_TEXT ${nsisString(finishText)}`);
+      L.push('!insertmacro MUI_PAGE_FINISH', '');
+    }
   }
   if (project.installer?.createUninstaller) L.push('!insertmacro MUI_UNPAGE_CONFIRM', '!insertmacro MUI_UNPAGE_INSTFILES', '');
 
