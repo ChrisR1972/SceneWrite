@@ -229,7 +229,7 @@ async function buildWindows(project, stagingDir, outputDir, logFn) {
   const appVersion = project.appVersion;
   const executable = project.windows.executable;
   let installDir = project.windows.installDir || '{pf}\\{appName}';
-  installDir = installDir.replace(/\{pf\}/gi, '$PROGRAMFILES').replace(/\{appName\}/g, appName).replace(/\\\\/g, '\\');
+  installDir = installDir.replace(/\{pf\}/gi, '$PROGRAMFILES64').replace(/\{appName\}/g, appName).replace(/\\\\/g, '\\');
   const outFileName = `${sanitizeFilename(appName)}-${sanitizeFilename(appVersion)}-setup.exe`;
   const pages = project.installer?.pages || ['welcome', 'license', 'directory', 'install', 'finish'];
   const hasLicense = pages.includes('license') && !!licenseFile;
