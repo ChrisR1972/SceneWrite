@@ -394,9 +394,32 @@ async function buildMacOS(project, stagingDir, outputDir, logFn) {
       logFn('Cleared quarantine attributes');
     } catch { /* non-fatal */ }
 
+    logFn('Ad-hoc signing app bundle (inside-out)...');
     try {
-      await execFileAsync('codesign', ['--force', '--deep', '-s', '-', appDir]);
-      logFn('Ad-hoc signed app bundle');
+      const { stdout: foundFiles } = await execFileAsync('find', [
+        appDir, '-type', 'f', '(',
+        '-name', '*.dylib', '-o', '-name', '*.so', '-o', '-name', '*.pyd',
+        ')']);
+      const files = foundFiles.trim().split('\n').filter(Boolean);
+
+      for (const f of files) {
+        try { await execFileAsync('codesign', ['--remove-signature', f]); } catch { /* ok */ }
+      }
+      logFn(`Stripped existing signatures from ${files.length} binaries`);
+
+      for (const f of files) {
+        await execFileAsync('codesign', ['--force', '-s', '-', f]);
+      }
+      logFn(`Re-signed ${files.length} binaries`);
+
+      if (fs.existsSync(executablePath)) {
+        try { await execFileAsync('codesign', ['--remove-signature', executablePath]); } catch { /* ok */ }
+        await execFileAsync('codesign', ['--force', '-s', '-', executablePath]);
+        logFn('Signed main executable');
+      }
+
+      await execFileAsync('codesign', ['--force', '-s', '-', appDir]);
+      logFn('Signed app bundle');
     } catch (e) {
       logFn(`Note: Ad-hoc signing failed (${e.message})`);
     }
