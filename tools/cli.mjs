@@ -389,6 +389,18 @@ async function buildMacOS(project, stagingDir, outputDir, logFn) {
   const base = `${sanitizeFilename(appName)}-${project.appVersion}-macos`;
 
   if (process.platform === 'darwin') {
+    try {
+      await execFileAsync('xattr', ['-cr', appDir]);
+      logFn('Cleared quarantine attributes');
+    } catch { /* non-fatal */ }
+
+    try {
+      await execFileAsync('codesign', ['--force', '--deep', '-s', '-', appDir]);
+      logFn('Ad-hoc signed app bundle');
+    } catch (e) {
+      logFn(`Note: Ad-hoc signing failed (${e.message})`);
+    }
+
     const dmgPath = path.join(outputDir, `${base}.dmg`);
     logFn('Creating .dmg with hdiutil...');
 
