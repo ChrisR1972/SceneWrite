@@ -253,8 +253,8 @@ async function buildWindows(project, stagingDir, outputDir, logFn) {
   );
   if (iconFile) L.push(`!define MUI_ICON ${nsisString(path.basename(iconFile))}`, `!define MUI_UNICON ${nsisString(path.basename(iconFile))}`, '');
   if (hasLicense) L.push(`LicenseData ${nsisString(path.basename(licenseFile))}`, '');
-  L.push('!insertmacro MUI_LANGUAGE "English"', '');
-  if (project.windows.requireAdmin) L.push('Function .onInit', '  SetShellVarContext all', 'FunctionEnd', '');
+
+  L.push('!define MUI_ABORTWARNING', '');
 
   for (const page of pages) {
     if (page === 'welcome') {
@@ -273,6 +273,9 @@ async function buildWindows(project, stagingDir, outputDir, logFn) {
     }
   }
   if (project.installer?.createUninstaller) L.push('!insertmacro MUI_UNPAGE_CONFIRM', '!insertmacro MUI_UNPAGE_INSTFILES', '');
+
+  L.push('!insertmacro MUI_LANGUAGE "English"', '');
+  if (project.windows.requireAdmin) L.push('Function .onInit', '  SetShellVarContext all', 'FunctionEnd', '');
 
   L.push('Section "Install"', '  SetOutPath "$INSTDIR"', '  File /r /x "*.nsi" "*.*"', '');
   if (project.installer?.createUninstaller) L.push('  WriteUninstaller "$INSTDIR\\Uninstall.exe"', '');

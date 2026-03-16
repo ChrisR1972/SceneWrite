@@ -51,6 +51,16 @@ for txt in txt_files:
     if os.path.exists(txt):
         datas.append((txt, "."))
 
+# Bundle pyspellchecker dictionary files
+try:
+    import spellchecker as _sc
+    _sc_dir = os.path.dirname(_sc.__file__)
+    _sc_res = os.path.join(_sc_dir, "resources")
+    if os.path.isdir(_sc_res):
+        datas.append((_sc_res, os.path.join("spellchecker", "resources")))
+except ImportError:
+    pass
+
 a = Analysis(
     ["main.py"],
     pathex=[],
