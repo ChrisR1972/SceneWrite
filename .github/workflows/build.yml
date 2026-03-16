@@ -70,6 +70,11 @@ jobs:
         run: pyinstaller --clean --noconfirm screenplay_tool.spec
         shell: bash
 
+      - name: List dist contents (debug)
+        if: matrix.platform == 'macos'
+        run: find dist/SceneWrite -maxdepth 2 -type f | head -60 && echo "---_internal---" && ls -la dist/SceneWrite/_internal/ | head -30
+        shell: bash
+
       - name: Build installer with MPSC CLI
         run: node tools/cli.mjs build SceneWrite.mpsc --platform ${{ matrix.platform }} --output ./installers
 
