@@ -244,7 +244,7 @@ async function buildWindows(project, stagingDir, outputDir, logFn) {
     `!define PRODUCT_WEB_SITE ${nsisString(project.website || '')}`,
     '', 'Name "${PRODUCT_NAME} ${PRODUCT_VERSION}"',
     `OutFile ${nsisString(outFileName)}`,
-    `InstallDir ${nsisString(installDir)}`, '',
+    `InstallDir "${installDir}"`, '',
     project.windows.requireAdmin ? 'RequestExecutionLevel admin' : 'RequestExecutionLevel user', '',
   );
   if (iconFile) L.push(`!define MUI_ICON ${nsisString(path.basename(iconFile))}`, `!define MUI_UNICON ${nsisString(path.basename(iconFile))}`, '');
