@@ -380,6 +380,21 @@ async function buildMacOS(project, stagingDir, outputDir, logFn) {
     logFn('Copied icon to Contents/Resources/');
   }
 
+  const frameworksDir = path.join(contentsDir, 'Frameworks');
+  fs.mkdirSync(frameworksDir, { recursive: true });
+  const internalDir = path.join(macosDir, '_internal');
+  if (fs.existsSync(internalDir)) {
+    for (const name of fs.readdirSync(internalDir)) {
+      if (name === 'Python' || /^libpython3\.\d+.*\.dylib$/.test(name)) {
+        const src = path.join(internalDir, name);
+        const dest = path.join(frameworksDir, name);
+        fs.renameSync(src, dest);
+        fs.symlinkSync(dest, src);
+        logFn(`Moved ${name} to Contents/Frameworks/`);
+      }
+    }
+  }
+
   const executablePath = path.join(macosDir, project.macos.executable);
   if (fs.existsSync(executablePath)) {
     try { fs.chmodSync(executablePath, 0o755); logFn('Set execute permission'); }
