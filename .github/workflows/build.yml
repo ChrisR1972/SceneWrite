@@ -25,7 +25,7 @@ jobs:
         include:
           - os: windows-latest
             platform: windows
-          - os: macos-13
+          - os: macos-26-intel
             platform: macos
           - os: ubuntu-latest
             platform: linux
@@ -72,7 +72,7 @@ jobs:
         run: node tools/cli.mjs build SceneWrite.mpsc --platform ${{ matrix.platform }} --output ./installers
 
       - name: Upload installer artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: scenewrite-${{ matrix.platform }}
           path: ./installers/*
@@ -89,7 +89,7 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Download all build artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v7
         with:
           path: ./release-assets
           merge-multiple: true
