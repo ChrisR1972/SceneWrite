@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox,
     QLineEdit, QPushButton, QLabel, QSpinBox, QComboBox, QCheckBox,
     QMessageBox, QTabWidget, QWidget, QTextEdit, QApplication,
-    QSlider, QSizePolicy
+    QScrollArea, QSlider, QSizePolicy
 )
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont
@@ -44,9 +44,10 @@ class SettingsDialog(QDialog):
         self.setModal(True)
         # Set window size based on which dialog is shown
         if show_tab == "ui":
-            self.resize(450, 350)  # Smaller size for UI Config
+            self.resize(450, 350)
         else:
             self.resize(600, 650)
+        self.setMaximumHeight(750)
         self.init_ui()
         self.load_current_settings()
         
@@ -222,6 +223,38 @@ class SettingsDialog(QDialog):
         video_cap_note.setWordWrap(True)
         video_cap_layout.addRow(video_cap_note)
         parent_layout.addWidget(video_cap_group)
+
+        # Platform API Keys
+        platform_keys_group = QGroupBox("Video Generation Platform API Keys")
+        pk_layout = QFormLayout(platform_keys_group)
+
+        self._platform_key_edits = {}
+        platform_key_entries = [
+            ("higgsfield", "Higgsfield Key", "Higgsfield API key"),
+            ("higgsfield_secret", "Higgsfield Secret", "Higgsfield API key secret"),
+            ("runway", "Runway", "Runway API key"),
+            ("openai_video", "OpenAI (Sora)", "OpenAI API key for Sora video generation"),
+            ("kling", "Kling", "Kling API key"),
+            ("luma", "Luma", "Luma Dream Machine API key"),
+            ("google_veo", "Google (Veo)", "Google API key for Veo"),
+            ("pika", "Pika / fal.ai", "fal.ai API key for Pika"),
+            ("minimax", "Minimax / Hailuo", "Minimax API key"),
+        ]
+        for key_id, label, placeholder in platform_key_entries:
+            edit = QLineEdit()
+            edit.setEchoMode(QLineEdit.EchoMode.Password)
+            edit.setPlaceholderText(placeholder)
+            self._platform_key_edits[key_id] = edit
+            pk_layout.addRow(f"{label}:", edit)
+
+        pk_note = QLabel(
+            "Keys are stored locally in config.json. "
+            "The generation panel auto-loads the key for the selected platform."
+        )
+        pk_note.setWordWrap(True)
+        pk_note.setStyleSheet("color: #888; font-size: 10px;")
+        pk_layout.addRow(pk_note)
+        parent_layout.addWidget(platform_keys_group)
         
         # Help text (dynamic based on provider)
         help_group = QGroupBox("Setup Help")
@@ -253,14 +286,31 @@ class SettingsDialog(QDialog):
         self.update_help_text()
     
     def create_ai_content(self, parent_layout):
-        """Create AI settings content and add directly to parent layout (for AI Config without tabs)."""
-        self._create_ai_widgets(parent_layout)
+        """Create AI settings content wrapped in a scroll area."""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        container = QWidget()
+        inner_layout = QVBoxLayout(container)
+        self._create_ai_widgets(inner_layout)
+        scroll.setWidget(container)
+        parent_layout.addWidget(scroll)
     
     def create_ai_tab(self):
-        """Create the AI settings tab."""
+        """Create the AI settings tab with scroll support."""
         tab = QWidget()
-        layout = QVBoxLayout(tab)
-        self._create_ai_widgets(layout)
+        tab_layout = QVBoxLayout(tab)
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        container = QWidget()
+        inner_layout = QVBoxLayout(container)
+        self._create_ai_widgets(inner_layout)
+        scroll.setWidget(container)
+        tab_layout.addWidget(scroll)
         self.tabs.addTab(tab, "AI Settings")
     
     def _create_ui_widgets(self, parent_layout):
@@ -289,15 +339,25 @@ class SettingsDialog(QDialog):
         # Editor Settings
         editor_group = QGroupBox("Editor Settings")
         editor_layout = QFormLayout(editor_group)
-        
+
         # Auto-save interval
         self.auto_save_spinbox = QSpinBox()
         self.auto_save_spinbox.setRange(60, 3600)
         self.auto_save_spinbox.setValue(300)
         self.auto_save_spinbox.setSuffix(" seconds")
         editor_layout.addRow("Auto-save Interval:", self.auto_save_spinbox)
-        
+
         parent_layout.addWidget(editor_group)
+
+        # Updates
+        updates_group = QGroupBox("Updates")
+        updates_layout = QFormLayout(updates_group)
+
+        self.check_updates_checkbox = QCheckBox("Check for updates automatically on startup")
+        self.check_updates_checkbox.setChecked(True)
+        updates_layout.addRow("", self.check_updates_checkbox)
+
+        parent_layout.addWidget(updates_group)
     
     def create_ui_content(self, parent_layout):
         """Create UI settings content and add directly to parent layout (for UI Config without tabs)."""
@@ -855,6 +915,30 @@ class SettingsDialog(QDialog):
                     actual_tokens = (slider_index + 1) * 2000
                     self.max_tokens_value_label.setText(str(actual_tokens))
         
+        # Platform API keys
+        if hasattr(self, '_platform_key_edits'):
+            pk_map = {
+                "higgsfield": ("higgsfield", "api_key"),
+                "higgsfield_secret": ("higgsfield", "api_key_secret"),
+                "runway": ("runway", "api_key"),
+                "openai_video": ("sora", "api_key"),
+                "kling": ("kling", "api_key"),
+                "luma": ("luma", "api_key"),
+                "google_veo": ("veo", "api_key"),
+                "pika": ("pika", "api_key"),
+                "minimax": ("minimax", "api_key"),
+            }
+            for edit_id, (pid, field) in pk_map.items():
+                edit = self._platform_key_edits.get(edit_id)
+                if not edit:
+                    continue
+                if field == "api_key_secret":
+                    val = config.get_platform_api_secret(pid)
+                else:
+                    val = config.get_platform_api_key(pid)
+                if val:
+                    edit.setText(val)
+
         # UI Settings (only if UI widgets exist)
         if hasattr(self, 'theme_combo'):
             ui_settings = config.get_ui_settings()
@@ -862,6 +946,11 @@ class SettingsDialog(QDialog):
             self.font_size_spinbox.setValue(ui_settings["font_size"])
             self.show_line_numbers_checkbox.setChecked(ui_settings["show_line_numbers"])
             self.auto_save_spinbox.setValue(ui_settings["auto_save_interval"])
+
+        if hasattr(self, 'check_updates_checkbox'):
+            self.check_updates_checkbox.setChecked(
+                config._config_data.get("check_for_updates", True)
+            )
     
     def save_settings(self):
         """Save settings to config."""
@@ -943,6 +1032,29 @@ class SettingsDialog(QDialog):
                     model, temperature, max_tokens, provider, base_url,
                 )
             
+            # Save platform API keys
+            if hasattr(self, '_platform_key_edits'):
+                pk_map = {
+                    "higgsfield": ("higgsfield", "api_key"),
+                    "higgsfield_secret": ("higgsfield", "api_key_secret"),
+                    "runway": ("runway", "api_key"),
+                    "openai_video": ("sora", "api_key"),
+                    "kling": ("kling", "api_key"),
+                    "luma": ("luma", "api_key"),
+                    "google_veo": ("veo", "api_key"),
+                    "pika": ("pika", "api_key"),
+                    "minimax": ("minimax", "api_key"),
+                }
+                for edit_id, (pid, field) in pk_map.items():
+                    edit = self._platform_key_edits.get(edit_id)
+                    if not edit:
+                        continue
+                    val = edit.text().strip()
+                    if field == "api_key_secret":
+                        config.set_platform_api_secret(pid, val)
+                    else:
+                        config.set_platform_api_key(pid, val)
+
             # Save UI settings (only if UI widgets exist)
             if hasattr(self, 'theme_combo'):
                 theme = self.theme_combo.currentText().lower()
@@ -953,6 +1065,10 @@ class SettingsDialog(QDialog):
                 
                 # Apply theme and font size immediately
                 self.apply_ui_settings(theme, font_size)
+
+            if hasattr(self, 'check_updates_checkbox'):
+                config._config_data["check_for_updates"] = self.check_updates_checkbox.isChecked()
+                config._save_config()
             
             self.accept()
             

@@ -1,9 +1,0 @@
-We are going to implement new character rules
-
-Currently the user selects how many main characters there is in the story. This is the number of characters that are given details such as physical appearance, outline and growth arc. We are going to amend the rules for this.
-
-All main characters are mentioned first in the expanded storyline in the wizard. These will include the protagonist, the companions of the protagonist and the antagonist. These will have their character's generated with physical appearance, outline and growth arc.
-
-Other minor characters can be created in the scene generation as the story plays out. These characters will be added to the character tab but only with physical appearance details.
-
-The only except to these rules is when the story length is micro, then only physical appearance details are generated for all characters.  

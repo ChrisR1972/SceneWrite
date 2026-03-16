@@ -78,7 +78,7 @@ class WorkflowProfileManager:
             }
     
     @classmethod
-    def get_framework_structure(cls, profile: WorkflowProfile, length: str) -> Dict[str, Any]:
+    def get_framework_structure(cls, profile: WorkflowProfile, length: str, custom_duration_seconds: int = 0) -> Dict[str, Any]:
         """Get framework structure requirements based on profile and length."""
         if profile == WorkflowProfile.PROMOTIONAL:
             return {
@@ -95,6 +95,16 @@ class WorkflowProfileManager:
                 "characters_optional": True
             }
         else:
+            if length == "custom" and custom_duration_seconds > 0:
+                act_count, scenes_range, spa = cls._derive_custom_structure(custom_duration_seconds)
+                return {
+                    "act_count": act_count,
+                    "scene_type": "narrative_scenes",
+                    "focus": ["plot_progression", "character_development", "story_arcs"],
+                    "characters_optional": False,
+                    "scenes_per_act_range": spa,
+                    "total_scenes_range": scenes_range,
+                }
             length_map = {
                 "micro": {"act_count": 1, "scenes_per_act": "1-5"},
                 "short": {"act_count": 3, "scenes_per_act": "3-5"},
@@ -108,6 +118,19 @@ class WorkflowProfileManager:
                 "focus": ["plot_progression", "character_development", "story_arcs"],
                 "characters_optional": False
             }
+    
+    @staticmethod
+    def _derive_custom_structure(duration_seconds: int):
+        """Derive act count, total scenes range, and scenes-per-act range from a duration."""
+        if duration_seconds <= 60:
+            act_count, total_range, spa = 1, "1-5", "1-5"
+        elif duration_seconds <= 300:
+            act_count, total_range, spa = 3, "6-15", "2-5"
+        elif duration_seconds <= 600:
+            act_count, total_range, spa = 3, "12-25", "4-9"
+        else:
+            act_count, total_range, spa = 5, "20-50", "4-10"
+        return act_count, total_range, spa
     
     @classmethod
     def get_premise_ui_config(cls, profile: WorkflowProfile, intent: str = "") -> Dict[str, Any]:

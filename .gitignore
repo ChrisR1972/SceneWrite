@@ -9,26 +9,43 @@ __pycache__/
 # Build / distribution artifacts
 build/
 dist/
+_obf/
 installer_output/
-*.spec
+mpsc-output/
+installers/
 
 # Sensitive files (API keys, credentials)
 API KEY.txt
 API KEYS.txt
 config.json
+license.dat
+.sw_trial
 
 # Debug / log files
 debug_*.log
 debug_*.json
 debug_*.txt
+debug_crash.log
 
 # Test / scratch data
 test.json
 test2.json
+test_*.py
 *.zip
 
-# Story files (user data)
+# Story files (user data — keep out of source control)
+*.story.json
 Haunted Hilarity.json
+
+# One-off fix scripts
+fix_storyboard_extraction.py
+
+# Node.js (server/)
+server/node_modules/
+
+# PyArmor
+.pyarmor/
+pyarmor_runtime_*/
 
 # IDE / OS
 .cursor/

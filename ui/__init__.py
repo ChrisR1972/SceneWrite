@@ -1,2 +1,2 @@
-"""UI modules for MoviePrompterAI."""
+"""UI modules for SceneWrite."""
 

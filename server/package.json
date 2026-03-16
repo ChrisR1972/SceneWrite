@@ -1,0 +1,13 @@
+{
+  "name": "scenewrite-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "SceneWrite license validation API (Cloudflare Worker)",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.73.0"
+  }
+}

@@ -1,5 +1,5 @@
 @echo off
-echo Building MoviePrompterAI installer...
+echo Building SceneWrite installer...
 echo.
 
 REM First build the executable
@@ -16,12 +16,12 @@ echo ========================================
 echo Executable built successfully!
 echo ========================================
 echo.
-echo The application is ready in: dist\MoviePrompterAI\
+echo The application is ready in: dist\SceneWrite\
 echo.
 echo To distribute the application:
-echo 1. Copy the entire "MoviePrompterAI" folder from the dist folder
+echo 1. Copy the entire "SceneWrite" folder from the dist folder
 echo 2. Zip it and share it with users
-echo 3. Users can extract and run MoviePrompterAI.exe
+echo 3. Users can extract and run SceneWrite.exe
 echo.
 echo For a proper installer, you can use:
 echo - Inno Setup (free, Windows installer creator)

@@ -1,0 +1,134 @@
+<!--
+  Success page for scenewrite.app/success
+  
+  After Stripe Checkout completes, the user is redirected here.
+  The license key is emailed by Stripe (via receipt) and also 
+  available via the Stripe session. This page provides confirmation.
+  
+  This is a standalone HTML snippet you can integrate into your site.
+-->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Purchase Complete — SceneWrite</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #f5f5f5; color: #333;
+      display: flex; justify-content: center; align-items: center;
+      min-height: 100vh; padding: 20px;
+    }
+    .card {
+      background: white; border-radius: 12px;
+      box-shadow: 0 4px 24px rgba(0,0,0,0.1);
+      max-width: 520px; width: 100%; padding: 40px;
+      text-align: center;
+    }
+    .check { font-size: 48px; margin-bottom: 16px; }
+    h1 { font-size: 24px; margin-bottom: 8px; }
+    .subtitle { color: #666; margin-bottom: 24px; }
+    .key-box {
+      background: #f0f4f8; border: 2px dashed #0078d4;
+      border-radius: 8px; padding: 16px; margin: 20px 0;
+      font-family: 'Consolas', 'Courier New', monospace;
+      font-size: 18px; letter-spacing: 1px;
+      color: #0078d4; font-weight: bold;
+      user-select: all; cursor: text;
+    }
+    .key-box.loading { color: #999; font-size: 14px; }
+    .copy-btn {
+      background: #0078d4; color: white; border: none;
+      padding: 10px 24px; border-radius: 6px;
+      font-size: 14px; cursor: pointer;
+      transition: background 0.2s;
+    }
+    .copy-btn:hover { background: #1a8ae8; }
+    .instructions {
+      margin-top: 24px; text-align: left;
+      background: #fafafa; border-radius: 8px;
+      padding: 16px; font-size: 14px; color: #555;
+    }
+    .instructions h3 { margin-bottom: 8px; color: #333; }
+    .instructions ol { padding-left: 20px; }
+    .instructions li { margin-bottom: 6px; }
+    .email-note { margin-top: 16px; font-size: 13px; color: #888; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="check">&#10003;</div>
+    <h1>Thank You!</h1>
+    <p class="subtitle">Your purchase of SceneWrite is complete.</p>
+    
+    <p><strong>Your License Key:</strong></p>
+    <div class="key-box" id="license-key">Retrieving your license key...</div>
+    
+    <button class="copy-btn" onclick="copyKey()">Copy to Clipboard</button>
+    
+    <div class="instructions">
+      <h3>How to activate:</h3>
+      <ol>
+        <li>Open SceneWrite</li>
+        <li>The activation dialog will appear on first launch</li>
+        <li>Paste your license key and click <strong>Activate License</strong></li>
+      </ol>
+    </div>
+    
+    <p class="email-note">
+      A copy of your license key has also been sent to your email.
+    </p>
+  </div>
+
+  <script>
+    // Retrieve the license key from the Cloudflare Worker
+    // The Worker returns the key associated with the Stripe session
+    async function loadKey() {
+      const params = new URLSearchParams(window.location.search);
+      const sessionId = params.get('session_id');
+      
+      if (!sessionId) {
+        document.getElementById('license-key').textContent = 
+          'Check your email for your license key.';
+        document.getElementById('license-key').classList.add('loading');
+        return;
+      }
+      
+      try {
+        const resp = await fetch('https://api.scenewrite.app/api/lookup-session', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_id: sessionId }),
+        });
+        const data = await resp.json();
+        
+        if (data.license_key) {
+          document.getElementById('license-key').textContent = data.license_key;
+        } else {
+          document.getElementById('license-key').textContent = 
+            'Check your email for your license key.';
+          document.getElementById('license-key').classList.add('loading');
+        }
+      } catch {
+        document.getElementById('license-key').textContent = 
+          'Check your email for your license key.';
+        document.getElementById('license-key').classList.add('loading');
+      }
+    }
+    
+    function copyKey() {
+      const keyEl = document.getElementById('license-key');
+      navigator.clipboard.writeText(keyEl.textContent).then(() => {
+        const btn = document.querySelector('.copy-btn');
+        btn.textContent = 'Copied!';
+        setTimeout(() => btn.textContent = 'Copy to Clipboard', 2000);
+      });
+    }
+    
+    loadKey();
+  </script>
+</body>
+</html>

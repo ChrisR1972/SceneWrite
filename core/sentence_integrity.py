@@ -1,5 +1,5 @@
 """
-Sentence Integrity Validator for MoviePrompterAI.
+Sentence Integrity Validator for SceneWrite.
 
 Detects and repairs incomplete/broken sentences caused by AI word-dropping artifacts.
 
@@ -82,10 +82,12 @@ _MISSING_MOTION_VERB = re.compile(
     re.IGNORECASE
 )
 
-# Pattern: verb + "with a" at end of sentence (missing noun)
-# "falls off with a." / "crashes with a."
+# Pattern: verb + "with a" at end of sentence or before comma (missing noun)
+# "falls off with a." / "crashes with a," / "*ignite* with a."
+# Also catches "with a deafening," where an adjective follows but no noun
 _TRAILING_ARTICLE = re.compile(
-    r'\b(with|like|as|into|from|of|for|about)\s+(a|an|the)\s*[.!?]',
+    r'\b(with|like|as|into|from|of|for|about)\s+(a|an|the)\s*[.!?,;]'
+    r'|\b(with|like|as|into|from|of|for|about)\s+(a|an|the)\s+\w+\s*[,;]\s*$',
     re.IGNORECASE
 )
 
@@ -118,6 +120,32 @@ _ADJECTIVE_AS_NOUN = re.compile(
 _NOUN_PREP_GERUND = re.compile(
     r'\b(The|A|An|His|Her|Its|Their)\s+(\w+)\s+'
     r'(before|after|without|while|until|despite)\s+(\w+ing)\b',
+    re.IGNORECASE
+)
+
+# Pattern: quantifier/adjective + noun + preposition with no verb
+# "more stone behind her" (missing *crashes* / *falls*), "another blast beside him"
+_QUANTIFIER_NOUN_NO_VERB = re.compile(
+    r'\b(more|another|several|two|three|four|five|six|fresh|further|additional)\s+'
+    r'(\w+)\s+'
+    r'(behind|beside|around|above|below|across|through|beneath|toward|towards|near|past|over|under)\b',
+    re.IGNORECASE
+)
+
+# Pattern: subject + bare "to" + verb/action-markup with no auxiliary
+# "Smoke to *fill* the air" (missing "begins" / "starts")
+# Does NOT flag proper infinitives like "wants to fill", "tries to fill"
+_BARE_INFINITIVE = re.compile(
+    r'\b([\w\s*]+?)\s+to\s+\*?(\w+)\*?',
+    re.IGNORECASE
+)
+_VALID_INFINITIVE_PRECURSORS = re.compile(
+    r'\b(wants?|tries?|attempts?|begins?|starts?|needs?|seems?|appears?|'
+    r'continues?|refuses?|fails?|manages?|chooses?|decides?|threatens?|'
+    r'struggles?|moves?|rushes?|races?|hurries?|goes?|comes?|is|are|was|were|'
+    r'has|have|had|will|would|shall|should|can|could|may|might|must|'
+    r'about|going|ought|used|supposed|able|likely|unlikely|enough|'
+    r'order|orders?|in order|not)\s+to\b',
     re.IGNORECASE
 )
 
@@ -171,6 +199,8 @@ def detect_sentence_issues(text: str) -> List[SentenceIssue]:
                 _check_compound_missing_verb(sent_stripped, p_idx, s_idx, issues)
                 _check_adjective_as_noun(sent_stripped, p_idx, s_idx, issues)
                 _check_noun_prep_gerund(sent_stripped, p_idx, s_idx, issues)
+                _check_quantifier_noun_no_verb(sent_stripped, p_idx, s_idx, issues)
+                _check_bare_infinitive(sent_stripped, p_idx, s_idx, issues)
     
     return issues
 
@@ -362,6 +392,62 @@ def _check_noun_prep_gerund(sentence: str, p_idx: int, s_idx: int,
             paragraph_idx=p_idx,
             sentence_idx=s_idx
         ))
+
+
+def _check_quantifier_noun_no_verb(sentence: str, p_idx: int, s_idx: int,
+                                    issues: List[SentenceIssue]):
+    """Detect quantifier + noun + preposition with no verb: 'more stone behind her'."""
+    for m in _QUANTIFIER_NOUN_NO_VERB.finditer(sentence):
+        quantifier = m.group(1)
+        noun = m.group(2)
+        prep = m.group(3)
+        between = sentence[m.start():m.end()]
+        if '*' in between:
+            continue
+        if noun.lower().endswith(('ing', 'ed', 'es', 'ly')):
+            continue
+        issues.append(SentenceIssue(
+            sentence=sentence,
+            issue_type="QUANTIFIER_NOUN_NO_VERB",
+            description=f"'{quantifier} {noun}' missing verb before '{prep}' (e.g. *crashes*, *falls*, *tumbles*)",
+            paragraph_idx=p_idx,
+            sentence_idx=s_idx
+        ))
+
+
+def _check_bare_infinitive(sentence: str, p_idx: int, s_idx: int,
+                            issues: List[SentenceIssue]):
+    """Detect subject + bare 'to' + verb missing an auxiliary.
+
+    Catches 'Smoke to *fill* the air' (should be 'Smoke begins to *fill*')
+    but skips legitimate infinitives like 'wants to fill'.
+    """
+    if ' to ' not in sentence.lower():
+        return
+    if _VALID_INFINITIVE_PRECURSORS.search(sentence):
+        return
+    m = _BARE_INFINITIVE.search(sentence)
+    if not m:
+        return
+    prefix = m.group(1).strip()
+    # Only flag if the prefix is a simple subject (noun/noun-phrase) — skip
+    # if prefix already contains a conjugated verb.
+    prefix_words = re.sub(r'\*', '', prefix).split()
+    if not prefix_words:
+        return
+    last_word = prefix_words[-1].lower()
+    # If the word before "to" looks like a conjugated verb, it's probably fine
+    if last_word.endswith(('s', 'ed', 'ing')) and last_word not in (
+        'his', 'hers', 'its', 'this', 'glass', 'brass', 'across',
+    ):
+        return
+    issues.append(SentenceIssue(
+        sentence=sentence,
+        issue_type="BARE_INFINITIVE",
+        description=f"'{prefix} to {m.group(2)}' — missing auxiliary verb (e.g. *begins* to, *starts* to)",
+        paragraph_idx=p_idx,
+        sentence_idx=s_idx
+    ))
 
 
 # ── AI-POWERED REPAIR ────────────────────────────────────────────────────

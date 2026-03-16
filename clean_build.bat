@@ -1,6 +1,6 @@
 @echo off
 echo ========================================
-echo MoviePrompterAI - Clean Script
+echo SceneWrite - Clean Script
 echo ========================================
 echo.
 
@@ -30,6 +30,15 @@ if exist dist (
     )
 ) else (
     echo No dist folder found.
+)
+
+REM Clean obfuscation staging
+if exist _obf (
+    echo Removing obfuscation staging folder...
+    rmdir /s /q _obf
+    echo Obfuscation folder removed.
+) else (
+    echo No obfuscation folder found.
 )
 
 REM Clean PyInstaller cache

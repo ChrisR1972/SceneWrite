@@ -1,4 +1,4 @@
-We are enforcing a strict Action Verb Whitelist for MoviePrompterAI.
+We are enforcing a strict Action Verb Whitelist for SceneWrite.
 
 Action markup (* *):
 - Represents visible, camera-capturable motion or state change

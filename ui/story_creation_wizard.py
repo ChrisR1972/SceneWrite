@@ -1,6 +1,7 @@
 """
-Story Creation Wizard for MoviePrompterAI.
+Story Creation Wizard for SceneWrite.
 Guides users through premise creation, story outline, and framework generation.
+Supports standalone stories, new series creation, and new episode creation.
 """
 
 from PyQt6.QtWidgets import (
@@ -17,6 +18,16 @@ from .wizard_steps.length_intent_step import LengthIntentStepWidget
 from .wizard_steps.premise_step import PremiseStepWidget
 from .wizard_steps.story_outline_step import StoryOutlineStepWidget
 from .wizard_steps.framework_generation_step import FrameworkGenerationStepWidget
+from .wizard_steps.series_mode_step import SeriesModeStepWidget
+
+
+def _safe_print(*args, **kwargs):
+    """Route output through debug_log instead of stdout (hidden in production)."""
+    try:
+        from debug_log import debug_log as _dl
+        _dl(" ".join(str(a) for a in args))
+    except Exception:
+        pass
 
 
 class StoryCreationWizard(QDialog):
@@ -28,18 +39,24 @@ class StoryCreationWizard(QDialog):
         super().__init__(parent)
         self.ai_generator = ai_generator
         self.current_step = 0
-        self.total_steps = 4
+        self.total_steps = 5  # Step 0: series mode + original 4 steps
         
         # Wizard state
         self.premise: str = ""
         self.title: str = ""
         self.genres: List[str] = []
         self.atmosphere: str = ""
-        self.length: str = "medium"  # Story length: micro, short, medium, or long
+        self.length: str = "medium"  # Story length: micro, short, medium, long, or custom
+        self.custom_duration_seconds: int = 0  # Target total duration when length == "custom"
         self.intent: str = "General Story"  # Story intent (Advertisement, Horror Short, etc.)
         self.story_outline: Dict[str, Any] = {}
         self.brand_context = None  # BrandContext for promotional workflows
         self.generated_screenplay: Optional[Screenplay] = None
+        
+        # Series state
+        self.series_mode: str = SeriesModeStepWidget.MODE_STANDALONE
+        self.series_folder: str = ""
+        self.series_bible = None  # SeriesBible instance when in series mode
         
         self.init_ui()
     
@@ -114,16 +131,21 @@ class StoryCreationWizard(QDialog):
         layout.addWidget(progress_label)
         self.progress_label = progress_label
         
-        # Content switcher: Step 1 shows length_intent directly (no scroll); Steps 2-4 use scroll area
+        # Content switcher: compact steps (series mode, length/intent) vs scrollable steps
         from PyQt6.QtWidgets import QSizePolicy
         self.content_stack = QStackedWidget()
         self.content_stack.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred))
         
-        # Page 0: Step 1 - length/intent only, no scroll area
+        # Page 0: Step 0 - series mode selection (no scroll)
+        self.series_mode_step = SeriesModeStepWidget()
+        self.series_mode_step.mode_changed.connect(self.update_navigation)
+        self.content_stack.addWidget(self.series_mode_step)
+        
+        # Page 1: Step 1 - length/intent only, no scroll area
         self.length_intent_step = LengthIntentStepWidget(self.ai_generator)
         self.content_stack.addWidget(self.length_intent_step)
         
-        # Page 1: Steps 2-4 - scroll area with premise, outline, framework
+        # Page 2: Steps 2-4 - scroll area with premise, outline, framework
         self.stacked_widget = QStackedWidget()
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
@@ -179,18 +201,23 @@ class StoryCreationWizard(QDialog):
         self.update_navigation()
     
     def _show_step(self, step_index: int):
-        """Show the widget for the given step (0=length/intent, 1=premise, 2=outline, 3=framework)."""
+        """Show the widget for the given step.
+
+        0=series mode, 1=length/intent, 2=premise, 3=outline, 4=framework
+        """
         if step_index == 0:
-            self.content_stack.setCurrentIndex(0)
+            self.content_stack.setCurrentIndex(0)  # series mode
+        elif step_index == 1:
+            self.content_stack.setCurrentIndex(1)  # length/intent
         else:
-            self.content_stack.setCurrentIndex(1)
-            self.stacked_widget.setCurrentIndex(step_index - 1)
+            self.content_stack.setCurrentIndex(2)  # scroll area
+            self.stacked_widget.setCurrentIndex(step_index - 2)
     
     def _resize_for_step(self, step_index: int):
-        """Resize wizard window: compact for Step 1, full size for Steps 2-4."""
-        if step_index == 0:
+        """Resize wizard window: compact for Steps 0-1, full size for Steps 2-4."""
+        if step_index <= 1:
             self.setMinimumSize(420, 180)
-            self.resize(540, 260)
+            self.resize(540, 320 if step_index == 0 else 260)
         else:
             self.setMinimumSize(self._full_width, self._full_height)
             self.resize(self._full_width, self._full_height)
@@ -218,20 +245,18 @@ class StoryCreationWizard(QDialog):
     def validate_current_step(self) -> bool:
         """Validate the current step before allowing progression."""
         if self.current_step == 0:
-            # Length/intent step
-            return self.length_intent_step.is_valid()
+            return self.series_mode_step.is_valid()
         elif self.current_step == 1:
-            # Premise step
-            return self.premise_step.is_valid()
+            return self.length_intent_step.is_valid()
         elif self.current_step == 2:
-            # Outline step - check if required
+            return self.premise_step.is_valid()
+        elif self.current_step == 3:
             if hasattr(self, 'length') and hasattr(self, 'intent'):
                 workflow_profile = WorkflowProfileManager.get_profile(self.length, self.intent)
                 if not WorkflowProfileManager.requires_story_outline(workflow_profile):
                     return True
             return self.outline_step.is_valid()
-        elif self.current_step == 3:
-            # Framework step
+        elif self.current_step == 4:
             return self.generated_screenplay is not None
         return False
     
@@ -239,7 +264,7 @@ class StoryCreationWizard(QDialog):
         """Navigate to previous step."""
         if self.current_step > 0:
             # When leaving outline step (step 3), push edited premise into premise step
-            if self.current_step == 2:
+            if self.current_step == 3:
                 edited_premise = self.outline_step.premise_text.toPlainText().strip()
                 if edited_premise:
                     self.premise = edited_premise
@@ -256,12 +281,22 @@ class StoryCreationWizard(QDialog):
             return
         
         if self.current_step == 0:
+            # Moving from series mode to length/intent
+            self.series_mode = self.series_mode_step.get_mode()
+            if self.series_mode == SeriesModeStepWidget.MODE_NEW_SERIES:
+                self._init_new_series()
+            elif self.series_mode == SeriesModeStepWidget.MODE_NEW_EPISODE:
+                if not self._init_new_episode():
+                    return
+        
+        elif self.current_step == 1:
             # Moving from length/intent to premise
             self.length = self.length_intent_step.get_length()
+            self.custom_duration_seconds = self.length_intent_step.get_custom_duration_seconds()
             self.intent = self.length_intent_step.get_intent()
             self.premise_step.set_length_intent(self.length, self.intent)
         
-        elif self.current_step == 1:
+        elif self.current_step == 2:
             # Moving from premise to outline
             premise_data = self.premise_step.get_premise_data()
             self.premise = premise_data["premise"]
@@ -287,16 +322,19 @@ class StoryCreationWizard(QDialog):
                 )
             else:
                 self.story_outline = {}
-                self.current_step = 3
-                self._show_step(3)
-                self._resize_for_step(3)
+                self.current_step = 4
+                self._show_step(4)
+                self._resize_for_step(4)
                 self.framework_step.start_generation(
-                    self.premise, self.title, self.genres, self.atmosphere, self.story_outline, self.length, self.intent, self.brand_context
+                    self.premise, self.title, self.genres, self.atmosphere,
+                    self.story_outline, self.length, self.intent, self.brand_context,
+                    series_bible=self.series_bible,
+                    custom_duration_seconds=self.custom_duration_seconds,
                 )
                 self.update_navigation()
                 return
         
-        elif self.current_step == 2:
+        elif self.current_step == 3:
             # Moving from outline to framework generation
             self._proceed_from_outline_to_framework()
             return
@@ -305,6 +343,38 @@ class StoryCreationWizard(QDialog):
         self._show_step(self.current_step)
         self._resize_for_step(self.current_step)
         self.update_navigation()
+    
+    def _init_new_series(self):
+        """Initialize state for creating a new series."""
+        from core.series_manager import SeriesManager
+        title = self.series_mode_step.get_new_series_title()
+        try:
+            self.series_folder, self.series_bible = SeriesManager.create_series(title)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to create series folder:\n{e}")
+            return
+    
+    def _init_new_episode(self) -> bool:
+        """Load bible for a new episode. Returns False on failure."""
+        from core.series_manager import SeriesManager
+        folder = self.series_mode_step.get_selected_series_folder()
+        if not folder:
+            QMessageBox.warning(self, "No Series", "Please select an existing series.")
+            return False
+        try:
+            self.series_bible = SeriesManager.load_series(folder)
+            self.series_folder = folder
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load series:\n{e}")
+            return False
+        # Pre-fill atmosphere from bible
+        if self.series_bible.world_context.get("tone"):
+            self.atmosphere = self.series_bible.world_context["tone"]
+        # Pre-fill custom duration from bible
+        if getattr(self.series_bible, "episode_duration_seconds", 0) > 0:
+            self.custom_duration_seconds = self.series_bible.episode_duration_seconds
+            self.length_intent_step.set_custom_duration(self.series_bible.episode_duration_seconds)
+        return True
     
     def _proceed_from_outline_to_framework(self):
         """Complete transition from outline step to framework generation. Generates missing physical appearances first if needed."""
@@ -321,7 +391,9 @@ class StoryCreationWizard(QDialog):
             self.story_outline = self.outline_step.get_outline_data()
             self.framework_step.start_generation(
                 self.premise, self.title, self.genres, self.atmosphere,
-                self.story_outline, self.length, self.intent, self.brand_context
+                self.story_outline, self.length, self.intent, self.brand_context,
+                series_bible=self.series_bible,
+                custom_duration_seconds=self.custom_duration_seconds,
             )
             self.current_step += 1
             self._show_step(self.current_step)
@@ -432,14 +504,21 @@ class StoryCreationWizard(QDialog):
                 continue
 
             if name.lower() not in cleaned_lower:
-                # Check for confusing word overlap with already-accepted names
-                name_words = set(name.upper().split())
+                # Check for confusing word overlap with already-accepted names.
+                # Exclude common title/honorific words — sharing just "MASTER" is not a collision.
+                _TITLE_EXCL = {"MASTER", "MISTRESS", "CAPTAIN", "DOCTOR", "PROFESSOR",
+                               "GENERAL", "COLONEL", "MAJOR", "LIEUTENANT", "DETECTIVE",
+                               "INSPECTOR", "SHERIFF", "OFFICER", "AGENT", "JUDGE",
+                               "MAYOR", "SENATOR", "GOVERNOR", "KING", "QUEEN", "PRINCE",
+                               "PRINCESS", "LORD", "LADY", "SIR", "FATHER", "MOTHER",
+                               "SISTER", "BROTHER", "ELDER", "CHIEF", "COACH", "RANGER"}
+                name_words = set(name.upper().split()) - _TITLE_EXCL
                 is_overlap = False
                 if len(name_words) >= 2:
                     for accepted in cleaned:
-                        accepted_words = set(accepted.upper().split())
+                        accepted_words = set(accepted.upper().split()) - _TITLE_EXCL
                         if len(name_words & accepted_words) >= 2 and name.upper() != accepted.upper():
-                            print(f"  [registry guard] Skipping '{name}' — overlaps with '{accepted}'")
+                            _safe_print(f"  [registry guard] Skipping '{name}' — overlaps with '{accepted}'")
                             is_overlap = True
                             break
                 if not is_overlap:
@@ -448,8 +527,9 @@ class StoryCreationWizard(QDialog):
 
         screenplay.character_registry = list(dict.fromkeys(cleaned))  # preserve order, dedupe
         screenplay.character_registry_frozen = True
-        # Store length and intent for Premise tab / workflow profile
+        # Store length, intent, and custom duration for Premise tab / workflow profile
         screenplay.story_length = self.length
+        screenplay.custom_duration_seconds = self.custom_duration_seconds
         screenplay.intent = self.intent
         # Store brand context in screenplay
         if self.brand_context:
@@ -480,7 +560,7 @@ class StoryCreationWizard(QDialog):
                     )
                     phys = (result.get("physical_appearance", "") or "").strip()
                 except Exception as e:
-                    print(f"  Warning: could not generate appearance for minor character {display_name}: {e}")
+                    _safe_print(f"  Warning: could not generate appearance for minor character {display_name}: {e}")
                 from core.ai_generator import infer_species_from_text
                 char_context = ""
                 for seg in storyline_text.split(". "):
@@ -497,6 +577,49 @@ class StoryCreationWizard(QDialog):
                 })
                 existing_lower.add(display_name.lower())
             screenplay.story_outline["characters"] = existing_chars
+
+        # --- Apply series metadata if in series mode ---
+        if self.series_mode != SeriesModeStepWidget.MODE_STANDALONE and self.series_bible:
+            from core.series_manager import SeriesManager
+            ep_title = ""
+            if self.series_mode == SeriesModeStepWidget.MODE_NEW_EPISODE:
+                ep_title = self.series_mode_step.get_episode_title() or screenplay.title
+            else:
+                ep_title = screenplay.title
+            ep_num = self.series_bible.get_next_episode_number()
+
+            screenplay.series_metadata = {
+                "series_title": self.series_bible.series_title,
+                "series_folder": self.series_folder,
+                "episode_number": ep_num,
+                "episode_title": ep_title,
+                "episode_premise": self.premise,
+                "episode_summary": "",
+                "episode_story_arc": "",
+                "episode_scene_count": len(screenplay.get_all_scenes()),
+                "episode_status": "draft",
+            }
+            screenplay.title = f"{self.series_bible.series_title} - Episode {ep_num}: {ep_title}"
+
+            # Copy persistent identity blocks from bible
+            SeriesManager._copy_bible_identity_blocks(self.series_bible, screenplay)
+
+            # Persist custom duration in the series bible for future episodes
+            if self.custom_duration_seconds > 0 and getattr(self.series_bible, "episode_duration_seconds", 0) == 0:
+                self.series_bible.episode_duration_seconds = self.custom_duration_seconds
+
+            # Register this episode in the bible
+            self.series_bible.add_episode_record({
+                "episode_number": ep_num,
+                "title": ep_title,
+                "premise": self.premise,
+                "summary": "",
+                "story_arc": "",
+                "scene_count": len(screenplay.get_all_scenes()),
+                "status": "draft",
+                "filename": SeriesManager.build_episode_filename(ep_num, ep_title),
+            })
+            SeriesManager.save_series_bible(self.series_folder, self.series_bible)
 
         self.update_navigation()
     

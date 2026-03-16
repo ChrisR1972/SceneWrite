@@ -1,5 +1,5 @@
 """
-Action Rules for MoviePrompterAI / screenplay action markup.
+Action Rules for SceneWrite / screenplay action markup.
 Enforces strict Action Verb Whitelist for *asterisk* action markup.
 
 CINEMATIC GRAMMAR SYSTEM:
@@ -821,7 +821,7 @@ def enforce_action_grammar(text: str) -> str:
 def get_action_rules_prompt_text() -> str:
     """Return the Action Rules block for inclusion in AI prompts."""
     return """
-ACTION MARKUP RULES (MANDATORY — MoviePrompterAI):
+ACTION MARKUP RULES (MANDATORY — SceneWrite):
 - ALL visible physical movement MUST be wrapped in *asterisks*.
 - This includes: character movement, object interaction, environmental movement, vehicle movement.
 - Use ONLY approved action verbs. One primary action per markup.

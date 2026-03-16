@@ -41,6 +41,7 @@ class PremiseStepWidget(QWidget):
         self.ai_generator = ai_generator
         self.premise_thread: Optional[PremiseGenerationThread] = None
         self.progress_dialog: Optional[QProgressDialog] = None
+        self._rejected_premises: list = []
         self._length = "medium"
         self._intent = "General Story"
         self.init_ui()
@@ -413,6 +414,11 @@ class PremiseStepWidget(QWidget):
                 distribution_platform=distribution_platform,
             )
         
+        # Track the current premise as rejected (if regenerating)
+        current = self.generated_premise_display.toPlainText().strip()
+        if current and current not in self._rejected_premises:
+            self._rejected_premises.append(current)
+
         # Disable button during generation
         self.generate_button.setEnabled(False)
         self.generate_button.setText("Generating...")
@@ -435,13 +441,14 @@ class PremiseStepWidget(QWidget):
             self.premise_thread.terminate()
             self.premise_thread.wait()
         
-        # Create and start generation thread with workflow profile and brand context
+        # Create and start generation thread with workflow profile, brand context, and rejected premises
         self.premise_thread = PremiseGenerationThread(
             self.ai_generator, 
             selected_genres, 
             atmosphere,
             workflow_profile=profile,
-            brand_context=brand_context
+            brand_context=brand_context,
+            rejected_premises=list(self._rejected_premises),
         )
         self.premise_thread.finished.connect(self.on_premise_generated)
         self.premise_thread.error.connect(self.on_premise_error)

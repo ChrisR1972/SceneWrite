@@ -1,0 +1,49 @@
+{
+  "appName": "SceneWrite",
+  "appVersion": "1.0.0",
+  "publisher": "SceneWrite",
+  "website": "",
+  "description": "AI-powered screenplay writing tool with cinematic grammar, storyboard generation, and multi-platform video prompt export",
+  "license": "",
+  "icon": "",
+
+  "files": [
+    { "source": "./dist/SceneWrite/**", "dest": "{app}" }
+  ],
+
+  "windows": {
+    "installDir": "{pf}\\SceneWrite",
+    "createDesktopShortcut": true,
+    "createStartMenuEntry": true,
+    "requireAdmin": true,
+    "executable": "SceneWrite.exe"
+  },
+
+  "macos": {
+    "bundleId": "com.scenewrite.app",
+    "category": "public.app-category.entertainment",
+    "executable": "SceneWrite",
+    "minimumOS": "10.15",
+    "signIdentity": ""
+  },
+
+  "linux": {
+    "installDir": "/opt/SceneWrite",
+    "categories": ["Office", "Utility"],
+    "executable": "SceneWrite",
+    "maintainer": "scenewrite@users.noreply.github.com",
+    "dependencies": ["libgl1", "libegl1", "libxkbcommon0", "libdbus-1-3"],
+    "section": "utils",
+    "priority": "optional"
+  },
+
+  "installer": {
+    "pages": ["welcome", "directory", "install", "finish"],
+    "allowCustomDir": true,
+    "createUninstaller": true,
+    "welcomeText": "Welcome to the SceneWrite Setup Wizard.\n\nThis will install SceneWrite on your computer. SceneWrite is an AI-powered screenplay writing tool with cinematic grammar, storyboard generation, and multi-platform video prompt export.\n\nClick Next to continue.",
+    "finishText": "SceneWrite has been successfully installed.\n\nYour stories are saved in Documents/SceneWrite Stories and your settings are stored separately, so they will survive future updates.\n\nClick Finish to exit the setup wizard.",
+    "preInstallScript": "",
+    "postInstallScript": ""
+  }
+}

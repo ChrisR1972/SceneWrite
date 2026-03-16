@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Fix and improve storyboard extraction from MoviePrompterAI project JSON.
+Fix and improve storyboard extraction from SceneWrite project JSON.
 Processes generated_content and creates proper storyboard items.
 """
 

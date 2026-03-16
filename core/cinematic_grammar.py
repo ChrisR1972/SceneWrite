@@ -1,5 +1,5 @@
 """
-Cinematic Grammar System for MoviePrompterAI.
+Cinematic Grammar System for SceneWrite.
 
 Unified validation pass that enforces:
 - Action markup (*asterisks*) for all physical verbs
@@ -298,7 +298,7 @@ def get_cinematic_grammar_prompt_text() -> str:
     """
     return f"""
 ========================================
-CINEMATIC GRAMMAR SYSTEM (MANDATORY — MoviePrompterAI)
+CINEMATIC GRAMMAR SYSTEM (MANDATORY — SceneWrite)
 ========================================
 
 {get_action_rules_prompt_text().strip()}

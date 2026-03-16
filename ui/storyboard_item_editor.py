@@ -17,6 +17,7 @@ from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QRect, QSize, QPoint
 from PyQt6.QtGui import QFont, QPixmap
 from .image_thumbnail import ClickableImageLabel
 from typing import Optional, Dict, List, Set
+import re
 from core.screenplay_engine import (
     StoryboardItem, SceneType, SHOT_TYPE_OPTIONS,
     CAMERA_MOTION_OPTIONS, APERTURE_STYLE_OPTIONS, FOCAL_LENGTH_RANGE,
@@ -122,10 +123,11 @@ class StoryboardItemEditor(QDialog):
         screen = QApplication.primaryScreen().geometry()
         max_w = int(screen.width() * 0.9)
         max_h = int(screen.height() * 0.9)
-        self.setMinimumWidth(720)
+        self.setMinimumWidth(960)
         self.setMinimumHeight(620)
         self.setMaximumWidth(max_w)
         self.setMaximumHeight(max_h)
+        self.resize(min(1080, max_w), min(max_h, 820))
 
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(10, 10, 10, 10)
@@ -133,7 +135,7 @@ class StoryboardItemEditor(QDialog):
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
         content = QWidget()
@@ -144,8 +146,9 @@ class StoryboardItemEditor(QDialog):
         # --- Section 1: Scene Setup ---
         layout.addWidget(self._build_scene_setup_group())
 
-        # --- Section 2: Storyline & Dialogue ---
+        # --- Section 2: Storyline, Composition & Dialogue ---
         layout.addWidget(self._build_storyline_group())
+        layout.addWidget(self._build_composition_group())
         layout.addWidget(self._build_dialogue_group())
 
         # --- Section 3: Image Mapping ---
@@ -184,11 +187,12 @@ class StoryboardItemEditor(QDialog):
         main_layout.addLayout(btn_layout)
 
         # Tab key moves focus in form fields
-        for w in (self.storyline_edit, self.dialogue_edit):
+        for w in (self.storyline_edit, self.composition_edit, self.dialogue_edit):
             w.setTabChangesFocus(True)
 
         # Spell checking
         enable_spell_checking(self.storyline_edit)
+        enable_spell_checking(self.composition_edit)
         enable_spell_checking(self.dialogue_edit)
 
         self.center_on_screen()
@@ -321,6 +325,32 @@ class StoryboardItemEditor(QDialog):
         layout.addWidget(self.storyline_edit)
         return group
 
+    # ── Composition / Blocking ────────────────────────────────────
+
+    def _build_composition_group(self) -> QGroupBox:
+        group = QGroupBox("Composition / Blocking")
+        layout = QVBoxLayout(group)
+        hint = QLabel(
+            "Entity positions, facing directions, spatial relationships. "
+            "Auto-filled from scene content; edit to refine."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #666; font-size: 9px; padding: 2px;")
+        layout.addWidget(hint)
+        self.composition_edit = QTextEdit()
+        self.composition_edit.setPlaceholderText(
+            "e.g. DETECTIVE VASH camera-left facing right; "
+            "DETECTIVE NOIR camera-right facing left, 3m apart"
+        )
+        self.composition_edit.setMinimumHeight(60)
+        self.composition_edit.setMaximumHeight(70)
+        self.composition_edit.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self.composition_edit.setFont(QFont("Arial", 9))
+        layout.addWidget(self.composition_edit)
+        return group
+
     # ── Dialogue ─────────────────────────────────────────────────
 
     def _build_dialogue_group(self) -> QGroupBox:
@@ -348,119 +378,96 @@ class StoryboardItemEditor(QDialog):
     # ── Image Mapping ────────────────────────────────────────────
 
     def _build_image_mapping_group(self) -> QGroupBox:
-        group = QGroupBox("Image Mapping")
+        group = QGroupBox("Reference Images")
         layout = QVBoxLayout(group)
         layout.setSpacing(6)
 
-        # Hero frame (environment start) + end frame
-        env_grid = QGridLayout()
-        env_grid.setSpacing(6)
+        hint = QLabel(
+            "Images are auto-populated from approved identity blocks. "
+            "Use 'Override Hero Frame' to supply a custom environment image."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #666; font-size: 10px; padding: 2px;")
+        layout.addWidget(hint)
 
-        env_grid.addWidget(QLabel("Hero Frame (Required):"), 0, 0)
-        self.env_start_thumb = ClickableImageLabel(max_short=60, max_long=80)
-        env_grid.addWidget(self.env_start_thumb, 0, 1)
-        self.env_start_btn = QPushButton("Upload")
-        self.env_start_btn.setFixedWidth(70)
-        self.env_start_btn.clicked.connect(lambda: self._upload_env_image("start"))
-        env_grid.addWidget(self.env_start_btn, 0, 2)
-        self.env_start_clear = QPushButton("Clear")
-        self.env_start_clear.setFixedWidth(60)
-        self.env_start_clear.clicked.connect(lambda: self._clear_env_image("start"))
-        env_grid.addWidget(self.env_start_clear, 0, 3)
-        env_grid.addWidget(QLabel("Assign to:"), 0, 4)
-        self.hero_frame_combo = QComboBox()
-        self.hero_frame_combo.setMinimumWidth(180)
-        self.hero_frame_combo.addItem("(Unassigned)", "")
-        self.hero_frame_combo.currentIndexChanged.connect(
-            lambda _idx: self._on_frame_assignment_changed("start"))
-        env_grid.addWidget(self.hero_frame_combo, 0, 5)
+        # ── Entities in Scene (grid) — shown BEFORE hero frame ──
+        entity_header = QLabel("Entities in Scene:")
+        entity_header.setStyleSheet("font-size: 10px; font-weight: bold; padding: 4px 0 0 0;")
+        layout.addWidget(entity_header)
 
-        env_grid.addWidget(QLabel("End Frame (Optional):"), 1, 0)
-        self.env_end_thumb = ClickableImageLabel(max_short=60, max_long=80)
-        env_grid.addWidget(self.env_end_thumb, 1, 1)
-        self.env_end_btn = QPushButton("Upload")
-        self.env_end_btn.setFixedWidth(70)
-        self.env_end_btn.clicked.connect(lambda: self._upload_env_image("end"))
-        env_grid.addWidget(self.env_end_btn, 1, 2)
-        self.env_end_clear = QPushButton("Clear")
-        self.env_end_clear.setFixedWidth(60)
-        self.env_end_clear.clicked.connect(lambda: self._clear_env_image("end"))
-        env_grid.addWidget(self.env_end_clear, 1, 3)
-        env_grid.addWidget(QLabel("Assign to:"), 1, 4)
-        self.end_frame_combo = QComboBox()
-        self.end_frame_combo.setMinimumWidth(180)
-        self.end_frame_combo.addItem("(Unassigned)", "")
-        self.end_frame_combo.currentIndexChanged.connect(
-            lambda _idx: self._on_frame_assignment_changed("end"))
-        env_grid.addWidget(self.end_frame_combo, 1, 5)
-
-        layout.addLayout(env_grid)
-
-        # Entity reference image slots
-        entity_grid = QGridLayout()
-        entity_grid.setSpacing(6)
-        self._image_slot_widgets: Dict[str, dict] = {}
-        for idx, slot in enumerate(("image_1", "image_2", "image_3")):
-            label_text = slot.replace("_", " ").title()
-            entity_grid.addWidget(QLabel(f"{label_text}:"), idx, 0)
-
-            thumb = ClickableImageLabel(max_short=60, max_long=80)
-            entity_grid.addWidget(thumb, idx, 1)
-
-            upload_btn = QPushButton("Upload")
-            upload_btn.setFixedWidth(70)
-            entity_grid.addWidget(upload_btn, idx, 2)
-
-            clear_btn = QPushButton("Clear")
-            clear_btn.setFixedWidth(60)
-            entity_grid.addWidget(clear_btn, idx, 3)
-
-            entity_grid.addWidget(QLabel("Assign to:"), idx, 4)
-            combo = QComboBox()
-            combo.setMinimumWidth(180)
-            combo.addItem("(Unassigned)", "")
-            entity_grid.addWidget(combo, idx, 5)
-
-            self._image_slot_widgets[slot] = {
-                "thumb": thumb, "upload": upload_btn,
-                "clear": clear_btn, "combo": combo,
-            }
-            upload_btn.clicked.connect(
-                lambda checked, s=slot: self._upload_entity_image(s)
-            )
-            clear_btn.clicked.connect(
-                lambda checked, s=slot: self._clear_entity_image(s)
-            )
-            combo.currentIndexChanged.connect(
-                lambda _idx, s=slot: self._on_assignment_changed(s)
-            )
-
-        layout.addLayout(entity_grid)
-
-        # Entity tags — visual hint for identity-block vs markup-only entities
-        entity_tags_header = QLabel("Entities in Scene:")
-        entity_tags_header.setStyleSheet("font-size: 10px; font-weight: bold; padding: 2px 0 0 0;")
-        layout.addWidget(entity_tags_header)
-
-        self._entity_tags_container = QWidget()
-        self._entity_tags_layout = _FlowLayout(self._entity_tags_container, spacing=5)
-        self._entity_tags_layout.setContentsMargins(0, 2, 0, 2)
-        layout.addWidget(self._entity_tags_container)
+        self._entity_ref_list = QWidget()
+        self._entity_ref_grid = QGridLayout(self._entity_ref_list)
+        self._entity_ref_grid.setContentsMargins(0, 0, 0, 0)
+        self._entity_ref_grid.setSpacing(8)
+        layout.addWidget(self._entity_ref_list)
 
         legend = QLabel(
             '<span style="color:#888; font-size:9px;">'
-            '\u25cf <span style="color:#5b9bd5;">Blue</span> = identity block (reference image assignable)  '
-            '\u25cf <span style="color:#999;">Gray</span> = markup only (generator-handled)'
+            'Passive entities are included in the environment description.'
             '</span>'
         )
+        legend.setWordWrap(True)
         legend.setTextFormat(Qt.TextFormat.RichText)
         layout.addWidget(legend)
+
+        # ── Hero frame override row ──
+        hero_row = QHBoxLayout()
+        hero_row.addWidget(QLabel("Hero Frame:"))
+        self.env_start_thumb = ClickableImageLabel(max_short=60, max_long=80)
+        hero_row.addWidget(self.env_start_thumb)
+        self.env_start_btn = QPushButton("Override Hero Frame")
+        self.env_start_btn.setFixedWidth(140)
+        self.env_start_btn.clicked.connect(lambda: self._upload_env_image("start"))
+        hero_row.addWidget(self.env_start_btn)
+        self.env_start_clear = QPushButton("Clear")
+        self.env_start_clear.setFixedWidth(60)
+        self.env_start_clear.clicked.connect(lambda: self._clear_env_image("start"))
+        hero_row.addWidget(self.env_start_clear)
+        hero_row.addStretch()
+        layout.addLayout(hero_row)
+
+        # Hero frame environment hint
+        self.hero_frame_hint = QLabel("")
+        self.hero_frame_hint.setWordWrap(True)
+        self.hero_frame_hint.setTextFormat(Qt.TextFormat.RichText)
+        self.hero_frame_hint.setStyleSheet("font-size: 10px; padding: 2px 0;")
+        layout.addWidget(self.hero_frame_hint)
+
+        # Keep hidden combos for backward compat (data layer still uses them)
+        self.hero_frame_combo = QComboBox()
+        self.hero_frame_combo.hide()
+        self.end_frame_combo = QComboBox()
+        self.end_frame_combo.hide()
+        self.env_end_thumb = ClickableImageLabel(max_short=60, max_long=80)
+        self.env_end_thumb.hide()
+        self.env_end_btn = QPushButton()
+        self.env_end_btn.hide()
+        self.env_end_clear = QPushButton()
+        self.env_end_clear.hide()
+
+        # Keep hidden image slot widgets for backward compat
+        self._image_slot_widgets: Dict[str, dict] = {}
+        for slot in ("image_1", "image_2", "image_3"):
+            thumb = ClickableImageLabel(max_short=60, max_long=80)
+            thumb.hide()
+            combo = QComboBox()
+            combo.hide()
+            self._image_slot_widgets[slot] = {
+                "thumb": thumb, "upload": QPushButton(),
+                "clear": QPushButton(), "combo": combo,
+            }
 
         # Validation status
         self.validation_label = QLabel("")
         self.validation_label.setStyleSheet("font-size: 10px; padding: 3px;")
         self.validation_label.setWordWrap(True)
         layout.addWidget(self.validation_label)
+
+        # Keep entity tags container for backward compat (hidden)
+        self._entity_tags_container = QWidget()
+        self._entity_tags_layout = _FlowLayout(self._entity_tags_container, spacing=5)
+        self._entity_tags_layout.setContentsMargins(0, 0, 0, 0)
+        self._entity_tags_container.hide()
 
         return group
 
@@ -575,6 +582,31 @@ class StoryboardItemEditor(QDialog):
         vp_copy_row.addWidget(self.copy_video_btn)
         vp_layout.addLayout(vp_copy_row)
         self.prompt_tabs.addTab(vp_widget, "Video (Motion)")
+
+        # Tab 4: Platform Prompt (read-only, adapted output)
+        pp_widget = QWidget()
+        pp_layout = QVBoxLayout(pp_widget)
+        self.platform_prompt_hint = QLabel(
+            "Platform-adapted prompt — the final output sent to the selected generation platform."
+        )
+        self.platform_prompt_hint.setWordWrap(True)
+        self.platform_prompt_hint.setStyleSheet("color: #666; font-size: 9px; padding: 2px;")
+        pp_layout.addWidget(self.platform_prompt_hint)
+        self.platform_prompt_edit = QTextEdit()
+        self.platform_prompt_edit.setReadOnly(True)
+        self.platform_prompt_edit.setMinimumHeight(140)
+        self.platform_prompt_edit.setFont(QFont("Consolas", 9))
+        pp_layout.addWidget(self.platform_prompt_edit)
+        pp_copy_row = QHBoxLayout()
+        pp_copy_row.addStretch()
+        self.copy_platform_btn = QPushButton("Copy Platform Prompt")
+        self.copy_platform_btn.setFixedWidth(180)
+        self.copy_platform_btn.clicked.connect(
+            lambda: self._copy_to_clipboard(self.platform_prompt_edit)
+        )
+        pp_copy_row.addWidget(self.copy_platform_btn)
+        pp_layout.addLayout(pp_copy_row)
+        self.prompt_tabs.addTab(pp_widget, "Platform Prompt")
 
         layout.addWidget(self.prompt_tabs)
 
@@ -699,11 +731,18 @@ class StoryboardItemEditor(QDialog):
 
         # Text fields
         self.storyline_edit.setPlainText(self.item.storyline)
+        self.composition_edit.setPlainText(getattr(self.item, "composition_notes", "") or "")
         self.dialogue_edit.setPlainText(self.item.dialogue)
 
-        # Prompt layers (load existing prompts into the editable fields)
-        self.keyframe_prompt_edit.setPlainText(self.item.image_prompt)
-        self.video_prompt_edit.setPlainText(self.item.prompt)
+        # Prompt layers — only show if user has explicitly generated them
+        if getattr(self.item, "prompts_generated", False):
+            self.keyframe_prompt_edit.setPlainText(self.item.image_prompt)
+            self.video_prompt_edit.setPlainText(self.item.prompt)
+        else:
+            self.keyframe_prompt_edit.clear()
+            self.video_prompt_edit.clear()
+            self.identity_prompt_edit.clear()
+            self.platform_prompt_edit.clear()
 
         # Audio
         self.audio_intent_edit.setPlainText(
@@ -737,7 +776,8 @@ class StoryboardItemEditor(QDialog):
         if (getattr(self.item, "environment_end_image", "") or "").strip():
             self._set_thumb(self.env_end_thumb, self.item.environment_end_image)
         self._restore_entity_assignments()
-        self._populate_entity_tags()
+        self._populate_entity_ref_list()
+        self._update_hero_frame_hint()
         self._update_validation()
 
         # Multi-shot cluster info
@@ -759,10 +799,20 @@ class StoryboardItemEditor(QDialog):
         # Sync editor values into the item
         self._sync_item_from_ui()
 
+        # Clear generated-output fields so previous prompt text doesn't
+        # feed back into the builder as input (prevents duplication on
+        # repeated clicks).  The builder derives action text from
+        # item.storyline, not from these output-only fields.
+        self.item.prompt = ""
+        self.item.image_prompt = ""
+
         scene = self._find_parent_scene()
 
-        from core.video_prompt_builder import compile_all_prompts
-        result = compile_all_prompts(self.item, self.screenplay, scene)
+        # Auto-populate image assignments from identity blocks
+        self._auto_populate_images(scene)
+
+        from core.video_prompt_builder import compile_platform_prompts
+        result = compile_platform_prompts(self.item, self.screenplay, scene)
 
         if not result["success"]:
             self.prompt_error_label.setText("\n".join(result["errors"]))
@@ -772,6 +822,17 @@ class StoryboardItemEditor(QDialog):
         self.keyframe_prompt_edit.setPlainText(result["keyframe_prompt"])
         self.identity_prompt_edit.setPlainText(result["identity_prompt"])
         self.video_prompt_edit.setPlainText(result["video_prompt"])
+
+        self.item.image_prompt = result["keyframe_prompt"]
+        self.item.prompt = result["video_prompt"]
+        self.item.prompts_generated = True
+
+        platform_name = result.get("platform_name", "")
+        self.platform_prompt_edit.setPlainText(result.get("platform_prompt", ""))
+        self.platform_prompt_hint.setText(
+            f"Platform-adapted prompt for {platform_name} — "
+            "the final output sent to the generation platform."
+        )
 
     def _sync_item_from_ui(self):
         """Write current UI values back to the item object."""
@@ -785,12 +846,113 @@ class StoryboardItemEditor(QDialog):
         self.item.mood_tone = self.mood_edit.currentText().strip()
         self.item.lighting_description = self.lighting_edit.currentText().strip()
         self.item.storyline = self.storyline_edit.toPlainText().strip()
+        self.item.composition_notes = self.composition_edit.toPlainText().strip()
         self.item.dialogue = self.dialogue_edit.toPlainText().strip()
         self.item.image_prompt = self.keyframe_prompt_edit.toPlainText().strip()
         self.item.prompt = self.video_prompt_edit.toPlainText().strip()
         self.item.camera_notes = CAMERA_MOTION_OPTIONS.get(
             self.item.camera_motion, "Static"
         )
+
+    def _auto_populate_images(self, scene=None):
+        """Auto-fill environment and entity images from identity block metadata.
+
+        Only assigns entities that belong to this scene (via
+        ``get_entity_ids_for_scene``).  Within the scene-scoped set, priority:
+          1. Characters/entities named in the item's storyline text
+          2. Characters in the scene's character_focus
+          3. Scene-level non-character entities (objects, vehicles) mentioned
+             in any storyboard item text within the scene
+        """
+        if not self.screenplay:
+            return
+        meta = getattr(self.screenplay, "identity_block_metadata", {}) or {}
+
+        # Scope to entities that belong to this scene
+        scene_entity_ids: set = set()
+        if scene:
+            scene_entity_ids = self.screenplay.get_entity_ids_for_scene(scene)
+
+        # 1. Environment hero frame — use identity block image unless user uploaded one
+        if not (self.item.environment_start_image or "").strip() and scene:
+            env_id = getattr(scene, "environment_id", None)
+            if env_id and env_id in meta:
+                env_path = (meta[env_id].get("image_path") or "").strip()
+                if env_path:
+                    self.item.environment_start_image = env_path
+                    self._set_thumb(self.env_start_thumb, env_path)
+
+        # 2. Entity image slots — scene-scoped auto-assign
+        item_text = " ".join([
+            self.item.storyline or "",
+            self.item.image_prompt or "",
+            self.item.prompt or "",
+            self.item.visual_description or "",
+            self.item.dialogue or "",
+        ]).upper()
+
+        scene_char_focus = set()
+        if scene:
+            for name in getattr(scene, "character_focus", []) or []:
+                stripped = name.strip()
+                if stripped:
+                    scene_char_focus.add(stripped.upper())
+
+        def _entity_mentioned_in_text(entity_name: str, text: str) -> bool:
+            if not entity_name:
+                return False
+            return entity_name.upper() in text
+
+        tier1 = []  # mentioned in this item's text
+        tier2 = []  # in scene character_focus but not in item text
+        tier3 = []  # scene-level objects/vehicles mentioned in scene text
+
+        scene_text_upper = ""
+        if scene:
+            parts = []
+            for si in getattr(scene, "storyboard_items", []):
+                parts.append(getattr(si, "storyline", "") or "")
+                parts.append(getattr(si, "image_prompt", "") or "")
+                parts.append(getattr(si, "visual_description", "") or "")
+            parts.append(getattr(scene, "description", "") or "")
+            scene_meta = getattr(scene, "metadata", None) or {}
+            parts.append(scene_meta.get("generated_content", "") or "")
+            scene_text_upper = " ".join(parts).upper()
+
+        for eid, m in meta.items():
+            # Only consider entities that belong to this scene
+            if scene_entity_ids and eid not in scene_entity_ids:
+                continue
+            etype = (m.get("type") or "").lower()
+            status = m.get("status", "")
+            if etype not in ("character", "object", "vehicle", "group"):
+                continue
+            if status == "passive":
+                continue
+            img = (m.get("image_path") or "").strip()
+            if not img:
+                continue
+            ename = (m.get("name") or "").strip()
+            entry = {
+                "path": img,
+                "entity_id": eid,
+                "entity_name": ename,
+                "entity_type": etype,
+            }
+            if _entity_mentioned_in_text(ename, item_text):
+                tier1.append(entry)
+            elif etype in ("character", "group") and ename.upper() in scene_char_focus:
+                tier2.append(entry)
+            elif etype in ("object", "vehicle") and _entity_mentioned_in_text(ename, scene_text_upper):
+                tier3.append(entry)
+
+        ranked = tier1 + tier2 + tier3
+        slots = ("image_1", "image_2", "image_3")
+        assignments: Dict[str, Dict[str, str]] = {}
+        for i, entry in enumerate(ranked[:len(slots)]):
+            assignments[slots[i]] = entry
+        if assignments:
+            self.item.image_assignments = assignments
 
     # ================================================================
     #  Clipboard
@@ -813,6 +975,9 @@ class StoryboardItemEditor(QDialog):
         vp = self.video_prompt_edit.toPlainText().strip()
         if vp:
             parts.append(f"--- VIDEO (Motion) ---\n{vp}")
+        pp = self.platform_prompt_edit.toPlainText().strip()
+        if pp:
+            parts.append(f"--- PLATFORM PROMPT ---\n{pp}")
         if parts:
             QApplication.clipboard().setText("\n\n".join(parts))
 
@@ -832,6 +997,7 @@ class StoryboardItemEditor(QDialog):
         if which == "start":
             self.item.environment_start_image = path
             self._set_thumb(self.env_start_thumb, path)
+            self._update_hero_frame_hint()
         else:
             self.item.environment_end_image = path
             self._set_thumb(self.env_end_thumb, path)
@@ -841,6 +1007,7 @@ class StoryboardItemEditor(QDialog):
         if which == "start":
             self.item.environment_start_image = ""
             self.env_start_thumb.clearImage()
+            self._update_hero_frame_hint()
         else:
             self.item.environment_end_image = ""
             self.env_end_thumb.clearImage()
@@ -958,12 +1125,19 @@ class StoryboardItemEditor(QDialog):
         label.setImageFromPath(path)
 
     def _populate_entity_combos(self):
-        """Fill assignment dropdowns with screenplay entities."""
+        """Fill assignment dropdowns with entities scoped to the current scene."""
+        scene = self._find_parent_scene()
+        scene_entity_ids: set = set()
+        if self.screenplay and scene:
+            scene_entity_ids = self.screenplay.get_entity_ids_for_scene(scene)
+
         char_obj_veh: list = []
         all_entities: list = []
         if self.screenplay:
             meta = getattr(self.screenplay, "identity_block_metadata", {}) or {}
             for eid, m in meta.items():
+                if scene_entity_ids and eid not in scene_entity_ids:
+                    continue
                 etype = m.get("type", "")
                 ename = (m.get("name") or "").strip()
                 if not ename:
@@ -974,7 +1148,7 @@ class StoryboardItemEditor(QDialog):
                     "entity_type": etype,
                 }
                 all_entities.append(entry)
-                if etype in ("character", "object", "vehicle"):
+                if etype in ("character", "object", "vehicle", "group"):
                     char_obj_veh.append(entry)
 
         for slot, widgets in self._image_slot_widgets.items():
@@ -1056,6 +1230,7 @@ class StoryboardItemEditor(QDialog):
         known_lower: Dict[str, Set[str]] = {
             "character": set(), "object": set(),
             "vehicle": set(), "environment": set(),
+            "group": set(),
         }
         if self.screenplay:
             meta = getattr(self.screenplay, "identity_block_metadata", {}) or {}
@@ -1070,6 +1245,7 @@ class StoryboardItemEditor(QDialog):
             "object": "\U0001F4E6",
             "vehicle": "\U0001F697",
             "environment": "\U0001F30D",
+            "group": "\U0001F46A",
         }
         _IDENTITY_BG = (
             "background-color:#1a3a5c; color:#9ecbff; border:1px solid #2a6cb5;"
@@ -1093,6 +1269,9 @@ class StoryboardItemEditor(QDialog):
         for name in sorted(ent.environments):
             has_id = name.lower() in known_lower["environment"]
             entries.append(("environment", name, has_id))
+        for name in sorted(ent.groups):
+            has_id = name.lower() in known_lower["group"]
+            entries.append(("group", name, has_id))
 
         if not entries:
             placeholder = QLabel("No entities detected")
@@ -1113,18 +1292,181 @@ class StoryboardItemEditor(QDialog):
             tag.setToolTip(tip)
             self._entity_tags_layout.addWidget(tag)
 
-    def _update_validation(self):
-        from core.video_prompt_builder import validate_for_generation
-        valid, errors = validate_for_generation(self.item)
-        if valid:
-            self.validation_label.setText("Ready for generation.")
-            self.validation_label.setStyleSheet(
-                "font-size: 10px; padding: 3px; color: #00AA00; font-weight: bold;"
+    def _populate_entity_ref_list(self):
+        """Build a horizontal grid of entity reference cards from identity blocks.
+
+        Only entities that belong to the current scene are shown.
+        """
+        grid = self._entity_ref_grid
+        while grid.count():
+            child = grid.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+
+        if not self.screenplay:
+            return
+
+        meta = getattr(self.screenplay, "identity_block_metadata", {}) or {}
+        scene = self._find_parent_scene()
+
+        # Scope to entities that belong to this scene
+        scene_entity_ids: set = set()
+        if scene:
+            scene_entity_ids = self.screenplay.get_entity_ids_for_scene(scene)
+
+        COLS = 4
+        all_cards: list = []
+
+        # Environment card
+        if scene:
+            env_id = getattr(scene, "environment_id", None)
+            if env_id and env_id in meta:
+                env_meta = meta[env_id]
+                env_name = (env_meta.get("name") or "").strip()
+                img_path = (env_meta.get("image_path") or "").strip()
+                all_cards.append(("environment", env_name, "approved", img_path))
+
+        # Characters, groups, objects, vehicles — scoped to scene
+        type_order = {"character": 0, "group": 1, "object": 2, "vehicle": 3}
+        entities = []
+        for eid, m in meta.items():
+            if scene_entity_ids and eid not in scene_entity_ids:
+                continue
+            etype = (m.get("type") or "").lower()
+            if etype not in type_order:
+                continue
+            if (m.get("status") or "") == "passive":
+                continue
+            ename = (m.get("name") or "").strip()
+            if not ename:
+                continue
+            entities.append((type_order[etype], ename, etype, m))
+
+        entities.sort(key=lambda x: (x[0], x[1].lower()))
+        for _, ename, etype, m in entities:
+            status = m.get("status", "")
+            img_path = (m.get("image_path") or "").strip()
+            all_cards.append((etype, ename, status, img_path))
+
+        if not all_cards:
+            placeholder = QLabel("No entities detected")
+            placeholder.setStyleSheet("color: #888; font-size: 9px; padding: 2px;")
+            grid.addWidget(placeholder, 0, 0)
+            return
+
+        type_icons = {
+            "character": "\U0001F9D1",
+            "group": "\U0001F46A",
+            "object": "\U0001F4E6",
+            "vehicle": "\U0001F697",
+            "environment": "\U0001F30D",
+        }
+
+        for idx, (etype, ename, status, img_path) in enumerate(all_cards):
+            row = idx // COLS
+            col = idx % COLS
+
+            card = QVBoxLayout()
+            card.setSpacing(2)
+            card.setContentsMargins(4, 4, 4, 4)
+
+            thumb = ClickableImageLabel(max_short=50, max_long=65)
+            if img_path:
+                thumb.setImageFromPath(img_path)
+            card.addWidget(thumb, alignment=Qt.AlignmentFlag.AlignCenter)
+
+            display = ename if len(ename) <= 18 else ename[:15] + "\u2026"
+            icon = type_icons.get(etype, "")
+
+            if status == "approved":
+                name_html = (
+                    f"<div style='text-align:center; font-size:9px;'>"
+                    f"{icon} <b>{display}</b><br/>"
+                    f"<span style='color:#4CAF50; font-size:8px;'>{etype} \u2714</span></div>"
+                )
+            else:
+                name_html = (
+                    f"<div style='text-align:center; font-size:9px;'>"
+                    f"{icon} {display}<br/>"
+                    f"<span style='color:#ff9800; font-size:8px;'>{etype}</span></div>"
+                )
+
+            if not img_path:
+                name_html = name_html.replace("</div>",
+                    "<br/><span style='color:#CC0000; font-size:8px;'>(no image)</span></div>")
+
+            name_lbl = QLabel(name_html)
+            name_lbl.setTextFormat(Qt.TextFormat.RichText)
+            name_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            name_lbl.setWordWrap(True)
+            name_lbl.setFixedWidth(90)
+            name_lbl.setToolTip(f"{etype.title()}: {ename}")
+            card.addWidget(name_lbl, alignment=Qt.AlignmentFlag.AlignCenter)
+
+            container = QWidget()
+            container.setFixedWidth(100)
+            container.setLayout(card)
+            grid.addWidget(container, row, col, alignment=Qt.AlignmentFlag.AlignTop)
+
+    def _update_hero_frame_hint(self):
+        """Show which environment image is used for the hero frame."""
+        scene = self._find_parent_scene()
+        if not scene or not self.screenplay:
+            self.hero_frame_hint.setText(
+                '<span style="color:#888;">No scene context available.</span>'
+            )
+            return
+
+        has_override = bool((getattr(self.item, "environment_start_image", "") or "").strip())
+        if has_override:
+            self.hero_frame_hint.setText(
+                '<span style="color:#00AA00;">&#10003; Hero frame image set (custom override).</span>'
+            )
+            return
+
+        env_id = getattr(scene, "environment_id", None)
+        if not env_id:
+            self.hero_frame_hint.setText(
+                '<span style="color:#E6A817;">&#9888; No environment assigned to this scene. '
+                'Assign one in the Scene tab or override manually above.</span>'
+            )
+            return
+
+        meta = getattr(self.screenplay, "identity_block_metadata", {}) or {}
+        env_meta = meta.get(env_id, {})
+        env_name = (env_meta.get("name") or env_id).strip()
+        env_img = (env_meta.get("image_path") or "").strip()
+
+        if env_img:
+            self.hero_frame_hint.setText(
+                f'<span style="color:#00AA00;">&#10003; Hero frame uses: '
+                f'<b>{env_name}</b> (approved)</span>'
             )
         else:
+            self.hero_frame_hint.setText(
+                f'<span style="color:#E6A817;">&#9888; Hero frame requires: '
+                f'<b>{env_name}</b> &mdash; generate and approve this '
+                f'environment\'s identity block first.</span>'
+            )
+
+    def _update_validation(self):
+        from core.video_prompt_builder import validate_for_generation, get_image_warnings
+        valid, errors = validate_for_generation(self.item)
+        img_warnings = get_image_warnings(self.item)
+        if not valid:
             self.validation_label.setText("  ".join(errors))
             self.validation_label.setStyleSheet(
                 "font-size: 10px; padding: 3px; color: #CC0000; font-weight: bold;"
+            )
+        elif img_warnings:
+            self.validation_label.setText("Ready for generation.  " + "  ".join(img_warnings))
+            self.validation_label.setStyleSheet(
+                "font-size: 10px; padding: 3px; color: #E6A817; font-weight: bold;"
+            )
+        else:
+            self.validation_label.setText("Ready for generation.")
+            self.validation_label.setStyleSheet(
+                "font-size: 10px; padding: 3px; color: #00AA00; font-weight: bold;"
             )
 
     # ================================================================
@@ -1210,6 +1552,17 @@ class StoryboardItemEditor(QDialog):
                 self.item.audio_source = (
                     val if val in ("none", "generated", "post") else "none"
                 )
+
+            # Dialogue duration floor — bump duration if dialogue needs more time
+            dialogue_raw = (self.item.dialogue or "").strip()
+            if dialogue_raw:
+                d_text = re.sub(r'^[A-Z][A-Z\s]+:\s*', '', dialogue_raw)
+                d_text = re.sub(r'\([^)]*\)', '', d_text).strip()
+                wc = len(d_text.split())
+                min_dur = max(4, round(wc / 2.3 + 1.5))
+                if self.item.duration < min_dur:
+                    self.item.duration = min(30, min_dur)
+                    self.duration_spinbox.setValue(self.item.duration)
 
             # Timestamp
             from datetime import datetime

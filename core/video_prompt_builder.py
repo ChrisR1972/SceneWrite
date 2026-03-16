@@ -35,35 +35,161 @@ from .screenplay_engine import (
 
 # ── Keywords forbidden in keyframe prompts (motion belongs in video layer) ──
 _KEYFRAME_FORBIDDEN_VERBS = frozenset({
+    # Locomotion
     "walks", "walking", "walk", "runs", "running", "run",
-    "jumps", "jumping", "jump", "turns", "turning", "turn",
+    "steps", "stepping", "step", "sprints", "sprinting", "sprint",
+    "dashes", "dashing", "dash", "marches", "marching", "march",
+    "creeps", "creeping", "creep", "sneaks", "sneaking", "sneak",
+    "tiptoes", "tiptoeing", "tiptoe", "paces", "pacing", "pace",
+    "staggers", "staggering", "stagger", "limps", "limping", "limp",
     "enters", "entering", "enter", "exits", "exiting", "exit",
-    "approaches", "approaching", "approach", "speaks", "speaking", "speak",
-    "pulls", "pulling", "pull", "pushes", "pushing", "push",
-    "slides", "sliding", "slide", "opens", "opening", "open",
-    "closes", "closing", "close", "grabs", "grabbing", "grab",
-    "reaches", "reaching", "reach", "throws", "throwing", "throw",
-    "kicks", "kicking", "kick", "hits", "hitting", "hit",
-    "strikes", "striking", "strike", "fires", "firing", "fire",
-    "swings", "swinging", "swing", "lifts", "lifting", "lift",
-    "drops", "dropping", "drop", "falls", "falling", "fall",
-    "rises", "rising", "rise", "climbs", "climbing", "climb",
-    "crawls", "crawling", "crawl", "leaps", "leaping", "leap",
-    "dives", "diving", "dive", "spins", "spinning", "spin",
-    "rolls", "rolling", "roll", "ducks", "ducking", "duck",
-    "dodges", "dodging", "dodge", "charges", "charging", "charge",
+    "approaches", "approaching", "approach",
+    # Jumping / climbing / falling
+    "jumps", "jumping", "jump", "leaps", "leaping", "leap",
+    "climbs", "climbing", "climb", "dives", "diving", "dive",
+    "falls", "falling", "fall", "drops", "dropping", "drop",
+    "rises", "rising", "rise", "launches", "launching", "launch",
+    "lands", "landing", "land",
+    # Turning / spinning / rolling
+    "turns", "turning", "turn", "spins", "spinning", "spin",
+    "rolls", "rolling", "roll", "twists", "twisting", "twist",
+    "swerves", "swerving", "swerve",
+    # Evasive / reactive
+    "ducks", "ducking", "duck", "dodges", "dodging", "dodge",
+    "flinches", "flinching", "flinch", "recoils", "recoiling", "recoil",
+    "lurches", "lurching", "lurch", "wobbles", "wobbling", "wobble",
+    "sways", "swaying", "sway", "trembles", "trembling", "tremble",
+    "shakes", "shaking", "shake",
+    # Combat / forceful
+    "punches", "punching", "punch", "kicks", "kicking", "kick",
+    "hits", "hitting", "hit", "strikes", "striking", "strike",
+    "lunges", "lunging", "lunge", "swings", "swinging", "swing",
+    "slams", "slamming", "slam", "charges", "charging", "charge",
+    "fires", "firing", "fire",
+    # Hand actions (transient motion)
+    "grabs", "grabbing", "grab", "yanks", "yanking", "yank",
+    "tugs", "tugging", "tug", "pulls", "pulling", "pull",
+    "pushes", "pushing", "push", "throws", "throwing", "throw",
+    "tosses", "tossing", "toss", "catches", "catching", "catch",
+    "releases", "releasing", "release", "squeezes", "squeezing", "squeeze",
+    "presses", "pressing", "press", "taps", "tapping", "tap",
+    "knocks", "knocking", "knock", "flips", "flipping", "flip",
+    "reaches", "reaching", "reach", "lifts", "lifting", "lift",
+    "lowers", "lowering", "lower", "hoists", "hoisting", "hoist",
+    "picks", "picking",
+    # Opening / closing
+    "opens", "opening", "open", "closes", "closing", "close",
+    "slides", "sliding", "slide", "seals", "sealing", "seal",
+    # Pursuit / retreat
     "retreats", "retreating", "retreat", "flees", "fleeing", "flee",
-    "chases", "chasing", "chase", "catches", "catching", "catch",
-    "releases", "releasing", "release", "bursts", "bursting", "burst",
-    "explodes", "exploding", "explode", "shatters", "shattering", "shatter",
-    "crashes", "crashing", "crash", "collapses", "collapsing", "collapse",
+    "chases", "chasing", "chase",
+    # Speaking (audio, not visual)
+    "speaks", "speaking", "speak",
+    # Destruction / impact
+    "bursts", "bursting", "burst", "explodes", "exploding", "explode",
+    "shatters", "shattering", "shatter", "crashes", "crashing", "crash",
+    "collapses", "collapsing", "collapse", "crumbles", "crumbling", "crumble",
+    "snaps", "snapping", "snap", "cracks", "cracking", "crack",
+    # Appearing / vanishing
     "emerges", "emerging", "emerge", "appears", "appearing", "appear",
     "vanishes", "vanishing", "vanish", "fades", "fading", "fade",
+    # Light effects (transient)
     "glows", "glowing", "glow", "flickers", "flickering", "flicker",
+    "flashes", "flashing", "flash", "flares", "flaring", "flare",
+    "blinks", "blinking", "blink", "brightens", "brightening", "brighten",
+    "darkens", "darkening", "darken", "pulses", "pulsing", "pulse",
+    "ignites", "igniting", "ignite",
+    # Liquid / material
     "pours", "pouring", "pour", "spills", "spilling", "spill",
+    "floods", "flooding", "flood",
+    # Stumbling
     "trips", "tripping", "trip", "stumbles", "stumbling", "stumble",
-    "flips", "flipping", "flip", "activates", "activating", "activate",
+    "crawls", "crawling", "crawl",
+    # Vehicle motion
+    "accelerates", "accelerating", "accelerate",
+    "docks", "docking", "dock", "skids", "skidding", "skid",
+    "brakes", "braking", "brake", "reverses", "reversing", "reverse",
+    "starts", "starting", "start", "stops", "stopping", "stop",
+    # Repetitive hand / interaction motion
+    "types", "typing", "type", "scribbles", "scribbling", "scribble",
+    "scrolls", "scrolling", "scroll", "dials", "dialing", "dial",
+    "swipes", "swiping", "swipe", "writes", "writing", "write",
+    "scratches", "scratching", "scratch", "stirs", "stirring", "stir",
+    "wraps", "wrapping", "wrap", "unwraps", "unwrapping", "unwrap",
+    "loads", "loading", "load", "unloads", "unloading", "unload",
+    "plugs", "plugging", "plug", "unplugs", "unplugging", "unplug",
+    # Misc motion
+    "activates", "activating", "activate",
+    "shifts", "shifting", "shift", "settles", "settling", "settle",
+    "rumbles", "rumbling", "rumble", "echoes", "echoing", "echo",
 })
+
+# Pose / state verbs deliberately KEPT in keyframe prompts (not forbidden):
+# sit, stand, lean, hold, kneel, crouch, look, brace, point, freeze, halt,
+# hang, perch, prop, balance, dangle, drape, stretch, hover, drift, burn,
+# smolder, wave, gesture, nod, shrug, wipe, adjust, draw
+
+# ── Pose / state verb → participial form for image-gen friendliness ──
+# Image models respond much better to "-ing" / "-ed" forms than present tense.
+_POSE_VERB_TO_PARTICIPLE: Dict[str, str] = {
+    "sits": "sitting", "sit": "sitting",
+    "stands": "standing", "stand": "standing",
+    "leans": "leaning", "lean": "leaning",
+    "holds": "holding", "hold": "holding",
+    "kneels": "kneeling", "kneel": "kneeling",
+    "crouches": "crouching", "crouch": "crouching",
+    "looks": "looking", "look": "looking",
+    "braces": "bracing", "brace": "bracing",
+    "points": "pointing", "point": "pointing",
+    "freezes": "frozen", "freeze": "frozen",
+    "halts": "halted", "halt": "halted",
+    "hangs": "hanging", "hang": "hanging",
+    "perches": "perched", "perch": "perched",
+    "props": "propped", "prop": "propped",
+    "balances": "balancing", "balance": "balancing",
+    "dangles": "dangling", "dangle": "dangling",
+    "drapes": "draped", "drape": "draped",
+    "stretches": "stretching", "stretch": "stretching",
+    "hovers": "hovering", "hover": "hovering",
+    "drifts": "drifting", "drift": "drifting",
+    "burns": "burning", "burn": "burning",
+    "smolders": "smoldering", "smolder": "smoldering",
+    "waves": "waving", "wave": "waving",
+    "gestures": "gesturing", "gesture": "gesturing",
+    "nods": "nodding", "nod": "nodding",
+    "shrugs": "shrugging", "shrug": "shrugging",
+    "wipes": "wiping", "wipe": "wiping",
+    "adjusts": "adjusting", "adjust": "adjusting",
+    "draws": "drawing", "draw": "drawing",
+    "grips": "gripping", "grip": "gripping",
+    "clutches": "clutching", "clutch": "clutching",
+    "cradles": "cradling", "cradle": "cradling",
+    "rests": "resting", "rest": "resting",
+    "reclines": "reclining", "recline": "reclining",
+    "squats": "squatting", "squat": "squatting",
+    "straddles": "straddling", "straddle": "straddling",
+    "lies": "lying", "lie": "lying",
+    "lays": "laying", "lay": "laying",
+}
+
+# ── Motion-intensity adverbs to strip from keyframe prompts ──
+_MOTION_ADVERBS = frozenset({
+    "frantically", "desperately", "quickly", "rapidly", "hurriedly",
+    "urgently", "furiously", "violently", "aggressively", "wildly",
+    "hastily", "swiftly", "briskly", "fiercely", "forcefully",
+    "abruptly", "sharply", "suddenly", "immediately", "nervously",
+    "anxiously", "panicking", "recklessly", "feverishly", "breathlessly",
+})
+
+# ── Broken-sentence detection: pronoun/name + dangling particle after verb removal ──
+_BROKEN_SENT_RE = re.compile(
+    # "She up a [display]" — pronoun + orphaned preposition
+    r'^(?:she|he|they|it|we|i|the\b\S*)\s+'
+    r'(?:up|down|out|in|off|on|over|away|back|through|around|into|onto|across)\b'
+    # "TALON his arrow" — CAPS name + possessive/article (verb was stripped)
+    r'|^[A-Z][A-Z\s\']+\s+(?:his|her|its|their|the|a|an)\s+\w',
+    re.IGNORECASE,
+)
 
 # ── Pattern for *action* markup in storylines ──
 _ACTION_MARKUP_RE = re.compile(r'\*([^*]+)\*')
@@ -109,15 +235,28 @@ def _make_static_description(storyline: str) -> str:
 
     kept: List[str] = []
     for sent in sentences:
-        cleaned = _ACTION_MARKUP_RE.sub("", sent)
+        cleaned = _ACTION_MARKUP_RE.sub(r'\1', sent)
         words = cleaned.split()
-        static_words = [
-            w for w in words
-            if w.lower().rstrip(".,;:!?") not in _KEYFRAME_FORBIDDEN_VERBS
-        ]
+        static_words = []
+        for w in words:
+            bare = w.lower().rstrip(".,;:!?")
+            if bare in _KEYFRAME_FORBIDDEN_VERBS:
+                continue
+            if bare in _MOTION_ADVERBS:
+                continue
+            participle = _POSE_VERB_TO_PARTICIPLE.get(bare)
+            if participle:
+                trailing = w[len(bare):]
+                static_words.append(participle + trailing)
+            else:
+                static_words.append(w)
         static_sent = " ".join(static_words).strip()
         static_sent = re.sub(r'\s{2,}', ' ', static_sent)
         static_sent = re.sub(r'\s+([.,;:!?])', r'\1', static_sent)
+
+        # Drop sentences broken by verb removal (e.g. "She up a [display]")
+        if _BROKEN_SENT_RE.match(static_sent):
+            continue
 
         if len(static_sent) < 8:
             continue
@@ -125,6 +264,48 @@ def _make_static_description(storyline: str) -> str:
             kept.append(static_sent)
 
     return " ".join(kept).strip()
+
+
+def _strip_character_descriptions(text: str) -> str:
+    """Remove inline character descriptions, keeping only the name and action.
+
+    Transforms patterns like:
+        LUCY CHEN a woman in her late 20s wearing a paint-splattered
+        denim jacket over a black t-shirt and practical cargo pants, kneels ...
+    Into:
+        LUCY CHEN kneels ...
+
+    Also removes possessive appearance clauses like:
+        , her dark hair pulled into a messy bun.
+    """
+    if not text:
+        return ""
+
+    # Pass 1: CAPS NAME + article + gender/age trigger word + description up
+    # to the comma that precedes the action verb.
+    result = re.sub(
+        r'([A-Z]{2,}(?:\s+[A-Z]{2,})*)'
+        r',?\s+(?:a |an |the )?'
+        r'(?:woman|man|girl|boy|teen|teenager|child|person|figure|elderly|'
+        r'young|old|mid-|middle-aged|late-|early-)'
+        r'[^,]*,\s*',
+        r'\1 ',
+        text,
+        flags=re.DOTALL,
+    )
+
+    # Pass 2: possessive appearance clauses — ", her dark hair pulled into..."
+    result = re.sub(
+        r',?\s+(?:her|his|their)\s+(?:\w+\s+){0,3}'
+        r'(?:hair|eyes|skin|face|beard|brow|brows|lips|cheeks|complexion|'
+        r'build|features|figure|freckles|dimples)'
+        r'[^.,;]*[.,;]?\s*',
+        ' ',
+        result,
+        flags=re.IGNORECASE,
+    )
+
+    return re.sub(r'\s{2,}', ' ', result).strip()
 
 
 # =====================================================================
@@ -159,11 +340,10 @@ def validate_for_generation(item: "StoryboardItem") -> Tuple[bool, List[str]]:
     """Pre-generation validation.
 
     Returns (is_valid, error_messages).
+    Images are optional reference material — their absence never blocks
+    prompt generation.
     """
     errors: List[str] = []
-
-    if not (item.environment_start_image or "").strip():
-        errors.append("Hero Frame image is required (Environment Start Frame).")
 
     assignments = getattr(item, "image_assignments", {}) or {}
     for slot in ("image_1", "image_2", "image_3"):
@@ -179,10 +359,22 @@ def validate_for_generation(item: "StoryboardItem") -> Tuple[bool, List[str]]:
     return (len(errors) == 0, errors)
 
 
+def get_image_warnings(item: "StoryboardItem") -> List[str]:
+    """Return non-blocking warnings about missing reference images."""
+    warnings: List[str] = []
+    if not (item.environment_start_image or "").strip():
+        warnings.append("No Hero Frame image assigned (Environment Start Frame).")
+    assignments = getattr(item, "image_assignments", {}) or {}
+    if not any((info.get("path") or "").strip() for info in assignments.values()):
+        warnings.append("No entity reference images assigned.")
+    return warnings
+
+
 # ── Visual style prompt directives ───────────────────────────────────
 _VISUAL_STYLE_DIRECTIVES: Dict[str, str] = {
     "photorealistic": "photorealistic rendering, natural textures, cinematic realism",
     "anime_cartoon": "anime-style cel shading, vibrant colors, clean line art",
+    "3d_cartoon_pixar": "Pixar-style 3D cartoon rendering, smooth rounded forms, subsurface skin scattering, expressive oversized eyes, stylized proportions, rich saturated lighting, plastic-like material shaders",
     "vintage_retro": "vintage film grain, muted warm tones, light leaks, faded color palette",
     "film_noir": "high-contrast black and white, deep shadows, venetian blind lighting, dramatic chiaroscuro",
     "watercolor": "watercolor painting style, soft blended edges, visible brushstrokes, pigment textures",
@@ -197,7 +389,18 @@ _VISUAL_STYLE_DIRECTIVES: Dict[str, str] = {
     "oil_painting": "oil painting style, rich impasto texture, visible brushstrokes, classical composition",
     "vaporwave_synthwave": "vaporwave synthwave aesthetic, pink-purple-teal gradients, retro-futurist geometry, chrome reflections",
     "documentary_raw": "documentary raw look, natural available lighting, handheld feel, muted desaturated color grade",
+    "grindhouse_70s": "1970s grindhouse exploitation film look, heavy film grain, washed-out saturated color, soft focus, scratched print artifacts, warm amber highlights, gritty low-budget cinematography",
 }
+
+
+def get_visual_style_directive(style_key: str) -> str:
+    """Return the visual style directive string for a given style key.
+
+    Public API so other modules (e.g. ai_generator) can resolve a style key
+    to its prompt directive without duplicating the mapping.
+    Returns empty string for unknown keys.
+    """
+    return _VISUAL_STYLE_DIRECTIVES.get(style_key, "")
 
 
 def _resolve_visual_style(
@@ -207,18 +410,99 @@ def _resolve_visual_style(
     """Return the effective visual style directive string.
 
     Item-level override wins; falls back to project story_settings default.
-    Returns an empty string only for photorealistic (the implicit default).
     """
     style_key = (getattr(item, "visual_style", "") or "").strip()
     if not style_key:
-        ss = getattr(screenplay, "story_settings", {}) or {}
-        style_key = ss.get("visual_style", "photorealistic")
+        ss = getattr(screenplay, "story_settings", None) or {}
+        style_key = ss.get("visual_style") or "photorealistic"
     return _VISUAL_STYLE_DIRECTIVES.get(style_key, "")
 
 
 # =====================================================================
 #  Layer 1 — KEYFRAME PROMPT (Popcorn)
 # =====================================================================
+
+_FILL_FRAME_PATTERNS = re.compile(
+    r'fills?\s+(?:the\s+)?frame'
+    r'|dominates?\s+(?:the\s+)?frame'
+    r'|frame[- ]filling'
+    r'|takes?\s+up\s+(?:the\s+)?(?:entire|whole|full)\s+(?:frame|screen)'
+    r'|covers?\s+(?:the\s+)?(?:entire|whole|full)\s+(?:frame|screen)'
+    r'|(?:entire|whole|full)\s+frame',
+    re.IGNORECASE,
+)
+
+_CLOSE_INTENT_PATTERNS = re.compile(
+    r'close\s+on\b'
+    r'|detail\s+of\b'
+    r'|insert\s+(?:shot\s+)?of\b'
+    r'|tight\s+on\b'
+    r'|macro\s+(?:shot\s+)?of\b'
+    r'|focus(?:ed)?\s+on\b',
+    re.IGNORECASE,
+)
+
+_OTS_PATTERNS = re.compile(
+    r'over\s+(?:\w+\s+)?shoulder'
+    r'|behind\s+(?:\w+\s+){0,4}shoulder'
+    r'|from\s+behind\b'
+    r'|(?:camera|shot)\s+(?:positioned\s+)?behind\b',
+    re.IGNORECASE,
+)
+
+_LOW_ANGLE_PATTERNS = re.compile(
+    r'low\s+angle\b|from\s+below\b|looking\s+up\s+at\b|worm\'?s?\s+eye',
+    re.IGNORECASE,
+)
+
+_HIGH_ANGLE_PATTERNS = re.compile(
+    r'high\s+angle\b|from\s+above\b|looking\s+down\s+(?:at|on)\b|bird\'?s?\s+eye',
+    re.IGNORECASE,
+)
+
+_SHOT_ESCALATION: Dict[str, str] = {
+    "wide": "close_up",
+    "medium": "close_up",
+    "over_shoulder": "close_up",
+    "two_shot": "close_up",
+    "birds_eye": "close_up",
+    "low_angle": "close_up",
+    "high_angle": "close_up",
+    "dutch_angle": "close_up",
+    "close_up": "extreme_close_up",
+}
+
+
+def _detect_framing_override(composition: str, shot_key: str) -> Tuple[str, str]:
+    """Detect if composition notes require a different framing than the shot type.
+
+    Returns (effective_shot_key, framing_prefix).
+    framing_prefix is an extra descriptor to front-load (e.g. "frame-filling").
+
+    Priority: fill-frame > close-intent > camera-angle overrides.
+    """
+    if not composition:
+        return shot_key, ""
+
+    if _FILL_FRAME_PATTERNS.search(composition):
+        escalated = _SHOT_ESCALATION.get(shot_key, shot_key)
+        return escalated, "frame-filling"
+
+    if _CLOSE_INTENT_PATTERNS.search(composition):
+        escalated = _SHOT_ESCALATION.get(shot_key, shot_key)
+        return escalated, "tight"
+
+    if _OTS_PATTERNS.search(composition):
+        return "over_shoulder", "over-the-shoulder"
+
+    if _LOW_ANGLE_PATTERNS.search(composition):
+        return "low_angle", "low-angle"
+
+    if _HIGH_ANGLE_PATTERNS.search(composition):
+        return "high_angle", "high-angle"
+
+    return shot_key, ""
+
 
 def build_keyframe_prompt(
     item: "StoryboardItem",
@@ -238,18 +522,35 @@ def build_keyframe_prompt(
     """
     parts: List[str] = []
 
-    # Shot type and subject
-    shot_label = SHOT_TYPE_OPTIONS.get(
-        getattr(item, "shot_type", "wide"), "Wide Establishing Shot"
+    composition = (getattr(item, "composition_notes", "") or "").strip()
+    shot_key = getattr(item, "shot_type", "wide") or "wide"
+
+    # Auto-escalate shot type when composition demands tighter framing
+    effective_shot_key, framing_prefix = _detect_framing_override(
+        composition, shot_key
     )
+    shot_label = SHOT_TYPE_OPTIONS.get(effective_shot_key, "Wide Establishing Shot")
+
     storyline = (item.storyline or "").strip()
-    static_storyline = _make_static_description(storyline)
-    if static_storyline:
+    static_storyline = _strip_character_descriptions(
+        _make_static_description(storyline)
+    )
+
+    # Front-load framing descriptor when composition overrides shot type
+    if framing_prefix and static_storyline:
+        parts.append(f"{shot_label}, {framing_prefix} view of {static_storyline}")
+    elif static_storyline:
         parts.append(f"{shot_label} of {static_storyline}")
     else:
         parts.append(shot_label)
 
-    # Camera framing (from shot type — already captured above)
+    # Composition / blocking — integrated into the prompt
+    if composition:
+        cleaned_comp = _strip_character_descriptions(composition)
+        if framing_prefix:
+            parts.append(cleaned_comp)
+        else:
+            parts.append(f"Composition: {cleaned_comp}")
 
     # Lighting
     lighting = (getattr(item, "lighting_description", "") or "").strip()
@@ -294,6 +595,51 @@ def _get_environment_name(
     meta = getattr(screenplay, "identity_block_metadata", {}) or {}
     env_meta = meta.get(env_id, {})
     return (env_meta.get("name") or "").strip()
+
+
+def _collect_scene_level_props(
+    screenplay: "Screenplay", scene: Optional["StoryScene"]
+) -> List[str]:
+    """Return names of all objects, vehicles, and passive entities in the scene.
+
+    Scans the scene's generated content for ``[bracket]`` objects and
+    ``{brace}`` vehicles, plus any entities marked as passive in
+    identity block metadata.  These are props that exist on set and
+    should appear in every hero frame regardless of which paragraph
+    interacts with them.
+    """
+    names: List[str] = []
+    seen: set = set()
+
+    if scene:
+        content = ""
+        if scene.metadata and isinstance(scene.metadata, dict):
+            content = scene.metadata.get("generated_content", "")
+        if not content:
+            content = getattr(scene, "description", "") or ""
+
+        for m in re.finditer(r'\[([^\]]+)\]', content):
+            n = m.group(1).strip()
+            if n and n.lower() not in seen:
+                seen.add(n.lower())
+                names.append(n)
+
+        for m in re.finditer(r'\{([^{}]+)\}', content):
+            n = m.group(1).strip()
+            if n and len(n) >= 2 and n.lower() not in seen:
+                seen.add(n.lower())
+                names.append(n)
+
+    if screenplay:
+        meta = getattr(screenplay, "identity_block_metadata", {}) or {}
+        for _eid, emeta in meta.items():
+            if emeta.get("status") == "passive":
+                ename = (emeta.get("name") or "").strip()
+                if ename and ename.lower() not in seen:
+                    seen.add(ename.lower())
+                    names.append(ename)
+
+    return names
 
 
 # =====================================================================
@@ -363,6 +709,29 @@ def _build_identity_lock_section(
         if entity_type == "character":
             lines.append(f"{label} represents {entity_name}.")
             lines.append(suffix)
+        elif entity_type == "group":
+            _gid = (info.get("entity_id") or "").strip()
+            _gmeta = screenplay.identity_block_metadata.get(_gid, {}) if _gid else {}
+            _individuality = _gmeta.get("individuality", "slight_variation")
+            lines.append(f"{label} represents the group {entity_name}.")
+            lines.append("All members must share identical uniform, armor, and insignia.")
+            if _individuality == "identical":
+                lines.append(
+                    "All members are physically identical — same face, body, height, "
+                    "and skin tone (clones/robots/duplicates)."
+                )
+            elif _individuality == "distinct":
+                lines.append(
+                    "Members share faction colours and insignia but vary noticeably in "
+                    "gear, build, height, face, skin tone, and personal modifications."
+                )
+            else:
+                lines.append(
+                    "Members wear the same uniform but are physically diverse — each has "
+                    "a unique face, skin tone, build, and height. They are different "
+                    "people in matching outfits, NOT clones."
+                )
+            lines.append(suffix)
         else:
             lines.append(f"{label} represents the {entity_name} {entity_type}.")
             lines.append("Do not reinterpret as a character.")
@@ -393,7 +762,7 @@ def _build_wardrobe_section(
         if not info:
             continue
         entity_type = (info.get("entity_type") or "").strip().lower()
-        if entity_type != "character":
+        if entity_type not in ("character", "group"):
             continue
         entity_id = (info.get("entity_id") or "").strip()
         entity_name = (info.get("entity_name") or "").strip()
@@ -401,6 +770,16 @@ def _build_wardrobe_section(
             continue
 
         label = slot.replace("_", " ").title()
+
+        if entity_type == "group":
+            meta = screenplay.identity_block_metadata.get(entity_id, {})
+            uniform = (meta.get("uniform_description") or "").strip()
+            if uniform:
+                lines.append(f"{label} ({entity_name}): {uniform}")
+                lines.append("")
+                has_entries = True
+            continue
+
         vid = variant_ids.get(entity_id)
         variant = (
             screenplay.get_wardrobe_variant_by_id(entity_id, vid) if vid else None
@@ -438,6 +817,12 @@ def _build_wardrobe_section(
 #  Layer 3 — VIDEO PROMPT (Motion / Camera / Dialogue)
 # =====================================================================
 
+def _is_visual_art_intent(screenplay: "Screenplay") -> bool:
+    """Return True if the screenplay targets a Visual Art / Abstract intent."""
+    intent = (getattr(screenplay, "intent", "") or "").lower()
+    return "visual art" in intent or "abstract" in intent
+
+
 def build_video_prompt(
     item: "StoryboardItem",
     screenplay: "Screenplay",
@@ -452,6 +837,20 @@ def build_video_prompt(
     assignments = getattr(item, "image_assignments", {}) or {}
     binder = ImageAutoBindEngine(assignments)
     sections: List[str] = []
+
+    # Seamless-loop directive (Visual Art looping mode)
+    va_style = getattr(scene, "visual_art_style", "progressive") if scene else "progressive"
+    if va_style == "looping" and _is_visual_art_intent(screenplay):
+        sections.append(
+            "SEAMLESS LOOP:\n"
+            "This video must loop seamlessly — the final frame returns to the "
+            "opening state so the clip repeats without a visible cut.\n"
+            "Plan all motion as a cycle: environment, lighting, and atmosphere "
+            "must transition back to their starting conditions by the end.\n"
+            "Use circular or oscillating motion (e.g. light fading then returning, "
+            "elements drifting then resettling, camera orbiting back to its origin).\n"
+            "Explicitly show the return to the starting state."
+        )
 
     # Camera movement
     camera_section = _build_camera_section(item)
@@ -471,6 +870,22 @@ def build_video_prompt(
     audio_section = _build_audio_section(screenplay, item=item)
     if audio_section:
         sections.append(audio_section)
+
+    # Strict consistency enforcement (compact — identity lock already has full details)
+    has_characters = any(
+        (info.get("entity_type") or "").lower() in ("character", "group")
+        for info in assignments.values()
+        if info
+    )
+    consistency_lines = [
+        "CONSISTENCY: Match all reference images exactly — faces, proportions, "
+        "clothing, setting. No invented characters, objects, or details.",
+    ]
+    if has_characters:
+        consistency_lines.append(
+            "No camera gaze unless storyline demands it."
+        )
+    sections.append(" ".join(consistency_lines))
 
     return "\n\n".join(sections)
 
@@ -564,7 +979,7 @@ def _build_dialogue_section(
         info = assignments.get(slot)
         if not info:
             continue
-        if (info.get("entity_type") or "").lower() == "character":
+        if (info.get("entity_type") or "").lower() in ("character", "group"):
             ename = (info.get("entity_name") or "").strip()
             if ename:
                 label = slot.replace("_", " ").title()
@@ -751,6 +1166,63 @@ def compile_all_prompts(
         "identity_prompt": identity,
         "video_prompt": video,
         "errors": [],
+    }
+
+
+# =====================================================================
+#  Platform-adapted prompt compilation
+# =====================================================================
+
+def compile_platform_prompts(
+    item: "StoryboardItem",
+    screenplay: "Screenplay",
+    scene: Optional["StoryScene"] = None,
+) -> Dict[str, object]:
+    """Compile prompts and adapt them for the project's selected platform.
+
+    Returns::
+
+        {
+            "success": bool,
+            "keyframe_prompt": str,
+            "identity_prompt": str,
+            "video_prompt": str,
+            "platform_prompt": str,   # adapted for the target platform
+            "platform_id": str,
+            "platform_name": str,
+            "errors": List[str],
+        }
+    """
+    from .prompt_adapters import get_adapter
+
+    result = compile_all_prompts(item, screenplay, scene)
+
+    ss = getattr(screenplay, "story_settings", {}) or {}
+    platform_id = ss.get("generation_platform", "higgsfield")
+
+    adapter = get_adapter(platform_id)
+
+    if not result["success"] or not adapter:
+        return {
+            **result,
+            "platform_prompt": "",
+            "platform_id": platform_id,
+            "platform_name": adapter.platform_name if adapter else platform_id,
+        }
+
+    adapted = adapter.adapt(
+        result["keyframe_prompt"],
+        result["identity_prompt"],
+        result["video_prompt"],
+        item,
+        screenplay,
+    )
+
+    return {
+        **result,
+        "platform_prompt": adapted,
+        "platform_id": platform_id,
+        "platform_name": adapter.platform_name,
     }
 
 

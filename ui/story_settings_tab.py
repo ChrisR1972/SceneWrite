@@ -1,4 +1,8 @@
-"""Story Settings tab -- per-project cinematic and audio generation controls."""
+"""Story Settings tab -- per-project cinematic and audio generation controls.
+
+The Generation Platform selector drives which video/image models appear and
+which platform-specific controls are visible.
+"""
 
 from __future__ import annotations
 
@@ -14,10 +18,13 @@ from PyQt6.QtWidgets import (
     QLabel,
     QPushButton,
     QScrollArea,
+    QSlider,
     QSpinBox,
     QVBoxLayout,
     QWidget,
 )
+
+from core.prompt_adapters import PLATFORM_REGISTRY, get_adapter_class
 
 
 class StorySettingsTab(QWidget):
@@ -29,6 +36,7 @@ class StorySettingsTab(QWidget):
         super().__init__(parent)
         self._screenplay = None
         self._loading = False
+        self._platform_controls: dict = {}
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -48,7 +56,9 @@ class StorySettingsTab(QWidget):
         layout = QVBoxLayout(container)
         layout.setContentsMargins(10, 10, 10, 10)
 
+        layout.addWidget(self._build_platform_group())
         layout.addWidget(self._build_cinematic_group())
+        layout.addWidget(self._build_platform_specific_group())
         layout.addWidget(self._build_audio_group())
 
         reset_row = QHBoxLayout()
@@ -64,14 +74,43 @@ class StorySettingsTab(QWidget):
         scroll.setWidget(container)
         outer.addWidget(scroll)
 
-    # -- Cinematic controls -------------------------------------------
+    # -- Platform selector ---------------------------------------------
 
-    def _build_cinematic_group(self) -> QGroupBox:
-        group = QGroupBox("Video Model and Cinematic Controls")
+    def _build_platform_group(self) -> QGroupBox:
+        group = QGroupBox("Generation Platform")
         form = QFormLayout(group)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
-        # 1) Multi-Shot + Max Duration (side by side)
+        self.platform_combo = QComboBox()
+        for pid, cls in PLATFORM_REGISTRY.items():
+            self.platform_combo.addItem(f"{cls.platform_name}  —  {cls.description}", pid)
+        self.platform_combo.setToolTip(
+            "Select the AI video generation platform.\n"
+            "This determines available models, controls, and prompt format."
+        )
+        form.addRow("Platform:", self.platform_combo)
+
+        self.video_model_combo = QComboBox()
+        self.video_model_combo.setToolTip("Video generation model for the selected platform.")
+        form.addRow("Video Model:", self.video_model_combo)
+
+        self.image_model_combo = QComboBox()
+        self.image_model_combo.setToolTip("Image generation model (hero frames).")
+        self.image_model_label = QLabel("Image Model:")
+        form.addRow(self.image_model_label, self.image_model_combo)
+
+        self.platform_combo.currentIndexChanged.connect(self._on_platform_changed)
+
+        return group
+
+    # -- Cinematic controls -------------------------------------------
+
+    def _build_cinematic_group(self) -> QGroupBox:
+        group = QGroupBox("Cinematic Controls")
+        form = QFormLayout(group)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+
+        # Multi-Shot + Max Duration
         ms_row = QHBoxLayout()
 
         self.multishot_check = QCheckBox("Enable Multi-Shot Clustering")
@@ -80,6 +119,7 @@ class StorySettingsTab(QWidget):
             "characters, and vehicles are grouped into a single generation cluster."
         )
         ms_row.addWidget(self.multishot_check)
+        self.multishot_label = self.multishot_check
 
         ms_row.addWidget(QLabel("Max clip duration:"))
         self.max_duration_spin = QSpinBox()
@@ -87,64 +127,31 @@ class StorySettingsTab(QWidget):
         self.max_duration_spin.setValue(8)
         self.max_duration_spin.setSuffix("s")
         self.max_duration_spin.setToolTip(
-            "Maximum duration (in seconds) for a single generated video clip. "
-            "The AI will determine optimal durations up to this limit."
+            "Maximum duration (in seconds) for a single generated video clip."
         )
+        self.max_duration_label = QLabel("Max clip duration:")
         ms_row.addWidget(self.max_duration_spin)
         ms_row.addStretch()
         form.addRow(ms_row)
 
-        # 2) Aspect Ratio
+        # Aspect Ratio
         self.aspect_ratio_combo = QComboBox()
-        for label, value in [
+        self._all_aspect_ratios = [
             ("16:9 (Widescreen)", "16:9"),
             ("9:16 (Vertical / Mobile)", "9:16"),
             ("1:1 (Square)", "1:1"),
             ("4:3 (Classic)", "4:3"),
             ("21:9 (Ultra-wide / Cinematic)", "21:9"),
             ("2.35:1 (Cinema Wide / Anamorphic)", "2.35:1"),
-        ]:
+        ]
+        for label, value in self._all_aspect_ratios:
             self.aspect_ratio_combo.addItem(label, value)
         self.aspect_ratio_combo.setToolTip(
             "Frame aspect ratio used for image and video generation."
         )
         form.addRow("Aspect Ratio:", self.aspect_ratio_combo)
 
-        # 2b) Higgsfield Model
-        self.higgsfield_model_combo = QComboBox()
-        for label, value in [
-            ("DoP Standard — high-quality animation", "higgsfield-ai/dop/standard"),
-            ("DoP Preview — fast preview generation", "higgsfield-ai/dop/preview"),
-            ("Kling 2.1 Pro — realistic human motion", "kling-video/v2.1/pro/image-to-video"),
-            ("Kling 3.0 Pro — faster generation, reduced wait times", "kling-video/v3.0/pro/image-to-video"),
-            ("Seedance Pro — character motion", "bytedance/seedance/v1/pro/image-to-video"),
-        ]:
-            self.higgsfield_model_combo.addItem(label, value)
-        self.higgsfield_model_combo.setToolTip(
-            "Default video generation model for Higgsfield API export.\n"
-            "DoP Standard: general-purpose high quality.\n"
-            "Kling 3.0 Pro: fastest, best for realistic human motion.\n"
-            "Seedance Pro: best for character animation."
-        )
-        form.addRow("Video Model:", self.higgsfield_model_combo)
-
-        # 2b2) Higgsfield Image Model
-        self.higgsfield_image_model_combo = QComboBox()
-        for label, value in [
-            ("Soul Standard — creative character images", "higgsfield-ai/soul/standard"),
-            ("Soul 2.0 — fashion-forward, cultural fluency", "higgsfield-ai/soul/2.0"),
-            ("Nano Banana Pro — 4K image generation", "higgsfield-ai/nano-banana/pro"),
-        ]:
-            self.higgsfield_image_model_combo.addItem(label, value)
-        self.higgsfield_image_model_combo.setToolTip(
-            "Model used to generate hero frame images from keyframe prompts.\n"
-            "Soul Standard: versatile creative image generation.\n"
-            "Soul 2.0: fashion-forward with cultural fluency.\n"
-            "Nano Banana Pro: highest quality, 4K resolution."
-        )
-        form.addRow("Image Model:", self.higgsfield_image_model_combo)
-
-        # 2c) Visual Style
+        # Visual Style
         self.visual_style_combo = QComboBox()
         from core.screenplay_engine import VISUAL_STYLE_OPTIONS
         for key, label in VISUAL_STYLE_OPTIONS.items():
@@ -155,18 +162,31 @@ class StorySettingsTab(QWidget):
         )
         form.addRow("Visual Style:", self.visual_style_combo)
 
-        # 2d) Default Focal Length
+        # Content Rating
+        self.content_rating_combo = QComboBox()
+        from core.screenplay_engine import CONTENT_RATING_OPTIONS
+        for key, label in CONTENT_RATING_OPTIONS.items():
+            self.content_rating_combo.addItem(label, key)
+        self.content_rating_combo.setToolTip(
+            "Controls the content safety level for all AI-generated text and prompts.\n\n"
+            "• Unrestricted — No content filtering. Full creative freedom.\n"
+            "• Teen (PG-13) — Moderate action/violence, mild language, romantic tension. No gore or explicit content.\n"
+            "• Family Friendly (PG) — Mild peril and slapstick OK. No graphic violence, bad language, or sexual content.\n"
+            "• Child Safe (G) — No violence, scary imagery, bad language, or mature themes. Bright and positive tone."
+        )
+        form.addRow("Content Rating:", self.content_rating_combo)
+
+        # Default Focal Length
         self.default_focal_spin = QSpinBox()
         self.default_focal_spin.setRange(8, 50)
         self.default_focal_spin.setValue(35)
         self.default_focal_spin.setSuffix("mm")
         self.default_focal_spin.setToolTip(
-            "Default focal length for new storyboard items (8mm ultra-wide to 50mm portrait).\n"
-            "Matches Cinema Studio 2.0 optics simulation."
+            "Default focal length for new storyboard items (8mm ultra-wide to 50mm portrait)."
         )
         form.addRow("Default Focal Length:", self.default_focal_spin)
 
-        # 3) Identity Lock Strength
+        # Identity Lock Strength
         self.identity_lock_combo = QComboBox()
         for label, value in [
             ("Relaxed -- allow creative variation", "relaxed"),
@@ -176,15 +196,12 @@ class StorySettingsTab(QWidget):
             self.identity_lock_combo.addItem(label, value)
         self.identity_lock_combo.setCurrentIndex(1)
         self.identity_lock_combo.setToolTip(
-            "How strictly identity blocks (character appearances, vehicles, etc.) "
-            "are enforced in generated prompts.\n"
-            "Relaxed: broad consistency, allows artistic freedom.\n"
-            "Standard: balanced fidelity.\n"
-            "Strict: exact reproduction of identity descriptions."
+            "How strictly identity blocks are enforced in generated prompts."
         )
-        form.addRow("Identity Lock Strength:", self.identity_lock_combo)
+        self.identity_lock_label = QLabel("Identity Lock Strength:")
+        form.addRow(self.identity_lock_label, self.identity_lock_combo)
 
-        # 4) Cinematic Beat Density
+        # Cinematic Beat Density
         self.beat_density_combo = QComboBox()
         for label, value in [
             ("Sparse -- fewer beats, longer moments", "sparse"),
@@ -194,14 +211,11 @@ class StorySettingsTab(QWidget):
             self.beat_density_combo.addItem(label, value)
         self.beat_density_combo.setCurrentIndex(1)
         self.beat_density_combo.setToolTip(
-            "Controls the number of story beats packed into each scene.\n"
-            "Sparse: slow, contemplative pacing.\n"
-            "Balanced: standard narrative rhythm.\n"
-            "Dense: high-energy, trailer-like pacing."
+            "Controls the number of story beats packed into each scene."
         )
         form.addRow("Cinematic Beat Density:", self.beat_density_combo)
 
-        # 5) Camera Movement Intensity
+        # Camera Movement Intensity
         self.camera_intensity_combo = QComboBox()
         for label, value in [
             ("Static -- locked-off, minimal movement", "static"),
@@ -212,15 +226,11 @@ class StorySettingsTab(QWidget):
             self.camera_intensity_combo.addItem(label, value)
         self.camera_intensity_combo.setCurrentIndex(1)
         self.camera_intensity_combo.setToolTip(
-            "Intensity of camera movement suggested in motion prompts.\n"
-            "Static: tripod-locked compositions.\n"
-            "Subtle: slight push-ins, gentle pans.\n"
-            "Dynamic: crane shots, tracking, orbits.\n"
-            "Frenetic: handheld energy, whip-pans."
+            "Intensity of camera movement suggested in motion prompts."
         )
         form.addRow("Camera Movement Intensity:", self.camera_intensity_combo)
 
-        # 6) Prompt Output Format
+        # Prompt Output Format
         self.prompt_format_combo = QComboBox()
         for label, value in [
             ("Cinematic Script -- prose-style direction", "cinematic_script"),
@@ -229,14 +239,69 @@ class StorySettingsTab(QWidget):
         ]:
             self.prompt_format_combo.addItem(label, value)
         self.prompt_format_combo.setToolTip(
-            "Format used when assembling generation prompts.\n"
-            "Cinematic Script: rich, narrative prose.\n"
-            "Shot List: concise numbered shots.\n"
-            "Director Notes: minimal technical directions."
+            "Format used when assembling generation prompts."
         )
         form.addRow("Prompt Output Format:", self.prompt_format_combo)
 
         return group
+
+    # -- Platform-specific controls ------------------------------------
+
+    def _build_platform_specific_group(self) -> QGroupBox:
+        group = QGroupBox("Platform-Specific Options")
+        self._platform_specific_group = group
+        form = QFormLayout(group)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+
+        # Duration preset (Sora, Veo, Minimax)
+        self.duration_preset_combo = QComboBox()
+        self.duration_preset_label = QLabel("Duration Preset:")
+        form.addRow(self.duration_preset_label, self.duration_preset_combo)
+        self._platform_controls["duration_preset"] = (
+            self.duration_preset_label,
+            self.duration_preset_combo,
+        )
+
+        # Pika: motion strength slider
+        self.pika_motion_slider = QSlider(Qt.Orientation.Horizontal)
+        self.pika_motion_slider.setRange(1, 5)
+        self.pika_motion_slider.setValue(3)
+        self.pika_motion_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.pika_motion_slider.setTickInterval(1)
+        self.pika_motion_label = QLabel("Motion Strength:")
+        self.pika_motion_value_label = QLabel("3")
+        pika_row = QHBoxLayout()
+        pika_row.addWidget(self.pika_motion_slider)
+        pika_row.addWidget(self.pika_motion_value_label)
+        pika_widget = QWidget()
+        pika_widget.setLayout(pika_row)
+        form.addRow(self.pika_motion_label, pika_widget)
+        self.pika_motion_slider.valueChanged.connect(
+            lambda v: self.pika_motion_value_label.setText(str(v))
+        )
+        self._platform_controls["pika_motion"] = (
+            self.pika_motion_label,
+            pika_widget,
+        )
+
+        # Luma: loop checkbox
+        self.luma_loop_check = QCheckBox("Enable Loop Mode")
+        self.luma_loop_check.setToolTip("Generate seamlessly looping video clips.")
+        self.luma_loop_label = QLabel("Loop:")
+        form.addRow(self.luma_loop_label, self.luma_loop_check)
+        self._platform_controls["luma_loop"] = (
+            self.luma_loop_label,
+            self.luma_loop_check,
+        )
+
+        self._hide_all_platform_controls()
+        return group
+
+    def _hide_all_platform_controls(self):
+        for label, widget in self._platform_controls.values():
+            label.setVisible(False)
+            widget.setVisible(False)
+        self._platform_specific_group.setVisible(False)
 
     # -- Audio controls -----------------------------------------------
 
@@ -245,7 +310,6 @@ class StorySettingsTab(QWidget):
         form = QFormLayout(group)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
-        # 1) Dialogue Generation Mode
         self.dialogue_mode_combo = QComboBox()
         for label, value in [
             ("Generate Dialogue + Audio", "generate"),
@@ -253,14 +317,8 @@ class StorySettingsTab(QWidget):
             ("Disable Dialogue", "disabled"),
         ]:
             self.dialogue_mode_combo.addItem(label, value)
-        self.dialogue_mode_combo.setToolTip(
-            "Generate Dialogue + Audio: dialogue text with audio direction cues.\n"
-            "Generate Script Only: dialogue written but no audio metadata.\n"
-            "Disable Dialogue: visual-only scenes, no spoken lines."
-        )
         form.addRow("Dialogue Generation Mode:", self.dialogue_mode_combo)
 
-        # 2) Sound Effects Density
         self.sfx_density_combo = QComboBox()
         for label, value in [
             ("Minimal -- essential SFX only", "minimal"),
@@ -269,15 +327,8 @@ class StorySettingsTab(QWidget):
         ]:
             self.sfx_density_combo.addItem(label, value)
         self.sfx_density_combo.setCurrentIndex(1)
-        self.sfx_density_combo.setToolTip(
-            "Controls how many sound-effect cues are injected into scenes.\n"
-            "Minimal: only essential impacts, doors, engines.\n"
-            "Cinematic: environmental ambience + interaction SFX.\n"
-            "High-Impact: dense layering for trailer-style pacing."
-        )
         form.addRow("Sound Effects Density:", self.sfx_density_combo)
 
-        # 3) Music Strategy
         self.music_strategy_combo = QComboBox()
         for label, value in [
             ("None -- no music direction", "none"),
@@ -287,15 +338,107 @@ class StorySettingsTab(QWidget):
         ]:
             self.music_strategy_combo.addItem(label, value)
         self.music_strategy_combo.setCurrentIndex(1)
-        self.music_strategy_combo.setToolTip(
-            "None: no music cues generated.\n"
-            "Ambient Bed: subtle background atmosphere.\n"
-            "Thematic Score: recurring musical motifs tied to story.\n"
-            "Full Cinematic Score: dynamic cues aligned with beat density."
-        )
         form.addRow("Music Strategy:", self.music_strategy_combo)
 
         return group
+
+    # ------------------------------------------------------------------
+    # Platform change handler
+    # ------------------------------------------------------------------
+
+    def _on_platform_changed(self, _index=None):
+        """Reconfigure model combos and visibility when platform changes."""
+        platform_id = self.platform_combo.currentData()
+        if not platform_id:
+            return
+        adapter_cls = get_adapter_class(platform_id)
+        if not adapter_cls:
+            return
+
+        was_loading = self._loading
+        self._loading = True
+        try:
+            # Video models
+            self.video_model_combo.blockSignals(True)
+            self.video_model_combo.clear()
+            for model_id, label in adapter_cls.video_models.items():
+                self.video_model_combo.addItem(label, model_id)
+            self.video_model_combo.blockSignals(False)
+
+            # Image models
+            self.image_model_combo.blockSignals(True)
+            self.image_model_combo.clear()
+            if adapter_cls.supports_image_generation and adapter_cls.image_models:
+                for model_id, label in adapter_cls.image_models.items():
+                    self.image_model_combo.addItem(label, model_id)
+                self.image_model_combo.setVisible(True)
+                self.image_model_label.setVisible(True)
+            else:
+                self.image_model_combo.setVisible(False)
+                self.image_model_label.setVisible(False)
+            self.image_model_combo.blockSignals(False)
+
+            # Multi-shot and identity lock only for Higgsfield
+            show_higgsfield = adapter_cls.supports_multishot
+            self.multishot_check.setVisible(show_higgsfield)
+            show_identity_lock = adapter_cls.supports_identity_lock
+            self.identity_lock_combo.setVisible(show_identity_lock)
+            self.identity_lock_label.setVisible(show_identity_lock)
+
+            # Max duration range
+            self.max_duration_spin.setMaximum(adapter_cls.max_duration)
+            if self.max_duration_spin.value() > adapter_cls.max_duration:
+                self.max_duration_spin.setValue(adapter_cls.max_duration)
+
+            # Aspect ratios
+            current_ar = self.aspect_ratio_combo.currentData()
+            self.aspect_ratio_combo.blockSignals(True)
+            self.aspect_ratio_combo.clear()
+            supported = set(adapter_cls.supported_aspect_ratios)
+            for label, value in self._all_aspect_ratios:
+                if value in supported:
+                    self.aspect_ratio_combo.addItem(label, value)
+            idx = self.aspect_ratio_combo.findData(current_ar)
+            if idx >= 0:
+                self.aspect_ratio_combo.setCurrentIndex(idx)
+            self.aspect_ratio_combo.blockSignals(False)
+
+            # Platform-specific controls
+            self._hide_all_platform_controls()
+
+            any_visible = False
+
+            # Duration presets
+            if adapter_cls.duration_presets:
+                self.duration_preset_combo.blockSignals(True)
+                self.duration_preset_combo.clear()
+                for d in adapter_cls.duration_presets:
+                    self.duration_preset_combo.addItem(f"{d} seconds", d)
+                self.duration_preset_combo.blockSignals(False)
+                for w in self._platform_controls["duration_preset"]:
+                    w.setVisible(True)
+                any_visible = True
+
+            # Pika motion strength
+            if platform_id == "pika":
+                for w in self._platform_controls["pika_motion"]:
+                    w.setVisible(True)
+                any_visible = True
+
+            # Luma loop
+            if platform_id == "luma":
+                for w in self._platform_controls["luma_loop"]:
+                    w.setVisible(True)
+                any_visible = True
+
+            self._platform_specific_group.setVisible(any_visible)
+
+        finally:
+            self._loading = was_loading
+
+        if not self._loading and self._screenplay:
+            self._save_to_screenplay()
+            self.data_changed.emit()
 
     # ------------------------------------------------------------------
     # Data <-> UI
@@ -311,13 +454,30 @@ class StorySettingsTab(QWidget):
         try:
             ss = getattr(screenplay, "story_settings", {}) or {}
             audio = ss.get("audio_settings", {}) or {}
+            pc = ss.get("platform_config", {}) or {}
+
+            # Platform (triggers _on_platform_changed which rebuilds model combos)
+            self._set_combo_by_data(
+                self.platform_combo,
+                ss.get("generation_platform", "higgsfield"),
+            )
+            self._on_platform_changed()
+
+            # Models — set AFTER platform change rebuilt the combos
+            self._set_combo_by_data(
+                self.video_model_combo,
+                ss.get("video_model", ss.get("higgsfield_model", "")),
+            )
+            self._set_combo_by_data(
+                self.image_model_combo,
+                ss.get("image_model", ss.get("higgsfield_image_model", "")),
+            )
 
             self.multishot_check.setChecked(ss.get("supports_multishot", False))
             self.max_duration_spin.setValue(ss.get("max_generation_duration_seconds", 8))
             self._set_combo_by_data(self.aspect_ratio_combo, ss.get("aspect_ratio", "16:9"))
-            self._set_combo_by_data(self.higgsfield_model_combo, ss.get("higgsfield_model", "higgsfield-ai/dop/standard"))
-            self._set_combo_by_data(self.higgsfield_image_model_combo, ss.get("higgsfield_image_model", "higgsfield-ai/soul/standard"))
-            self._set_combo_by_data(self.visual_style_combo, ss.get("visual_style", "photorealistic"))
+            self._set_combo_by_data(self.visual_style_combo, ss.get("visual_style") or "photorealistic")
+            self._set_combo_by_data(self.content_rating_combo, ss.get("content_rating") or "unrestricted")
             self.default_focal_spin.setValue(ss.get("default_focal_length", 35))
             self._set_combo_by_data(self.identity_lock_combo, ss.get("identity_lock_strength", "standard"))
             self._set_combo_by_data(self.beat_density_combo, ss.get("cinematic_beat_density", "balanced"))
@@ -327,6 +487,14 @@ class StorySettingsTab(QWidget):
             self._set_combo_by_data(self.dialogue_mode_combo, audio.get("dialogue_generation_mode", "generate"))
             self._set_combo_by_data(self.sfx_density_combo, audio.get("sfx_density", "cinematic"))
             self._set_combo_by_data(self.music_strategy_combo, audio.get("music_strategy", "ambient"))
+
+            # Platform-specific
+            if pc.get("duration_preset"):
+                self._set_combo_by_data(self.duration_preset_combo, pc["duration_preset"])
+            if "pika_motion_strength" in pc:
+                self.pika_motion_slider.setValue(pc["pika_motion_strength"])
+            if "luma_loop" in pc:
+                self.luma_loop_check.setChecked(pc["luma_loop"])
 
             self._connect_signals()
         finally:
@@ -343,12 +511,14 @@ class StorySettingsTab(QWidget):
 
     def _change_signals(self):
         return [
+            self.platform_combo.currentIndexChanged,
+            self.video_model_combo.currentIndexChanged,
+            self.image_model_combo.currentIndexChanged,
             self.multishot_check.toggled,
             self.max_duration_spin.valueChanged,
             self.aspect_ratio_combo.currentIndexChanged,
-            self.higgsfield_model_combo.currentIndexChanged,
-            self.higgsfield_image_model_combo.currentIndexChanged,
             self.visual_style_combo.currentIndexChanged,
+            self.content_rating_combo.currentIndexChanged,
             self.default_focal_spin.valueChanged,
             self.identity_lock_combo.currentIndexChanged,
             self.beat_density_combo.currentIndexChanged,
@@ -357,6 +527,9 @@ class StorySettingsTab(QWidget):
             self.dialogue_mode_combo.currentIndexChanged,
             self.sfx_density_combo.currentIndexChanged,
             self.music_strategy_combo.currentIndexChanged,
+            self.duration_preset_combo.currentIndexChanged,
+            self.pika_motion_slider.valueChanged,
+            self.luma_loop_check.toggled,
         ]
 
     def _on_setting_changed(self):
@@ -386,12 +559,14 @@ class StorySettingsTab(QWidget):
             ss = get_default_story_settings()
             self._screenplay.story_settings = ss
 
+        ss["generation_platform"] = self.platform_combo.currentData() or "higgsfield"
+        ss["video_model"] = self.video_model_combo.currentData() or ""
+        ss["image_model"] = self.image_model_combo.currentData() or ""
         ss["supports_multishot"] = self.multishot_check.isChecked()
         ss["max_generation_duration_seconds"] = self.max_duration_spin.value()
         ss["aspect_ratio"] = self.aspect_ratio_combo.currentData() or "16:9"
-        ss["higgsfield_model"] = self.higgsfield_model_combo.currentData() or "higgsfield-ai/dop/standard"
-        ss["higgsfield_image_model"] = self.higgsfield_image_model_combo.currentData() or "higgsfield-ai/soul/standard"
         ss["visual_style"] = self.visual_style_combo.currentData() or "photorealistic"
+        ss["content_rating"] = self.content_rating_combo.currentData() or "unrestricted"
         ss["default_focal_length"] = self.default_focal_spin.value()
         ss["identity_lock_strength"] = self.identity_lock_combo.currentData() or "standard"
         ss["cinematic_beat_density"] = self.beat_density_combo.currentData() or "balanced"
@@ -402,6 +577,19 @@ class StorySettingsTab(QWidget):
         audio["dialogue_generation_mode"] = self.dialogue_mode_combo.currentData() or "generate"
         audio["sfx_density"] = self.sfx_density_combo.currentData() or "cinematic"
         audio["music_strategy"] = self.music_strategy_combo.currentData() or "ambient"
+
+        # Platform config
+        pc = ss.setdefault("platform_config", {})
+        if self.duration_preset_combo.isVisible():
+            pc["duration_preset"] = self.duration_preset_combo.currentData()
+        if self.pika_motion_slider.isVisible():
+            pc["pika_motion_strength"] = self.pika_motion_slider.value()
+        if self.luma_loop_check.isVisible():
+            pc["luma_loop"] = self.luma_loop_check.isChecked()
+
+        # Remove old keys if present
+        ss.pop("higgsfield_model", None)
+        ss.pop("higgsfield_image_model", None)
 
         # Validation: if multishot disabled, revert all scenes to single-shot
         if not ss["supports_multishot"]:

@@ -1,5 +1,5 @@
 """
-Story Framework View for MoviePrompterAI.
+Story Framework View for SceneWrite.
 Displays acts and scenes in a tree structure, with editing capabilities.
 """
 
@@ -22,41 +22,31 @@ from core.spell_checker import enable_spell_checking, enable_cinematic_checking
 from .identity_block_manager import IdentityBlockManager
 from .story_settings_tab import StorySettingsTab
 
+def _safe_print(*args, **kwargs):
+    """Route output through debug_log instead of stdout (hidden in production)."""
+    try:
+        from debug_log import debug_log as _dl
+        _dl(" ".join(str(a) for a in args))
+    except Exception:
+        pass
+
 # Logger functions - temporarily disabled to prevent crashes
 def log_exception(msg, exc):
     try:
         import traceback
-        print(f"ERROR: {msg}: {exc}")
+        _safe_print(f"ERROR: {msg}: {exc}")
         traceback.print_exc()
     except:
         pass
 def log_error(msg):
     try:
-        print(f"ERROR: {msg}")
+        _safe_print(f"ERROR: {msg}")
     except:
         pass
 def log_info(msg):
     pass
 def get_log_file_path():
     return "N/A"
-
-class SceneDescriptionTextEdit(QTextEdit):
-    """QTextEdit with Add Entity at top of standard context menu."""
-    
-    add_entity_requested = pyqtSignal()
-    
-    def contextMenuEvent(self, event):
-        menu = self.createStandardContextMenu()
-        add_action = QAction("Add Entity", self)
-        add_action.triggered.connect(self.add_entity_requested.emit)
-        if menu.actions():
-            menu.insertAction(menu.actions()[0], add_action)
-            menu.insertSeparator(menu.actions()[1])
-        else:
-            menu.addAction(add_action)
-            menu.addSeparator()
-        menu.exec(event.globalPos())
-
 
 class SceneContentTextEdit(QTextEdit):
     """QTextEdit with cinematic markup context menu, spell-check, and token highlighting.
@@ -478,6 +468,105 @@ class SceneContentTextEdit(QTextEdit):
                 pass
 
 
+class SceneDescriptionTextEdit(SceneContentTextEdit):
+    """Scene description text edit with cinematic markup context menu plus Add Entity."""
+
+    add_entity_requested = pyqtSignal()
+
+    def contextMenuEvent(self, event):
+        import re
+        from core.markup_whitelist import normalize_sfx
+
+        menu = self.createStandardContextMenu()
+        cursor = self.cursorForPosition(event.pos())
+
+        sel_cursor = self.textCursor()
+        if sel_cursor.hasSelection():
+            word = sel_cursor.selectedText().strip()
+            cursor = sel_cursor
+        else:
+            cursor.select(QTextCursor.SelectionType.WordUnderCursor)
+            word = cursor.selectedText().strip()
+
+        first_action = menu.actions()[0] if menu.actions() else None
+
+        # ── Add Entity (always at the top) ──
+        add_entity_act = QAction("Add Entity", self)
+        add_entity_act.triggered.connect(self.add_entity_requested.emit)
+        if first_action:
+            menu.insertAction(first_action, add_entity_act)
+            menu.insertSeparator(first_action)
+        else:
+            menu.addAction(add_entity_act)
+            menu.addSeparator()
+
+        if not word:
+            menu.exec(event.globalPos())
+            return
+
+        full_text = self.toPlainText()
+        sel_start = cursor.selectionStart()
+        sel_end = cursor.selectionEnd()
+
+        current_markup = None
+        markup_span = None
+        inner_word = word
+        for pat, mtype, grp in self._MARKUP_PATTERNS:
+            for m in re.finditer(pat, full_text):
+                if m.start() <= sel_start and sel_end <= m.end():
+                    current_markup = mtype
+                    markup_span = (m.start(), m.end())
+                    inner_word = m.group(grp)
+                    break
+            if current_markup:
+                break
+
+        first_std = first_action
+
+        # ── MARKUP SECTION ──
+        markup_menu = QMenu("Mark As", self)
+        for label, ctype, fmt_example in [
+            ("Action", "action", f"*{word}*"),
+            ("SFX", "sfx", f"({normalize_sfx(word)})"),
+            ("Character", "character", word.upper()),
+            ("Object", "object", f"[{word}]"),
+            ("Vehicle", "vehicle", "{" + word + "}"),
+            ("Environment", "environment", f"_{word}_"),
+        ]:
+            a = QAction(f"{label}  \u2192  {fmt_example}", self)
+            ctype_copy, word_copy = ctype, word
+            def apply_markup(checked=False, ct=ctype_copy, w=word_copy):
+                self._apply_markup(ct, w)
+            a.triggered.connect(apply_markup)
+            markup_menu.addAction(a)
+
+        if first_std:
+            menu.insertMenu(first_std, markup_menu)
+        else:
+            menu.addMenu(markup_menu)
+
+        # ── REMOVE MARKUP ──
+        if current_markup and markup_span:
+            remove_action = QAction("Remove Markup", self)
+            span_start, span_end = markup_span
+            iw = inner_word
+            def do_remove(checked=False, s=span_start, e=span_end, raw=iw):
+                self._remove_markup(s, e, raw)
+            remove_action.triggered.connect(do_remove)
+            if first_std:
+                menu.insertAction(first_std, remove_action)
+            else:
+                menu.addAction(remove_action)
+
+        # ── SEPARATOR before standard actions ──
+        if first_std:
+            menu.insertSeparator(first_std)
+        else:
+            menu.addSeparator()
+
+        menu.exec(event.globalPos())
+
+
 class AddEntityDialog(QDialog):
     """Dialog to select an entity (character, environment, vehicle, object) for insertion into scene description."""
     
@@ -780,7 +869,7 @@ class FrameworkGenerationThread(QThread):
     finished = pyqtSignal(Screenplay)
     error = pyqtSignal(str)
     
-    def __init__(self, ai_generator, premise, title, length, atmosphere, genres, story_outline=None, intent="General Story", brand_context=None):
+    def __init__(self, ai_generator, premise, title, length, atmosphere, genres, story_outline=None, intent="General Story", brand_context=None, series_bible=None, custom_duration_seconds: int = 0):
         super().__init__()
         self.ai_generator = ai_generator
         self.premise = premise
@@ -791,12 +880,17 @@ class FrameworkGenerationThread(QThread):
         self.story_outline = story_outline
         self.intent = intent
         self.brand_context = brand_context
-    
+        self.series_bible = series_bible
+        self.custom_duration_seconds = custom_duration_seconds
+
     def run(self):
         """Generate framework in background thread."""
         try:
             screenplay = self.ai_generator.generate_story_framework(
-                self.premise, self.title, self.length, self.atmosphere, self.genres, self.story_outline, self.intent, self.brand_context
+                self.premise, self.title, self.length, self.atmosphere, self.genres,
+                self.story_outline, self.intent, self.brand_context,
+                series_bible=self.series_bible,
+                custom_duration_seconds=self.custom_duration_seconds,
             )
             self.finished.emit(screenplay)
         except Exception as e:
@@ -808,23 +902,24 @@ class SceneContentGenerationThread(QThread):
     finished = pyqtSignal(str, object)  # Emits (generated content, list of drift warnings)
     error = pyqtSignal(str)  # Emits error message
     
-    def __init__(self, ai_generator: AIGenerator, scene_description: str, 
-                 word_count: int, screenplay: Screenplay, scene: StoryScene):
+    def __init__(self, ai_generator: AIGenerator, scene_description: str,
+                 screenplay: Screenplay, scene: StoryScene, *,
+                 target_duration: int = 0):
         super().__init__()
         self.ai_generator = ai_generator
         self.scene_description = scene_description
-        self.word_count = word_count
         self.screenplay = screenplay
         self.scene = scene
+        self.target_duration = target_duration
     
     def run(self):
         """Generate scene content."""
         try:
             result = self.ai_generator.generate_scene_content(
                 scene_description=self.scene_description,
-                word_count=self.word_count,
                 screenplay=self.screenplay,
-                scene=self.scene
+                scene=self.scene,
+                target_duration=self.target_duration
             )
             content = result[0] if isinstance(result, tuple) else result
             drift_warnings = result[1] if isinstance(result, tuple) and len(result) > 1 else []
@@ -975,10 +1070,27 @@ class StoryFrameworkView(QWidget):
             self.content_group.setVisible(not is_art)
         if hasattr(self, 'reextract_entities_btn'):
             self.reextract_entities_btn.setVisible(not is_art)
+        if hasattr(self, 'char_focus_group'):
+            self.char_focus_group.setVisible(not is_art)
         if hasattr(self, 'wardrobe_group'):
             self.wardrobe_group.setVisible(not is_art)
         if hasattr(self, 'visual_art_row'):
             self.visual_art_row.setVisible(is_art)
+
+    def _update_custom_duration_visibility(self):
+        """Hide the scene_duration_combo and show a read-only label when custom duration is active."""
+        is_custom = (self.screenplay and getattr(self.screenplay, "custom_duration_seconds", 0) > 0)
+        if hasattr(self, "scene_duration_combo"):
+            self.scene_duration_combo.setVisible(not is_custom)
+        if hasattr(self, "scene_duration_label_text"):
+            self.scene_duration_label_text.setVisible(not is_custom)
+        if hasattr(self, "custom_duration_label"):
+            self.custom_duration_label.setVisible(is_custom)
+            if is_custom and self.current_scene:
+                est = getattr(self.current_scene, "estimated_duration", 0) or 60
+                self.custom_duration_label.setText(f"Scene length: {est}s (allocated by time budget)")
+            elif is_custom:
+                self.custom_duration_label.setText("Scene length: (allocated by time budget)")
 
     def _on_visual_art_style_changed(self):
         """Handle visual art style combo change — persist to current scene."""
@@ -1052,7 +1164,7 @@ class StoryFrameworkView(QWidget):
             
             # Filter non-person entities (UI, software, abstract visuals)
             if self.ai_generator._is_company_or_concept_entity(name):
-                print(f"  [registry cleanup] removed non-person: {name}")
+                _safe_print(f"  [registry cleanup] removed non-person: {name}")
                 changed = True
                 continue
             
@@ -1061,13 +1173,13 @@ class StoryFrameworkView(QWidget):
             if bp:
                 name = self.ai_generator._normalize_character_name_for_identity(bp[0]) or bp[0]
                 if name != original:
-                    print(f"  [registry cleanup] folded body-part: {original} → {name}")
+                    _safe_print(f"  [registry cleanup] folded body-part: {original} → {name}")
                     changed = True
             else:
                 # Strip leading articles ("A Filmmaker" → "Filmmaker")
                 stripped = self.ai_generator._normalize_character_name_for_identity(name)
                 if stripped and stripped.lower() != name.lower():
-                    print(f"  [registry cleanup] stripped article: {name} → {stripped}")
+                    _safe_print(f"  [registry cleanup] stripped article: {name} → {stripped}")
                     name = stripped
                     changed = True
             
@@ -1079,7 +1191,7 @@ class StoryFrameworkView(QWidget):
                     for accepted in cleaned:
                         accepted_words = set(accepted.upper().split())
                         if len(name_words & accepted_words) >= 2 and name.upper() != accepted.upper():
-                            print(f"  [registry cleanup] removing overlap: '{name}' conflicts with '{accepted}'")
+                            _safe_print(f"  [registry cleanup] removing overlap: '{name}' conflicts with '{accepted}'")
                             is_overlap = True
                             changed = True
                             break
@@ -1091,7 +1203,7 @@ class StoryFrameworkView(QWidget):
         
         if changed:
             self.screenplay.character_registry = cleaned
-            print(f"  [registry cleanup] registry now: {cleaned}")
+            _safe_print(f"  [registry cleanup] registry now: {cleaned}")
 
     def __init__(self, parent=None):
         try:
@@ -1304,8 +1416,9 @@ class StoryFrameworkView(QWidget):
 
             # Story Settings (not a tab — opened from Settings menu)
             debug_log("Creating story settings tab...")
-            self.story_settings_tab = StorySettingsTab()
+            self.story_settings_tab = StorySettingsTab(self)
             self.story_settings_tab.data_changed.connect(self.data_changed.emit)
+            self.story_settings_tab.hide()
             debug_log("Story settings tab created")
             
             center_layout.addWidget(self.tabs)
@@ -1354,13 +1467,24 @@ class StoryFrameworkView(QWidget):
         generate_layout = QHBoxLayout(self.generate_row_widget)
         generate_layout.setContentsMargins(0, 0, 0, 0)
         generate_layout.addWidget(QLabel("Generate Full Scene Content:"))
+
+        # Scene duration selector
+        self.scene_duration_combo = QComboBox()
+        self.scene_duration_combo.addItem("15s  (micro)", 15)
+        self.scene_duration_combo.addItem("30s  (short)", 30)
+        self.scene_duration_combo.addItem("45s  (brief)", 45)
+        self.scene_duration_combo.addItem("60s  (standard)", 60)
+        self.scene_duration_combo.addItem("90s  (extended)", 90)
+        self.scene_duration_combo.addItem("120s (long)", 120)
+        self.scene_duration_combo.setCurrentIndex(3)  # Default to 60s
+        self.scene_duration_label_text = QLabel("Scene length:")
+        generate_layout.addWidget(self.scene_duration_label_text)
+        generate_layout.addWidget(self.scene_duration_combo)
         
-        # Word count selector
-        self.word_count_combo = QComboBox()
-        self.word_count_combo.addItems(["200", "400", "600"])
-        self.word_count_combo.setCurrentIndex(1)  # Default to 400
-        generate_layout.addWidget(QLabel("Target words:"))
-        generate_layout.addWidget(self.word_count_combo)
+        self.custom_duration_label = QLabel("")
+        self.custom_duration_label.setStyleSheet("color: #888; font-style: italic;")
+        self.custom_duration_label.setVisible(False)
+        generate_layout.addWidget(self.custom_duration_label)
         
         self.generate_scene_content_btn = QPushButton("Generate with AI")
         self.generate_scene_content_btn.clicked.connect(self.on_generate_scene_content_clicked)
@@ -1387,6 +1511,38 @@ class StoryFrameworkView(QWidget):
         desc_layout.addWidget(self.visual_art_row)
         
         desc_group.setLayout(desc_layout)
+
+        # Character Focus — collapsible, above wardrobe
+        self.char_focus_group = QGroupBox("Character Focus")
+        self.char_focus_group.setCheckable(True)
+        self.char_focus_group.setChecked(True)
+        self.char_focus_group.setToolTip(
+            "Characters featured in this scene.\n"
+            "Characters marked PRIMARY are guaranteed to appear in generated content.\n"
+            "Add or remove characters using the buttons below the list."
+        )
+        cf_inner = QVBoxLayout()
+        self.char_focus_container = QWidget()
+        cf_container_layout = QVBoxLayout(self.char_focus_container)
+        cf_container_layout.setContentsMargins(0, 0, 0, 0)
+        self.char_focus_list = QListWidget()
+        self.char_focus_list.setMaximumHeight(100)
+        cf_container_layout.addWidget(self.char_focus_list)
+        cf_btn_row = QHBoxLayout()
+        self.char_focus_add_btn = QPushButton("+ Add")
+        self.char_focus_add_btn.setToolTip("Add a character to this scene's focus list")
+        self.char_focus_add_btn.clicked.connect(self._on_add_char_focus)
+        cf_btn_row.addWidget(self.char_focus_add_btn)
+        self.char_focus_remove_btn = QPushButton("- Remove")
+        self.char_focus_remove_btn.setToolTip("Remove the selected character from this scene's focus list")
+        self.char_focus_remove_btn.clicked.connect(self._on_remove_char_focus)
+        cf_btn_row.addWidget(self.char_focus_remove_btn)
+        cf_btn_row.addStretch()
+        cf_container_layout.addLayout(cf_btn_row)
+        cf_inner.addWidget(self.char_focus_container)
+        self.char_focus_group.setLayout(cf_inner)
+        self.char_focus_group.toggled.connect(self.char_focus_container.setVisible)
+        layout.addWidget(self.char_focus_group)
 
         # Wardrobe State Selector (per character per scene) — collapsible, above scene description
         self.wardrobe_group = QGroupBox("Wardrobe State (per character)")
@@ -1435,9 +1591,8 @@ class StoryFrameworkView(QWidget):
         
         layout.addStretch()
         
-        # Enable spell checking for editable text widgets
-        enable_spell_checking(self.scene_description_edit)
-        # Scene content uses the combined cinematic markup + spell-check highlighter
+        # Enable cinematic markup + spell-check highlighting (does not override contextMenuEvent)
+        enable_cinematic_checking(self.scene_description_edit)
         enable_cinematic_checking(self.scene_content_display)
         
         # Tab key moves focus (not indentation)
@@ -2080,9 +2235,12 @@ class StoryFrameworkView(QWidget):
     def set_screenplay(self, screenplay: Screenplay):
         """Set the screenplay to display."""
         try:
+            # Reset scene state from previous story before loading new one
+            self.current_scene = None
+            self.clear_scene_data()
+
             self.screenplay = screenplay
             self.update_tree()
-            # Timeline visualization removed
             self.update_character_details()
             self.update_premise_tab()
             # Update identity blocks manager
@@ -2093,13 +2251,15 @@ class StoryFrameworkView(QWidget):
                 self.story_settings_tab.load_settings(screenplay)
             # Adapt UI for Visual Art mode
             self._update_visual_art_visibility()
+            # Adapt UI for custom duration mode
+            self._update_custom_duration_visibility()
         except Exception as e:
             # Silently handle errors during initialization
             try:
                 log_exception("Error in set_screenplay", e)
             except:
                 import traceback
-                print(f"Error updating framework view: {e}")
+                _safe_print(f"Error updating framework view: {e}")
                 traceback.print_exc()
 
     def update_premise_tab_for_profile(self):
@@ -2583,11 +2743,8 @@ class StoryFrameworkView(QWidget):
                 plot_point = getattr(scene, 'plot_point', None)
                 self.plot_point_label.setText(plot_point if plot_point else "None")
             
-            if hasattr(self, 'character_list'):
-                character_focus = getattr(scene, 'character_focus', []) or []
-                self.character_list.clear()
-                for char in character_focus:
-                    self.character_list.addItem(char)
+            # Populate character focus for this scene
+            self._refresh_character_focus_ui(scene)
             
             # Populate character wardrobe for this scene
             self._refresh_wardrobe_ui(scene)
@@ -2599,7 +2756,22 @@ class StoryFrameworkView(QWidget):
             if hasattr(self, 'duration_spinbox'):
                 estimated_duration = getattr(scene, 'estimated_duration', 0) or 0
                 self.duration_spinbox.setValue(estimated_duration)
-            
+
+            # Pre-select the closest duration preset or update custom label
+            is_custom_dur = (self.screenplay and getattr(self.screenplay, "custom_duration_seconds", 0) > 0)
+            if is_custom_dur and hasattr(self, "custom_duration_label"):
+                est = getattr(scene, 'estimated_duration', 0) or 60
+                self.custom_duration_label.setText(f"Scene length: {est}s (allocated by time budget)")
+            elif hasattr(self, 'scene_duration_combo'):
+                est = getattr(scene, 'estimated_duration', 0) or 60
+                best_idx, best_diff = 0, 9999
+                for i in range(self.scene_duration_combo.count()):
+                    diff = abs(self.scene_duration_combo.itemData(i) - est)
+                    if diff < best_diff:
+                        best_diff = diff
+                        best_idx = i
+                self.scene_duration_combo.setCurrentIndex(best_idx)
+
             if hasattr(self, 'compression_strategy_label'):
                 compression_strategy = getattr(scene, 'compression_strategy', 'beat_by_beat') or 'beat_by_beat'
                 # Format for display
@@ -2699,6 +2871,73 @@ class StoryFrameworkView(QWidget):
         all_scenes = self.screenplay.get_all_scenes()
         return bool(all_scenes) and getattr(all_scenes[0], 'scene_id', None) == getattr(scene, 'scene_id', None)
 
+    # ── Character Focus Management ─────────────────────────────────────
+
+    def _refresh_character_focus_ui(self, scene: StoryScene):
+        """Populate the character focus list for the given scene."""
+        if not hasattr(self, 'char_focus_list'):
+            return
+        self.char_focus_list.clear()
+        if not scene:
+            return
+        for name in (getattr(scene, 'character_focus', []) or []):
+            if name and name.strip():
+                self.char_focus_list.addItem(name.strip())
+
+    def _on_add_char_focus(self):
+        """Show a menu of available characters not yet in the focus list."""
+        if not self.current_scene or not self.screenplay:
+            return
+        current_focus = set(
+            (n.strip().lower() for n in (self.current_scene.character_focus or []))
+        )
+        story_outline = getattr(self.screenplay, 'story_outline', {}) or {}
+        characters = story_outline.get("characters", []) or []
+        available = []
+        for ch in characters:
+            if not isinstance(ch, dict):
+                continue
+            name = (ch.get("name") or "").strip()
+            if name and name.lower() not in current_focus:
+                available.append(name)
+
+        if not available:
+            QMessageBox.information(
+                self, "No Characters Available",
+                "All characters from the story outline are already in this scene's focus list."
+            )
+            return
+
+        menu = QMenu(self)
+        for name in available:
+            menu.addAction(name)
+        action = menu.exec(self.char_focus_add_btn.mapToGlobal(
+            self.char_focus_add_btn.rect().bottomLeft()
+        ))
+        if action:
+            chosen = action.text()
+            if not hasattr(self.current_scene, 'character_focus') or self.current_scene.character_focus is None:
+                self.current_scene.character_focus = []
+            self.current_scene.character_focus.append(chosen)
+            self._refresh_character_focus_ui(self.current_scene)
+            self._refresh_wardrobe_ui(self.current_scene)
+            self.data_changed.emit()
+
+    def _on_remove_char_focus(self):
+        """Remove the selected character from the scene's focus list."""
+        if not self.current_scene:
+            return
+        item = self.char_focus_list.currentItem()
+        if not item:
+            QMessageBox.information(self, "No Selection", "Select a character to remove.")
+            return
+        name = item.text()
+        focus = self.current_scene.character_focus or []
+        self.current_scene.character_focus = [n for n in focus if n.strip() != name.strip()]
+        self._refresh_character_focus_ui(self.current_scene)
+        self._refresh_wardrobe_ui(self.current_scene)
+        self.data_changed.emit()
+
     def _refresh_wardrobe_ui(self, scene: StoryScene):
         """Populate the wardrobe state selector for each character in the scene."""
         if not hasattr(self, 'wardrobe_form') or not self.screenplay:
@@ -2706,6 +2945,12 @@ class StoryFrameworkView(QWidget):
 
         if self._is_first_scene(scene):
             self.wardrobe_group.setVisible(False)
+            # Clear stale selectors so they don't pollute the first scene's
+            # character_wardrobe_selector when the user clicks Approve.
+            while self.wardrobe_form.rowCount() > 0:
+                self.wardrobe_form.removeRow(0)
+            self.wardrobe_selectors.clear()
+            self.wardrobe_edits.clear()
             return
         self.wardrobe_group.setVisible(True)
         while self.wardrobe_form.rowCount() > 0:
@@ -2730,7 +2975,22 @@ class StoryFrameworkView(QWidget):
 
         char_names = sorted(seen_lower.values())
         selector_state = getattr(scene, 'character_wardrobe_selector', {}) or {}
-        last_variants = getattr(self.screenplay, 'character_last_wardrobe_variant', {}) or {}
+
+        # Build set of entity IDs that appeared in any earlier scene
+        earlier_entity_ids: set = set()
+        all_scenes = self.screenplay.get_all_scenes()
+        for prev_scene in all_scenes:
+            if getattr(prev_scene, 'scene_id', None) == getattr(scene, 'scene_id', None):
+                break
+            for name in (getattr(prev_scene, 'character_focus', []) or []):
+                lk = f"character:{name.strip()}".lower()
+                eid = self.screenplay.identity_block_ids.get(lk)
+                if eid:
+                    earlier_entity_ids.add(eid)
+            for eid in getattr(prev_scene, 'character_wardrobe', {}) or {}:
+                earlier_entity_ids.add(eid)
+            for eid in getattr(prev_scene, 'character_wardrobe_variant_ids', {}) or {}:
+                earlier_entity_ids.add(eid)
 
         for char_name in char_names:
             lookup = f"character:{char_name}".lower()
@@ -2742,22 +3002,30 @@ class StoryFrameworkView(QWidget):
             if not entity_id:
                 continue
 
-            has_previous = bool(last_variants.get(entity_id))
+            is_first_appearance = entity_id not in earlier_entity_ids
+            if is_first_appearance:
+                hint = QLabel("First appearance — wardrobe derived from scene content")
+                hint.setStyleSheet("color: #888; font-style: italic; font-size: 10px;")
+                self.wardrobe_form.addRow(f"{char_name}:", hint)
+                continue
+
             combo = QComboBox()
-            combo.addItem("-- Select wardrobe state --", "")
-            if has_previous:
-                prev_var = self.screenplay.get_wardrobe_variant_by_id(entity_id, last_variants[entity_id])
-                prev_label = prev_var.get("label", "previous") if prev_var else "previous"
-                combo.addItem(f"Same wardrobe from last scene ({prev_label})", "same")
+            combo.addItem("Same wardrobe from last scene", "same")
             combo.addItem("Wardrobe change (new outfit)", "change")
             combo.addItem("Wardrobe change seen in this scene", "change_in_scene")
 
             saved = selector_state.get(entity_id, "")
-            idx = combo.findData(saved)
-            if idx >= 0:
-                combo.setCurrentIndex(idx)
-            elif has_previous and not saved:
-                combo.setCurrentIndex(combo.findData("same"))
+            if saved:
+                idx = combo.findData(saved)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+                else:
+                    combo.setCurrentIndex(0)
+            else:
+                combo.setCurrentIndex(0)
+                if not hasattr(scene, 'character_wardrobe_selector'):
+                    scene.character_wardrobe_selector = {}
+                scene.character_wardrobe_selector[entity_id] = "same"
 
             def _on_changed(_, eid=entity_id, cb=combo):
                 self._on_wardrobe_selector_changed(eid, cb)
@@ -2781,7 +3049,8 @@ class StoryFrameworkView(QWidget):
         self.scene_description_edit.clear()
         if hasattr(self, 'scene_content_display'):
             self.scene_content_display.clear()
-        # Right panel widgets removed
+        if hasattr(self, 'char_focus_list'):
+            self.char_focus_list.clear()
         self.storyboard_list.clear()
     
     def _is_micro_narrative(self) -> bool:
@@ -3064,7 +3333,7 @@ class StoryFrameworkView(QWidget):
         self.screenplay.character_registry_frozen = bool(registry)
 
     def _save_species_to_current_char(self):
-        """Persist the current species selection to the character data."""
+        """Persist the current species selection to the character data and identity block metadata."""
         if not self.screenplay or getattr(self, '_loading_char_selection', False):
             return
         row = self.char_details_list.currentRow() if hasattr(self, 'char_details_list') else -1
@@ -3077,7 +3346,16 @@ class StoryFrameworkView(QWidget):
         char = characters[row]
         if not isinstance(char, dict):
             return
-        char["species"] = self._get_current_species()
+        species = self._get_current_species()
+        char["species"] = species
+
+        # Also update the identity block metadata so the reference image
+        # prompt and other downstream consumers see the new species.
+        entity_id = self._get_current_char_entity_id()
+        if entity_id:
+            meta = self.screenplay.identity_block_metadata.get(entity_id)
+            if meta:
+                meta["species"] = species
 
     def _on_char_species_custom_committed(self):
         """Called when the user presses Enter or leaves the custom species field.
@@ -3409,6 +3687,27 @@ class StoryFrameworkView(QWidget):
             if is_first:
                 seen_first = True
             self._add_wardrobe_variant_widget(v, entity_id, is_first_scene=is_first)
+
+    def _refresh_char_tab_identity_data(self):
+        """Reload the character tab's reference prompt and wardrobe variants from screenplay data.
+
+        Called when identity block data changes externally (e.g. batch style
+        regeneration) so the character details tab stays in sync.
+        """
+        if not self.screenplay:
+            return
+        self._loading_char_selection = True
+        try:
+            self._load_char_identity_block_data()
+            row = getattr(self, '_char_details_last_row', -1)
+            if row >= 0:
+                story_outline = getattr(self.screenplay, 'story_outline', {})
+                characters = story_outline.get("characters", []) if isinstance(story_outline, dict) else []
+                if row < len(characters) and isinstance(characters[row], dict):
+                    self._load_wardrobe_variants_for_character(characters[row])
+            self._update_identity_block_buttons()
+        finally:
+            self._loading_char_selection = False
 
     def _load_char_identity_block_data(self):
         """Load identity block, reference prompt, and reference image from identity_block_metadata."""
@@ -3788,10 +4087,22 @@ class StoryFrameworkView(QWidget):
         QApplication.processEvents()
 
         try:
+            ss = getattr(self.screenplay, "story_settings", None) or {}
+            vs_key = ss.get("visual_style") or "photorealistic"
+            variant_metadata = {"species": self._get_current_species()}
+            entity_id = self._get_current_char_entity_id()
+            if entity_id:
+                full_meta = self.screenplay.get_identity_block_metadata_by_id(entity_id)
+                if full_meta:
+                    variant_metadata = full_meta
+                    variant_metadata["species"] = self._get_current_species()
             ref_prompt = self.ai_generator.generate_reference_image_prompt(
                 entity_name=char_name,
                 entity_type="character",
                 identity_block=ib_text,
+                metadata=variant_metadata,
+                visual_style=vs_key,
+                content_rating=ss.get("content_rating", ""),
             )
             if ref_prompt and ref_prompt.strip():
                 w_info["rip_edit"].setPlainText(ref_prompt.strip())
@@ -3920,6 +4231,8 @@ class StoryFrameworkView(QWidget):
                     self.screenplay.update_identity_block_metadata(
                         entity_id, identity_block=ib_text.strip(), status="generating")
                 self._update_identity_block_buttons()
+                if hasattr(self, 'identity_block_manager'):
+                    self.identity_block_manager.refresh_entity_list()
                 progress.close()
                 self._show_status(f"Identity block generated for '{char_name}'", 4000)
             else:
@@ -3966,11 +4279,26 @@ class StoryFrameworkView(QWidget):
             metadata = None
             if entity_id:
                 metadata = self.screenplay.get_identity_block_metadata_by_id(entity_id)
+            # Always use the species currently shown in the Character Details
+            # tab — the metadata may be stale if the user changed species
+            # after the identity block was first extracted.
+            current_species = self._get_current_species()
+            if metadata:
+                metadata["species"] = current_species
+            else:
+                metadata = {"species": current_species}
+            # Also persist to the canonical metadata so it stays in sync
+            if entity_id and entity_id in self.screenplay.identity_block_metadata:
+                self.screenplay.identity_block_metadata[entity_id]["species"] = current_species
+            ss = getattr(self.screenplay, "story_settings", None) or {}
+            vs_key = ss.get("visual_style") or "photorealistic"
             ref_prompt = self.ai_generator.generate_reference_image_prompt(
                 entity_name=char_name,
                 entity_type="character",
                 identity_block=ib_text,
                 metadata=metadata,
+                visual_style=vs_key,
+                content_rating=ss.get("content_rating", ""),
             )
             if ref_prompt and ref_prompt.strip():
                 self._loading_char_selection = True
@@ -3984,6 +4312,8 @@ class StoryFrameworkView(QWidget):
                         status="approved",
                     )
                 self._update_identity_block_buttons()
+                if hasattr(self, 'identity_block_manager'):
+                    self.identity_block_manager.refresh_entity_list()
                 progress.close()
                 self._show_status(f"Identity block approved for '{char_name}'", 4000)
             else:
@@ -4169,6 +4499,10 @@ class StoryFrameworkView(QWidget):
         if reply == QMessageBox.StandardButton.Yes:
             characters.pop(index)
             self._sync_character_registry()
+            self._char_details_last_row = -1
+            self.char_details_list.blockSignals(True)
+            self.char_details_list.setCurrentRow(-1)
+            self.char_details_list.blockSignals(False)
             self.update_character_details()
     
     def _regenerate_character_field(self, index: int, regenerate_type: str):
@@ -4273,11 +4607,11 @@ class StoryFrameworkView(QWidget):
                         if item:
                             item.setText(result["name"])
                 except Exception as e:
-                    print(f"Error updating character editor: {e}")
+                    _safe_print(f"Error updating character editor: {e}")
                     self.update_character_details()
         except Exception as e:
             import traceback
-            print(f"Error in on_character_regenerated: {e}")
+            _safe_print(f"Error in on_character_regenerated: {e}")
             traceback.print_exc()
             if progress:
                 progress.close()
@@ -4291,7 +4625,7 @@ class StoryFrameworkView(QWidget):
             QMessageBox.critical(self, "Generation Failed", f"Failed to regenerate character details:\n{error_message}")
         except Exception as e:
             import traceback
-            print(f"Error in on_character_regeneration_error: {e}")
+            _safe_print(f"Error in on_character_regeneration_error: {e}")
             traceback.print_exc()
     
     def on_generate_framework_clicked(self):
@@ -4319,6 +4653,8 @@ class StoryFrameworkView(QWidget):
             QMessageBox.warning(self, "No Screenplay", "No screenplay loaded.")
             return
         
+        self.sync_current_scene_to_model()
+        
         # Show progress dialog
         progress = QProgressDialog("Generating storyboard for scene...", "Cancel", 0, 0, self)
         progress.setWindowModality(Qt.WindowModality.WindowModal)
@@ -4340,6 +4676,13 @@ class StoryFrameworkView(QWidget):
     def on_storyboard_generated(self, scene: StoryScene, progress: QProgressDialog):
         """Handle storyboard generation completion."""
         progress.close()
+
+        # Auto-populate image_assignments on every new storyboard item
+        if self.screenplay:
+            assigned = self.screenplay.auto_populate_image_assignments(scene)
+            if assigned:
+                _safe_print(f"  [image_assignments] Auto-populated {assigned} storyboard item(s)")
+
         self.load_scene_data(scene)
         self.update_tree()
         # Refresh storyboard items display
@@ -4540,7 +4883,7 @@ class StoryFrameworkView(QWidget):
             import traceback
             error_msg = f"Error deleting storyboard item: {str(e)}\n\n{traceback.format_exc()}"
             QMessageBox.critical(self, "Error", error_msg)
-            print(error_msg)
+            _safe_print(error_msg)
     
     def on_select_all_storyboard_items(self):
         """Select all storyboard items."""
@@ -4642,11 +4985,41 @@ class StoryFrameworkView(QWidget):
         # Refresh display
         self.load_storyboard_items()
     
+    def _revalidate_storyboard_items(self):
+        """Re-run entity validation on storyboard items using current logic."""
+        if not self.current_scene or not self.screenplay:
+            return
+        items = self.current_scene.storyboard_items or []
+        if not items:
+            return
+        generated_content = (self.current_scene.metadata or {}).get("generated_content", "")
+        if not generated_content:
+            return
+        try:
+            from core.storyboard_validator import validate_storyboard_against_paragraphs
+            paras = [p.strip() for p in generated_content.split("\n\n") if p.strip()]
+            scene_beats = paras[1:] if len(paras) > 1 else paras
+            results = validate_storyboard_against_paragraphs(
+                scene_beats, items, self.screenplay
+            )
+            for idx, vr in enumerate(results):
+                if idx < len(items):
+                    if vr.is_valid:
+                        items[idx].validation_status = "passed"
+                        items[idx].validation_errors = []
+                    else:
+                        items[idx].validation_status = "validation_failed"
+                        items[idx].validation_errors = list(vr.errors)
+        except Exception as e:
+            _safe_print(f"Re-validation error: {e}")
+
     def load_storyboard_items(self):
         """Load storyboard items into the list widget."""
         if not self.current_scene:
             self.storyboard_list.clear()
             return
+        
+        self._revalidate_storyboard_items()
         
         self.storyboard_list.clear()
         for item in self.current_scene.storyboard_items:
@@ -4930,12 +5303,16 @@ class StoryFrameworkView(QWidget):
         # Duration editing removed with right panel - estimated_duration remains unchanged
         # (Duration can still be set via scene framework editor if needed)
         
-        # Save wardrobe selector state to scene
+        # Save wardrobe selector state to scene (skip for first scene —
+        # first scene always extracts wardrobe from content, never "same").
         if hasattr(self, 'wardrobe_selectors') and self.screenplay and self.current_scene:
-            if not hasattr(self.current_scene, 'character_wardrobe_selector'):
+            if self._is_first_scene(self.current_scene):
                 self.current_scene.character_wardrobe_selector = {}
-            for entity_id, combo in self.wardrobe_selectors.items():
-                self.current_scene.character_wardrobe_selector[entity_id] = combo.currentData() or ""
+            else:
+                if not hasattr(self.current_scene, 'character_wardrobe_selector'):
+                    self.current_scene.character_wardrobe_selector = {}
+                for entity_id, combo in self.wardrobe_selectors.items():
+                    self.current_scene.character_wardrobe_selector[entity_id] = combo.currentData() or ""
         
         # Save generated content to metadata
         generated_content = self.scene_content_display.toPlainText().strip()
@@ -5056,8 +5433,11 @@ class StoryFrameworkView(QWidget):
             QMessageBox.warning(self, "No Description", "Please enter a scene description first.")
             return
         
-        # Get word count
-        word_count = int(self.word_count_combo.currentText())
+        # Get target duration: use AI-allocated duration for custom mode, selector otherwise
+        if self.screenplay and getattr(self.screenplay, "custom_duration_seconds", 0) > 0:
+            target_duration = getattr(self.current_scene, "estimated_duration", 0) or 60
+        else:
+            target_duration = self.scene_duration_combo.currentData() or 60
         
         # Advertisement mode: run narrative complexity check before generation
         if self.screenplay and self.screenplay.is_advertisement_mode():
@@ -5108,9 +5488,9 @@ class StoryFrameworkView(QWidget):
         self.scene_content_thread = SceneContentGenerationThread(
             self.ai_generator,
             scene_description,
-            word_count,
             self.screenplay,
-            self.current_scene
+            self.current_scene,
+            target_duration=target_duration
         )
         self.scene_content_thread.finished.connect(
             lambda content, drift_warnings: self.on_scene_content_generated(content, progress, drift_warnings)
@@ -5155,10 +5535,6 @@ class StoryFrameworkView(QWidget):
         except Exception:
             pass
         
-        if drift_warnings:
-            QMessageBox.warning(self, "Narrative Drift Detected",
-                "Possible narrative drift detected; review recommended.\n\n" + "\n".join(drift_warnings))
-        
         self._show_status("Scene content generated — review then click Approve", 5000)
     
     def _extract_environment_from_content(self, content: str, scene_title: str) -> str:
@@ -5179,19 +5555,19 @@ Extract the following if mentioned:
 - Location type (indoor/outdoor, room type, town, city, etc.)
 - Time period, weather, time of day
 - Architectural style or notable features
-- Furniture, fixtures, and significant objects that define the space (e.g. desk, sofa, laptop, posters, table, TV)
+- For INDOOR settings: furniture, fixtures, and significant objects that define the space (e.g. desk, sofa, laptop, posters, table, TV)
+- For OUTDOOR settings: terrain, vegetation, geological features, natural landmarks, sky conditions. Do NOT include portable objects that characters bring (tables, chairs, papers, boots, daggers, journals, compasses, medallions) — these are character props, not part of the landscape.
 - Light sources and lighting conditions: which objects emit light (torches, lamps, candles, fires, screens, neon signs, chandeliers, sconces, braziers), the quality of light they produce (colour, warmth, intensity, flicker, direction of shadows), and any objects that are specifically dark or unlit
 - Atmosphere or mood of the setting
+- Scale of the space: approximate dimensions, exits, and how open/enclosed it feels
 
-Provide a concise 4-6 sentence description that includes the space, furniture/objects, AND lighting. Do NOT include character actions or dialogue.
-
-Example: "A cluttered living room with faded comedy posters on the walls. A worn sofa against one wall, piled with scripts and notebooks. A coffee table littered with empty mugs and papers. A laptop sits open. Warm light from a desk lamp pools across scattered papers, the rest of the room lit only by the pale glow of the laptop screen and dim city lights visible through the window. Quiet, reflective atmosphere."
+Provide a concise 4-6 sentence description of the PERMANENT features of this environment. Do NOT include character actions, dialogue, or portable objects that characters carry.
 
 Respond with ONLY the environment description, no preamble."""
 
             response = self.ai_generator._chat_completion(
                 messages=[
-                    {"role": "system", "content": "You are an expert at extracting environmental descriptions from scene text. Include furniture, fixtures, significant objects that define the space, and especially light sources and their effect on the environment."},
+                    {"role": "system", "content": "You are an expert at extracting environmental descriptions from scene text. For indoor settings, include built-in furniture and fixtures. For outdoor settings, describe only terrain, weather, and permanent landscape features — never portable character props. Always include light sources and their visual effect."},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.2,
@@ -5210,7 +5586,7 @@ Respond with ONLY the environment description, no preamble."""
             return env_desc if env_desc else f"Setting: {scene_title}"
             
         except Exception as e:
-            print(f"Error extracting environment: {e}")
+            _safe_print(f"Error extracting environment: {e}")
             return f"Setting: {scene_title}"
     
     def _extract_environment_description_from_content(self, content: str, env_name: str) -> str:
@@ -5239,6 +5615,18 @@ Respond with ONLY the environment description, no preamble."""
         
         name_lower = core_name.lower()
         name_parts = [p for p in re.split(r"[\s'\"]+", core_name) if len(p) >= 3]
+
+        # The extracted name may include absorbed qualifiers (e.g. "Laughing Skull
+        # Comedy Club Stage") that don't appear contiguously in the text. Build a
+        # list of "exact" variants to try: the full name, and progressively shorter
+        # versions dropping the last word (the absorbed qualifier).
+        _exact_variants = [name_lower]
+        _words = name_lower.split()
+        if len(_words) > 2:
+            for i in range(len(_words) - 1, max(1, len(_words) - 3), -1):
+                shorter = " ".join(_words[:i])
+                if shorter and shorter != name_lower:
+                    _exact_variants.append(shorter)
 
         all_env_names = set()
         if self.screenplay:
@@ -5269,24 +5657,37 @@ Respond with ONLY the environment description, no preamble."""
             # Starts with possessive pronoun (His/Her/Their) — about a person, not the setting
             if re.match(r'^(?:His|Her|Their|He|She|They)\s', s):
                 return True
-            # Contains [object] markup — about an object, not the environment
+            # [object] markup WITH character action/name = character sentence;
+            # [object] markup as set dressing (no action, no character) = setting sentence
             if re.search(r'\[[^\]]+\]', s):
-                return True
+                has_action = re.search(r'\*[^*]+\*', s)
+                has_char = re.search(r'\b[A-Z]{2,}(?:\s+[A-Z]{2,})+\b', s)
+                if has_action or has_char:
+                    return True
             return False
 
         def _clean_sentence(sent: str) -> str:
-            """Remove residual markup tokens from a setting-oriented sentence."""
+            """Remove residual markup tokens from a setting-oriented sentence.
+
+            Object/vehicle names are kept (brackets/braces unwrapped) so the
+            resulting text remains grammatically coherent.
+            """
             s = re.sub(r'\([a-z_]+\)', '', sent)       # (sfx)
             s = re.sub(r'\*[^*]+\*', '', s)             # *actions*
             s = re.sub(r'_([^_]+)_', r'\1', s)          # _Location_ → Location
-            s = re.sub(r'\[[^\]]+\]', '', s)             # [objects]
-            s = re.sub(r'\{[^}]+\}', '', s)              # {vehicles}
+            s = re.sub(r'\[([^\]]+)\]', r'\1', s)       # [objects] → objects (keep name)
+            s = re.sub(r'\{([^}]+)\}', r'\1', s)        # {vehicles} → vehicles (keep name)
             s = re.sub(r'"[^"]*"', '', s)                # "dialogue"
             s = re.sub(r'\s{2,}', ' ', s).strip()
             return s
 
-        def _sentence_mentions_env(sent_lower: str) -> bool:
-            """Return True if this sentence references the target environment."""
+        def _sentence_mentions_env_exact(sent_lower: str) -> bool:
+            """Return True if this sentence contains the full environment name
+            (or a close variant without the absorbed qualifier)."""
+            return any(v in sent_lower for v in _exact_variants)
+
+        def _sentence_mentions_env_partial(sent_lower: str) -> bool:
+            """Return True if this sentence contains significant words from the env name."""
             if name_lower in sent_lower:
                 return True
             if name_parts and any(p.lower() in sent_lower for p in name_parts):
@@ -5300,55 +5701,89 @@ Respond with ONLY the environment description, no preamble."""
                     return True
             return False
 
-        env_sentences = []
-        is_primary_paragraph = False
-        for para in paragraphs[:8]:
-            para_lower = para.lower()
+        def _is_usable_paragraph(para: str) -> bool:
+            """Return False for dialogue-only paragraphs."""
             lines = para.split('\n')
             if len(lines) >= 2 and lines[1].strip().startswith('"'):
-                continue
-            if para.startswith('"'):
-                continue
-            mentioned = name_lower in para_lower
-            if not mentioned and name_parts:
-                mentioned = any(part.lower() in para_lower for part in name_parts)
-            if not mentioned:
-                continue
+                return False
+            if para.startswith('"') or para.startswith('\u201c'):
+                return False
+            return True
 
-            sentences = re.split(r'(?<=[.!?])\s+', para)
-            direct_mentions = [s for s in sentences if _sentence_mentions_env(s.lower())]
-            is_primary_paragraph = len(direct_mentions) >= 2 or (
-                len(sentences) > 0 and _sentence_mentions_env(sentences[0].lower())
-            )
-
-            for sent in sentences:
-                if _is_character_sentence(sent):
+        def _extract_env_from_paragraphs(paras, use_exact: bool, allow_action_sentences: bool):
+            """Extract environment sentences from matching paragraphs.
+            
+            use_exact=True: only match paragraphs containing the FULL env name.
+            allow_action_sentences: if True, extract setting phrases even from
+            sentences that contain character action (strip action parts).
+            """
+            results = []
+            for para in paras:
+                if not _is_usable_paragraph(para):
                     continue
-                sent_lower = sent.lower()
-                mentions_this = _sentence_mentions_env(sent_lower)
-                mentions_other = _sentence_mentions_other_env(sent_lower)
+                para_lower = para.lower()
+                if use_exact:
+                    if not any(v in para_lower for v in _exact_variants):
+                        continue
+                else:
+                    mentioned = name_lower in para_lower
+                    if not mentioned and name_parts:
+                        mentioned = any(p.lower() in para_lower for p in name_parts)
+                    if not mentioned:
+                        continue
 
-                if mentions_other and not mentions_this:
-                    continue
-                if not is_primary_paragraph and not mentions_this:
-                    continue
+                sentences = re.split(r'(?<=[.!?])\s+', para)
+                direct_exact = [s for s in sentences if _sentence_mentions_env_exact(s.lower())]
+                is_primary = len(direct_exact) >= 2 or (
+                    len(sentences) > 0 and _sentence_mentions_env_exact(sentences[0].lower())
+                )
 
-                cleaned = _clean_sentence(sent)
-                if len(cleaned) > 15:
-                    env_sentences.append(cleaned)
-        
-        if not env_sentences:
-            first = paragraphs[0]
-            first_lower = first.lower()
-            if not first.startswith('"') and len(first) > 30:
-                if name_lower in first_lower or (name_parts and any(p.lower() in first_lower for p in name_parts)):
-                    sentences = re.split(r'(?<=[.!?])\s+', first)
-                    for sent in sentences:
+                for sent in sentences:
+                    sent_lower = sent.lower()
+                    mentions_this_exact = _sentence_mentions_env_exact(sent_lower)
+                    mentions_other = _sentence_mentions_other_env(sent_lower)
+
+                    if not allow_action_sentences and _is_character_sentence(sent):
+                        continue
+
+                    if allow_action_sentences and not mentions_this_exact:
                         if _is_character_sentence(sent):
                             continue
-                        cleaned = _clean_sentence(sent)
-                        if len(cleaned) > 15:
-                            env_sentences.append(cleaned)
+
+                    if mentions_other and not mentions_this_exact:
+                        continue
+                    if not is_primary and not _sentence_mentions_env_partial(sent_lower):
+                        continue
+
+                    cleaned = _clean_sentence(sent)
+                    if len(cleaned) > 15:
+                        results.append(cleaned)
+                if results:
+                    break
+            return results
+
+        # Pass 1: exact full-name match, strict sentence filtering
+        env_sentences = _extract_env_from_paragraphs(
+            paragraphs[:12], use_exact=True, allow_action_sentences=False
+        )
+
+        # Pass 2: exact full-name match, relaxed (allow action sentences with cleanup)
+        if not env_sentences:
+            env_sentences = _extract_env_from_paragraphs(
+                paragraphs[:12], use_exact=True, allow_action_sentences=True
+            )
+
+        # Pass 3: partial word match, strict sentence filtering
+        if not env_sentences:
+            env_sentences = _extract_env_from_paragraphs(
+                paragraphs[:12], use_exact=False, allow_action_sentences=False
+            )
+
+        # Pass 4: partial word match, relaxed
+        if not env_sentences:
+            env_sentences = _extract_env_from_paragraphs(
+                paragraphs[:12], use_exact=False, allow_action_sentences=True
+            )
         
         result = " ".join(env_sentences)
         max_len = 500
@@ -5427,9 +5862,199 @@ Respond with ONLY the physical appearance description (no clothing)."""
             
             return desc
         except Exception as e:
-            print(f"Error extracting character appearance: {e}")
+            _safe_print(f"Error extracting character appearance: {e}")
             return ""
-    
+
+    def _extract_group_appearance_from_scene(self, content: str, group_name: str) -> str:
+        """Extract a shared visual description of a group entity from scene content.
+
+        Focuses on uniform/armor, insignia, weapons, formation, and shared
+        physical traits visible in the scene.  Returns a concise description
+        suitable for identity-block user_notes and uniform_description.
+        """
+        if not self.ai_generator or not self.ai_generator._adapter or not content or not group_name:
+            return ""
+
+        genres_list: list = []
+        atmosphere = ""
+        if self.screenplay:
+            g = getattr(self.screenplay, "genre", None) or []
+            genres_list = g if isinstance(g, list) else ([g] if g else [])
+            atmosphere = getattr(self.screenplay, "atmosphere", None) or ""
+
+        genre_str = ", ".join(genres_list) if genres_list else "unspecified"
+        genre_line = f"Story genre: {genre_str}."
+        if atmosphere:
+            genre_line += f" Atmosphere: {atmosphere}."
+
+        # Build genre-specific material/aesthetic guidance.
+        # Collect ALL matching palettes so multi-genre stories get blended guidance.
+        genres_lower = {g.lower() for g in genres_list}
+
+        _GENRE_PALETTES = {
+            "fantasy": {
+                "keys": {"fantasy", "high fantasy", "dark fantasy", "epic fantasy", "sword and sorcery", "medieval", "historical"},
+                "label": "FANTASY/MEDIEVAL",
+                "use": (
+                    "forged steel, iron, chainmail, plate armor, leather, fur, wool, linen, "
+                    "bronze, wood, heraldic crests, swords, spears, shields, crossbows, "
+                    "halberds, tabards, cloaks, surcoats, gauntlets, helms"
+                ),
+                "avoid": (
+                    "energy weapons, chrome, polymers, synthetic fabrics, LED lights, "
+                    "holographic displays, powered armor, modern/futuristic technology"
+                ),
+            },
+            "scifi": {
+                "keys": {"sci-fi", "science fiction", "cyberpunk", "space opera", "dystopian", "post-apocalyptic"},
+                "label": "SCI-FI/FUTURISTIC",
+                "use": (
+                    "composite armor, energy shields, plasma weapons, tactical HUDs, "
+                    "synthetic uniforms, powered exoskeletons, holographic insignia"
+                ),
+                "avoid": (
+                    "purely medieval materials with no tech integration, "
+                    "horse-drawn equipment, rustic hand-forged weapons"
+                ),
+            },
+            "western": {
+                "keys": {"western", "frontier"},
+                "label": "WESTERN",
+                "use": (
+                    "leather, denim, cotton, revolvers, rifles, bandoliers, "
+                    "spurs, dusters, wide-brimmed hats, sheriff badges"
+                ),
+                "avoid": (
+                    "energy weapons, chrome, powered armor, futuristic technology"
+                ),
+            },
+        }
+
+        matched_palettes = [p for p in _GENRE_PALETTES.values() if genres_lower & p["keys"]]
+
+        if len(matched_palettes) == 1:
+            p = matched_palettes[0]
+            genre_guidance = (
+                f"\nGENRE CONSTRAINT — {p['label']}: All materials, weapons, and armor MUST be "
+                f"genre-appropriate. Use: {p['use']}. "
+                f"NEVER use: {p['avoid']}."
+            )
+        elif len(matched_palettes) >= 2:
+            labels = " + ".join(p["label"] for p in matched_palettes)
+            all_use = "; ".join(p["use"] for p in matched_palettes)
+            genre_guidance = (
+                f"\nGENRE CONSTRAINT — HYBRID ({labels}): This story blends multiple genres. "
+                f"Materials and equipment should FUSE elements from both aesthetics into a "
+                f"cohesive hybrid look. Available palette: {all_use}. "
+                f"Blend freely — e.g. medieval plate armor with energy runes, swords alongside "
+                f"plasma pistols, leather cloaks over synthetic bodysuits. The result should "
+                f"feel like a unified world, not randomly mixed."
+            )
+        else:
+            genre_guidance = ""
+
+        try:
+            prompt = f"""Create a SHORT shared visual description of the group "{group_name}" for visual reference.
+
+{genre_line}
+{genre_guidance}
+
+Scene content:
+{content[:6000]}
+
+INSTRUCTIONS:
+1. Describe the SHARED visual appearance of the group members as seen in the scene.
+2. Include: uniform/armor, colours, insignia/emblems, weapons, equipment, general build/physique if described.
+3. ALL materials, weapons, and equipment MUST be consistent with the story genre listed above.
+4. Output 2-3 sentences (about 60-120 words). No preamble.
+5. Do NOT include:
+   - Individual members' names or personal features
+   - Actions, dialogue, movements, or scene narrative
+   - Setting or environment details
+   - Number of members (tracked separately)
+
+Respond with ONLY the shared visual appearance description."""
+
+            system_msg = (
+                f"You create concise visual descriptions of groups/teams/squads for a {genre_str} story. "
+                "Describe their shared uniform, armor, insignia, weapons, and general appearance. "
+                "All equipment and materials MUST be authentic to the genre setting. "
+                "Never describe individual members, actions, dialogue, or setting."
+            )
+
+            response = self.ai_generator._chat_completion(
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.2,
+                max_tokens=250
+            )
+
+            desc = (response.choices[0].message.content or "").strip()
+            desc = desc.strip('"""').strip("'''").strip('"').strip("'")
+
+            if not desc or "no description" in desc.lower() or "cannot be inferred" in desc.lower():
+                return ""
+            if len(desc) > 300:
+                desc = desc[:300].rsplit(".", 1)[0] + "." if "." in desc[:300] else desc[:300] + "..."
+
+            return desc
+        except Exception as e:
+            _safe_print(f"Error extracting group appearance: {e}")
+            return ""
+
+    _WORD_TO_NUMBER = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+        "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+        "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+        "nineteen": 19, "twenty": 20, "thirty": 30, "forty": 40,
+        "fifty": 50, "a dozen": 12, "half a dozen": 6, "a handful": 5,
+        "a pair": 2, "a trio": 3, "a couple": 2, "several": 4,
+        "a few": 3, "a score": 20,
+    }
+
+    def _extract_group_member_count(self, content: str, group_name: str) -> int:
+        """Extract the number of group members mentioned in the scene content.
+
+        Looks for patterns like "six IMPERIAL SOLDIERS", "a dozen IMPERIAL SOLDIERS",
+        "12 IMPERIAL SOLDIERS" near the group name. Returns 0 if no count found.
+        """
+        import re as _re
+
+        if not content or not group_name:
+            return 0
+
+        group_escaped = _re.escape(group_name)
+        content_to_search = content
+
+        # Pattern 1: digit(s) + group name  (e.g. "12 IMPERIAL SOLDIERS")
+        m = _re.search(
+            rf'\b(\d+)\s+{group_escaped}\b',
+            content_to_search, _re.IGNORECASE,
+        )
+        if m:
+            return int(m.group(1))
+
+        # Pattern 2: number word + group name  (e.g. "six IMPERIAL SOLDIERS")
+        for word, val in sorted(self._WORD_TO_NUMBER.items(), key=lambda x: -len(x[0])):
+            pattern = rf'\b{_re.escape(word)}\s+{group_escaped}\b'
+            if _re.search(pattern, content_to_search, _re.IGNORECASE):
+                return val
+
+        # Pattern 3: group name + digit count after  (e.g. "IMPERIAL SOLDIERS, all 6 of them")
+        m = _re.search(
+            rf'{group_escaped}\b[^.]*?\b(\d+)\b',
+            content_to_search, _re.IGNORECASE,
+        )
+        if m:
+            val = int(m.group(1))
+            if 2 <= val <= 100:
+                return val
+
+        return 0
+
     def _extract_entity_details_from_scene(self, content: str, entity_name: str, entity_type: str) -> str:
         """Extract entity-relevant snippets from scene content for use as user_notes.
         
@@ -5656,8 +6281,8 @@ Respond with ONLY the physical appearance description (no clothing)."""
             s = re.sub(r'\([a-z_]+\)', '', sent)
             s = re.sub(r'\*[^*]+\*', '', s)
             s = re.sub(r'_([^_]+)_', r'\1', s)
-            s = re.sub(r'\[[^\]]+\]', '', s)
-            s = re.sub(r'\{[^}]+\}', '', s)
+            s = re.sub(r'\[([^\]]+)\]', r'\1', s)       # keep object name
+            s = re.sub(r'\{([^}]+)\}', r'\1', s)         # keep vehicle name
             s = re.sub(r'"[^"]*"', '', s)
             s = re.sub(r'\b[A-Z]{2,}(?:\s+[A-Z]{2,})*\b', '', s)
             s = re.sub(r'\s{2,}', ' ', s).strip()
@@ -5666,7 +6291,11 @@ Respond with ONLY the physical appearance description (no clothing)."""
         enriched_count = 0
         for entity_id, meta in list(self.screenplay.identity_block_metadata.items()):
             etype = (meta.get("type") or "").lower()
-            if etype not in ("object", "vehicle", "environment"):
+            # Environments already get comprehensive extraction from
+            # _extract_environment_description_from_content — enrichment here
+            # only adds noise (character actions, object descriptions that
+            # happen to mention the environment name).
+            if etype not in ("object", "vehicle"):
                 continue
             if meta.get("source_scene_id") and meta.get("source_scene_id") != scene_id:
                 continue
@@ -5693,7 +6322,7 @@ Respond with ONLY the physical appearance description (no clothing)."""
             for sent in sentences:
                 if not pattern.search(sent):
                     continue
-                if etype != "environment" and _is_character_or_action(sent):
+                if _is_character_or_action(sent):
                     continue
                 cleaned = _clean(sent)
                 if len(cleaned) < 20:
@@ -5719,10 +6348,10 @@ Respond with ONLY the physical appearance description (no clothing)."""
             if combined != existing_notes:
                 self.screenplay.update_identity_block_metadata(entity_id, user_notes=combined)
                 enriched_count += 1
-                print(f"  + Enriched user_notes for {entity_name} ({etype}): +{len(combined) - len(existing_notes)} chars")
+                _safe_print(f"  + Enriched user_notes for {entity_name} ({etype}): +{len(combined) - len(existing_notes)} chars")
 
         if enriched_count:
-            print(f"Enrichment pass: updated {enriched_count} entities with additional scene details")
+            _safe_print(f"Enrichment pass: updated {enriched_count} entities with additional scene details")
 
         # --- Lighting cross-reference: fold object light sources into environment ---
         self._cross_reference_lighting_objects_to_environment()
@@ -5789,19 +6418,16 @@ Respond with ONLY the physical appearance description (no clothing)."""
             obj_name = re.sub(r'^[_\{\[\]\}]|[_\{\[\]\}]$', '', obj_name).strip()
             if not obj_name:
                 continue
-            snippet = notes[:120]
-            if len(notes) > 120:
-                snippet = snippet.rsplit(" ", 1)[0] + "..."
-            light_fragments.append(f"{obj_name} — {snippet}")
+            light_fragments.append(obj_name)
 
         if not light_fragments:
             return
 
-        summary = "Light sources: " + "; ".join(light_fragments)
+        summary = "Light sources: " + ", ".join(light_fragments)
         updated = (existing_env_notes + " " + summary).strip() if existing_env_notes else summary
         if len(updated) <= 1200:
             self.screenplay.update_identity_block_metadata(env_id, user_notes=updated)
-            print(f"  + Lighting cross-reference: added {len(light_fragments)} light source(s) to environment")
+            _safe_print(f"  + Lighting cross-reference: added {len(light_fragments)} light source(s) to environment")
 
     def extract_entities_from_scene_content(self, content: str, progress=None):
         """Extract entities from scene content and create placeholders.
@@ -5831,7 +6457,9 @@ Respond with ONLY the physical appearance description (no clothing)."""
         if not self.current_scene or not self.screenplay or not self.ai_generator:
             _elog("EARLY RETURN — missing current_scene, screenplay, or ai_generator")
             return
-        
+
+        scene_desc = self.current_scene.description or ""
+
         def _update_progress(msg: str):
             if progress:
                 progress.setLabelText(msg)
@@ -5864,69 +6492,233 @@ Respond with ONLY the physical appearance description (no clothing)."""
             filtered_lower = set()
             for _cname in characters_named_in_scene:
                 # Filter non-person entities (UI, software, abstract visuals)
-                if self.ai_generator._is_company_or_concept_entity(_cname):
-                    print(f"  [filtered non-person] {_cname}")
+                # Pass screenplay so registered characters are never rejected.
+                if self.ai_generator._is_company_or_concept_entity(_cname, self.screenplay):
+                    _safe_print(f"  [filtered non-person] {_cname}")
                     continue
                 # Fold body-part possessives ("filmmaker's hands" → "filmmaker")
                 bp = self.ai_generator._split_possessive_body_part(_cname)
                 if bp:
                     _cname = self.ai_generator._normalize_character_name_for_identity(bp[0]) or bp[0]
-                    print(f"  [folded body-part] → {_cname}")
+                    _safe_print(f"  [folded body-part] → {_cname}")
                 else:
                     # Strip leading articles ("A FILMMAKER" → "FILMMAKER")
                     stripped = self.ai_generator._normalize_character_name_for_identity(_cname)
                     if stripped and stripped.lower() != _cname.lower():
-                        print(f"  [stripped article] {_cname} → {stripped}")
+                        _safe_print(f"  [stripped article] {_cname} → {stripped}")
                         _cname = stripped
                 if _cname.lower() not in filtered_lower:
                     filtered_chars.append(_cname)
                     filtered_lower.add(_cname.lower())
             characters_named_in_scene = filtered_chars
             
-            # Filter name collisions: no two characters may share a significant name part.
-            # When two names collide, prefer the canonical (registry) version.
+            # Filter name collisions: deduplicate when two extracted names
+            # clearly refer to the SAME person (one is a subset of the other,
+            # e.g. "FLECK" vs "DETECTIVE JUDE FLECK").
+            # NEVER collide two names that are both in the character registry —
+            # the registry is the authority on distinct characters.
+            _TITLE_WORDS_LOWER = {w.lower() for w in (
+                "master", "mistress", "captain", "doctor", "professor", "general",
+                "colonel", "major", "lieutenant", "admiral", "sergeant", "corporal",
+                "detective", "inspector", "sheriff", "officer", "constable", "marshal",
+                "chief", "commissioner", "director", "agent", "judge", "justice",
+                "mayor", "senator", "governor", "president", "chancellor", "ambassador",
+                "king", "queen", "prince", "princess", "duke", "duchess", "baron",
+                "baroness", "count", "countess", "earl", "lord", "lady", "sir",
+                "father", "mother", "sister", "brother", "uncle", "aunt",
+                "elder", "coach", "nurse", "pilot", "ranger", "reverend", "madam",
+            )}
             _registry_set = {n.strip().upper() for n in (getattr(self.screenplay, 'character_registry', []) or []) if n}
             collision_filtered = []
             for _cname in characters_named_in_scene:
-                _cwords = {w.lower() for w in _re.sub(r"['\"]", " ", _cname).split() if len(w) >= 3}
+                _cname_is_canonical = _cname.strip().upper() in _registry_set
+                _cwords = {w.lower() for w in _re.sub(r"['\"]", " ", _cname).split() if len(w) >= 3} - _TITLE_WORDS_LOWER
                 has_collision = False
                 for idx, kept_name in enumerate(collision_filtered):
-                    _kwords = {w.lower() for w in _re.sub(r"['\"]", " ", kept_name).split() if len(w) >= 3}
+                    _kept_is_canonical = kept_name.strip().upper() in _registry_set
+                    # Both are canonical registry names → they are distinct characters, never collide
+                    if _cname_is_canonical and _kept_is_canonical:
+                        continue
+                    _kwords = {w.lower() for w in _re.sub(r"['\"]", " ", kept_name).split() if len(w) >= 3} - _TITLE_WORDS_LOWER
                     shared = _cwords & _kwords
-                    if shared:
-                        # Prefer the registry (canonical) name over the scene-extracted variant
-                        _cname_is_canonical = _cname.strip().upper() in _registry_set
-                        _kept_is_canonical = kept_name.strip().upper() in _registry_set
-                        if _cname_is_canonical and not _kept_is_canonical:
-                            print(f"  [name collision] '{kept_name}' shares word(s) {shared} with canonical '{_cname}' — replacing with canonical")
-                            collision_filtered[idx] = _cname
-                        else:
-                            print(f"  [name collision] '{_cname}' shares word(s) {shared} with '{kept_name}' — skipping '{_cname}'")
-                        has_collision = True
-                        break
+                    if not shared:
+                        continue
+                    # Only treat as collision if one name's significant words are
+                    # a subset of the other's (same person, different specificity)
+                    if not (_cwords <= _kwords or _kwords <= _cwords):
+                        continue
+                    # Prefer the registry (canonical) name over the scene-extracted variant
+                    if _cname_is_canonical and not _kept_is_canonical:
+                        _safe_print(f"  [name collision] '{kept_name}' is subset of canonical '{_cname}' — replacing with canonical")
+                        collision_filtered[idx] = _cname
+                    else:
+                        _safe_print(f"  [name collision] '{_cname}' is subset of '{kept_name}' — skipping '{_cname}'")
+                    has_collision = True
+                    break
                 if not has_collision:
                     collision_filtered.append(_cname)
             characters_named_in_scene = collision_filtered
             
-            _elog(f"STEP 1 final (after filters): {len(characters_named_in_scene)} characters: {characters_named_in_scene}")
-            print(f"CHARACTER EXTRACTION: Found {len(characters_named_in_scene)} characters named in scene")
+            # Cross-check with character_focus: any character listed in the
+            # scene's character_focus MUST be included even if the ALL-CAPS
+            # pattern or collision filter dropped them.
+            _chars_lower = {c.strip().lower() for c in characters_named_in_scene}
+            for cf_name in getattr(self.current_scene, "character_focus", []) or []:
+                cf_stripped = cf_name.strip()
+                if not cf_stripped:
+                    continue
+                # Skip group/team entities — they get separate group identity blocks
+                _cf_check = cf_stripped.title() if cf_stripped.isupper() else cf_stripped
+                if self.ai_generator._is_group_or_team(_cf_check):
+                    _safe_print(f"  [character_focus skip] '{cf_stripped}' is a group entity, not a character")
+                    continue
+                # Resolve to canonical name if registry is frozen
+                resolved = cf_stripped
+                if getattr(self.screenplay, "character_registry_frozen", False):
+                    canonical = self.screenplay.resolve_character_to_canonical(cf_stripped)
+                    if canonical:
+                        resolved = canonical
+                if resolved.lower() not in _chars_lower:
+                    characters_named_in_scene.append(resolved)
+                    _chars_lower.add(resolved.lower())
+                    _safe_print(f"  [character_focus rescue] Added '{resolved}' — present in character_focus but missed by text extraction")
+                    _elog(f"  character_focus rescue: added '{resolved}'")
+
+            # Wizard character safety net: if any wizard character's name (or
+            # any significant word from their name) appears in the scene text
+            # but wasn't captured by the ALL-CAPS regex + filters, add them.
+            _content_upper = content.upper() if content else ""
+            story_outline = getattr(self.screenplay, 'story_outline', {}) or {}
+            _wiz_chars_list = story_outline.get("characters", []) if isinstance(story_outline, dict) else []
+            for wc in _wiz_chars_list:
+                if not isinstance(wc, dict):
+                    continue
+                wc_name = (wc.get("name") or "").strip()
+                if not wc_name or wc_name.lower() in _chars_lower:
+                    continue
+                # Skip group/team entities
+                _wc_check = wc_name.title() if wc_name.isupper() else wc_name
+                if self.ai_generator._is_group_or_team(_wc_check):
+                    continue
+                # Check if full name or any individual name word (≥3 chars) appears in text
+                name_found = wc_name.upper() in _content_upper
+                if not name_found:
+                    for word in wc_name.split():
+                        if len(word) >= 3 and word.upper() in _content_upper:
+                            name_found = True
+                            break
+                if name_found:
+                    characters_named_in_scene.append(wc_name)
+                    _chars_lower.add(wc_name.lower())
+                    _safe_print(f"  [wizard character rescue] Added '{wc_name}' — found in scene text but missed by CAPS extraction")
+                    _elog(f"  wizard character rescue: added '{wc_name}'")
+
+            # Final safety net: remove any group/team names that slipped through rescue paths
+            _pre_group_filter = len(characters_named_in_scene)
+            characters_named_in_scene = [
+                c for c in characters_named_in_scene
+                if not self.ai_generator._is_group_or_team(c.title() if c.isupper() else c)
+            ]
+            if len(characters_named_in_scene) < _pre_group_filter:
+                _removed = _pre_group_filter - len(characters_named_in_scene)
+                _safe_print(f"  [group filter] Removed {_removed} group entity(ies) from character list")
+                _elog(f"  group safety-net filter removed {_removed} name(s)")
+
+            _elog(f"STEP 1 final (after filters + character_focus + wizard rescue): {len(characters_named_in_scene)} characters: {characters_named_in_scene}")
+            _safe_print(f"CHARACTER EXTRACTION: Found {len(characters_named_in_scene)} characters named in scene")
             for char_name in characters_named_in_scene:
-                print(f"  - {char_name}")
-            
+                _safe_print(f"  - {char_name}")
+
+            # STEP 1b: Extract group entities (IMPERIAL SOLDIERS, CITY GUARDS, etc.)
+            # Pass scene description + character_focus as fallback sources since
+            # AI-generated content may use mixed-case names instead of ALL-CAPS.
+            _cf_list = getattr(self.current_scene, "character_focus", []) or []
+            groups_named_in_scene = self.ai_generator.extract_groups_named_in_scene(
+                content, self.screenplay,
+                scene_description=scene_desc,
+                character_focus=_cf_list,
+            )
+            _elog(f"STEP 1b: Found {len(groups_named_in_scene)} group(s): {groups_named_in_scene}")
+            if groups_named_in_scene:
+                _safe_print(f"GROUP EXTRACTION: Found {len(groups_named_in_scene)} group(s) named in scene")
+                for gn in groups_named_in_scene:
+                    _safe_print(f"  - {gn}")
+
             _elog("STEP 2: Extracting environments, objects, and vehicles...")
             _update_progress("Extracting environments, objects, and vehicles...")
             markup_locations = self.ai_generator._extract_locations_from_text(content, max_locations=50)
             markup_objects = self.ai_generator._extract_objects_from_scene_markup(content, require_interaction=True)
             markup_vehicles = self.ai_generator._extract_vehicles_from_scene_markup(content, require_interaction=True)
+
+            # Cross-check: filter out objects/vehicles whose names are clearly
+            # partial references to a known environment (e.g. "the club" when the
+            # environment is "Laughing Skull Comedy Club").
+            import re as _re2
+            _STRIP_ARTICLES = _re2.compile(r'^(?:the|a|an)\s+', _re2.IGNORECASE)
+            # Collect environment names from BOTH the current scene markup AND
+            # the full screenplay metadata (the parent venue name may not appear
+            # in underscore markup in every scene).
+            _env_names_lower = set()
+            for loc in markup_locations:
+                if loc and loc.strip():
+                    _env_names_lower.add(loc.strip().lower())
+            if self.screenplay and hasattr(self.screenplay, 'identity_block_metadata'):
+                for _mid, _mmeta in self.screenplay.identity_block_metadata.items():
+                    if (_mmeta.get("type") or "").lower() == "environment":
+                        _ename = (_mmeta.get("name") or "").strip().lower()
+                        if _ename:
+                            _env_names_lower.add(_ename)
+            # Also include environment names from the scene description / story outline
+            story_outline = getattr(self.screenplay, 'story_outline', {}) or {}
+            if isinstance(story_outline, dict):
+                for _scene_info in (story_outline.get("scenes") or []):
+                    if isinstance(_scene_info, dict):
+                        _sdesc = (_scene_info.get("description") or "").strip()
+                        for _env_m in _re2.finditer(r'(?<!\w)_([^_]+)_(?!\w)', _sdesc):
+                            _env_names_lower.add(_env_m.group(1).strip().lower())
+
+            def _is_environment_reference(name: str) -> bool:
+                """Return True if *name* is a casual substring of a known environment."""
+                stripped = _STRIP_ARTICLES.sub('', name).strip().lower()
+                if not stripped or len(stripped) < 3:
+                    return False
+                for env in _env_names_lower:
+                    if stripped in env:
+                        return True
+                return False
+
+            pre_obj_count = len(markup_objects)
+            pre_veh_count = len(markup_vehicles)
+            markup_objects = [n for n in markup_objects if not _is_environment_reference(n)]
+            markup_vehicles = [n for n in markup_vehicles if not _is_environment_reference(n)]
+            filtered_obj = pre_obj_count - len(markup_objects)
+            filtered_veh = pre_veh_count - len(markup_vehicles)
+            if filtered_obj or filtered_veh:
+                _elog(f"  Cross-check filtered {filtered_obj} object(s) and {filtered_veh} vehicle(s) as environment references")
+                _safe_print(f"  [env cross-check] Filtered {filtered_obj} object(s) and {filtered_veh} vehicle(s) that were environment references")
+
+            # Reorder environments: put the location matching the scene DESCRIPTION
+            # first so it becomes the primary environment_id (not just text order).
+            _desc_locs = set()
+            if scene_desc:
+                for _dm in _re2.finditer(r'(?<!\w)_([^_]+)_(?!\w)', scene_desc):
+                    _desc_locs.add(_dm.group(1).strip().lower())
+            _ordered_locs = sorted(
+                markup_locations,
+                key=lambda n: (0 if n.strip().lower() in _desc_locs
+                               or any(n.strip().lower() in dl or dl in n.strip().lower()
+                                      for dl in _desc_locs)
+                               else 1),
+            )
             entities = [
-                {"name": name, "type": "environment", "description": ""} for name in markup_locations
+                {"name": name, "type": "environment", "description": ""} for name in _ordered_locs
             ] + [
                 {"name": name, "type": "object", "description": ""} for name in markup_objects
             ] + [
                 {"name": name, "type": "vehicle", "description": ""} for name in markup_vehicles
             ]
             if not entities:
-                print("No markup entities extracted from scene content (only explicitly marked entities)")
+                _safe_print("No markup entities extracted from scene content (only explicitly marked entities)")
             _elog(f"STEP 2 complete: {len(markup_locations)} locations, {len(markup_objects)} objects, {len(markup_vehicles)} vehicles")
             
             _elog("STEP 3: Creating character identity block placeholders...")
@@ -5951,7 +6743,7 @@ Respond with ONLY the physical appearance description (no clothing)."""
                 # Check if identity block already exists (use lookup_name for consistency)
                 existing_block = self.screenplay.get_identity_block_by_name(lookup_name, "character")
                 if existing_block:
-                    print(f"  ✓ Identity block already exists for {char_name}")
+                    _safe_print(f"  ✓ Identity block already exists for {char_name}")
                     continue
                 
                 # Create identity block for this character (use lookup_name so block matches registry)
@@ -5991,9 +6783,9 @@ Respond with ONLY the physical appearance description (no clothing)."""
                                 existing_characters=wizard_chars,
                             )
                             details = (result.get("physical_appearance", "") or "").strip()
-                            print(f"  ⚙ Generated physical appearance for minor character: {lookup_name}")
+                            _safe_print(f"  ⚙ Generated physical appearance for minor character: {lookup_name}")
                         except Exception as gen_err:
-                            print(f"  ⚠ Failed to generate appearance for {lookup_name}: {gen_err}")
+                            _safe_print(f"  ⚠ Failed to generate appearance for {lookup_name}: {gen_err}")
                     elif not details:
                         details = self._extract_character_appearance_from_scene(content, char_name)
                     
@@ -6040,13 +6832,13 @@ Respond with ONLY the physical appearance description (no clothing)."""
                         if lookup_name not in registry:
                             overlap = self.screenplay.has_overlapping_registry_name(lookup_name)
                             if overlap:
-                                print(f"  [registry guard] Skipping '{lookup_name}' — overlaps with existing '{overlap}'")
+                                _safe_print(f"  [registry guard] Skipping '{lookup_name}' — overlaps with existing '{overlap}'")
                             else:
                                 registry.append(lookup_name)
                                 self.screenplay.character_registry = registry
-                        print(f"  + Created identity block for MINOR character {lookup_name}")
+                        _safe_print(f"  + Created identity block for MINOR character {lookup_name}")
                     else:
-                        print(f"  + Created identity block placeholder for {char_name}")
+                        _safe_print(f"  + Created identity block placeholder for {char_name}")
             _elog(f"STEP 3 complete: {characters_created} character blocks created")
 
             # STEP 3b: Ensure ALL wizard characters have identity block placeholders
@@ -6057,6 +6849,10 @@ Respond with ONLY the physical appearance description (no clothing)."""
                     continue
                 wc_name = (wc.get("name") or "").strip()
                 if not wc_name:
+                    continue
+                # Skip group/team entities that were previously mis-added as characters
+                _wc_check3b = wc_name.title() if wc_name.isupper() else wc_name
+                if self.ai_generator._is_group_or_team(_wc_check3b):
                     continue
                 existing = self.screenplay.get_identity_block_by_name(wc_name, "character")
                 if existing:
@@ -6073,8 +6869,101 @@ Respond with ONLY the physical appearance description (no clothing)."""
                     meta = self.screenplay.identity_block_metadata.get(char_id)
                     if meta:
                         meta["species"] = char_species
-                    print(f"  + Created identity block for wizard character {wc_name}")
+                    _safe_print(f"  + Created identity block for wizard character {wc_name}")
             _elog(f"STEP 3b complete: ensured all wizard characters have identity blocks")
+
+            # STEP 3c: Create group identity block placeholders (e.g. IMPERIAL SOLDIERS)
+            # Also reclassify any entity that was previously stored as "character" but
+            # is now recognised as a group, and clean up stale wizard/registry data.
+            groups_created = 0
+            for group_name in groups_named_in_scene:
+                existing_group = self.screenplay.get_identity_block_by_name(group_name, "group")
+                if existing_group:
+                    _safe_print(f"  ✓ Group identity block already exists for {group_name}")
+                    continue
+
+                # Check if this group was mistakenly created as a character in a prior run
+                _misclassified_id = None
+                _name_upper = group_name.strip().upper()
+                for _eid, _emeta in list(self.screenplay.identity_block_metadata.items()):
+                    if (_emeta.get("type") or "") == "character" and (_emeta.get("name") or "").strip().upper() == _name_upper:
+                        _misclassified_id = _eid
+                        break
+                if _misclassified_id:
+                    _old_meta = self.screenplay.identity_block_metadata[_misclassified_id]
+                    _old_key = f"character:{_old_meta.get('name', '')}".lower()
+                    self.screenplay.identity_block_metadata.pop(_misclassified_id, None)
+                    self.screenplay.identity_blocks.pop(_misclassified_id, None)
+                    self.screenplay.identity_block_ids.pop(_old_key, None)
+
+                    # Purge ghost wardrobe data left behind by the misclassified entity
+                    _wardrobe_variants = getattr(self.screenplay, "character_wardrobe_variants", None)
+                    if isinstance(_wardrobe_variants, dict):
+                        _wardrobe_variants.pop(_misclassified_id, None)
+                    _last_variant = getattr(self.screenplay, "character_last_wardrobe_variant", None)
+                    if isinstance(_last_variant, dict):
+                        _last_variant.pop(_misclassified_id, None)
+                    # Clean per-scene wardrobe references
+                    for _scene in self.screenplay.get_all_scenes():
+                        _cw = getattr(_scene, "character_wardrobe", None) or {}
+                        if isinstance(_cw, dict):
+                            _cw.pop(_misclassified_id, None)
+                        _cvi = getattr(_scene, "character_wardrobe_variant_ids", None) or {}
+                        if isinstance(_cvi, dict):
+                            _cvi.pop(_misclassified_id, None)
+                        _cws = getattr(_scene, "character_wardrobe_selector", None) or {}
+                        if isinstance(_cws, dict):
+                            _cws.pop(_misclassified_id, None)
+
+                    _safe_print(f"  ♻ Removed misclassified character block for {group_name} (was {_misclassified_id})")
+
+                # Remove from story_outline characters list (groups are not characters)
+                _group_lower = group_name.strip().lower()
+                _so = getattr(self.screenplay, 'story_outline', {}) or {}
+                if isinstance(_so, dict):
+                    _so_chars = _so.get("characters", [])
+                    if isinstance(_so_chars, list):
+                        _before = len(_so_chars)
+                        _so["characters"] = [
+                            c for c in _so_chars
+                            if not (isinstance(c, dict) and (c.get("name") or "").strip().lower() == _group_lower)
+                        ]
+                        if len(_so["characters"]) < _before:
+                            _safe_print(f"  ♻ Removed '{group_name}' from story_outline characters")
+
+                # Remove from character_registry
+                _reg = getattr(self.screenplay, "character_registry", []) or []
+                if isinstance(_reg, list):
+                    _new_reg = [r for r in _reg if r.strip().lower() != _group_lower]
+                    if len(_new_reg) < len(_reg):
+                        self.screenplay.character_registry = _new_reg
+                        _safe_print(f"  ♻ Removed '{group_name}' from character_registry")
+
+                group_id = self.screenplay.create_placeholder_identity_block(
+                    group_name, "group", self.current_scene.scene_id
+                )
+                if group_id:
+                    groups_created += 1
+                    _update_progress(f"Extracting appearance for group {group_name}...")
+                    group_desc = self._extract_group_appearance_from_scene(content, group_name)
+                    if group_desc:
+                        self.screenplay.update_identity_block_metadata(group_id, user_notes=group_desc)
+                        meta = self.screenplay.identity_block_metadata.get(group_id)
+                        if meta:
+                            meta["uniform_description"] = group_desc
+                        _safe_print(f"  + Created group identity block for {group_name} (appearance extracted)")
+                    else:
+                        _safe_print(f"  + Created group identity block placeholder for {group_name} (no appearance found)")
+
+                    # Extract member count from scene content
+                    _inferred_count = self._extract_group_member_count(content, group_name)
+                    if _inferred_count and _inferred_count > 0:
+                        meta = self.screenplay.identity_block_metadata.get(group_id)
+                        if meta:
+                            meta["member_count"] = _inferred_count
+                            meta["member_count_visible"] = _inferred_count
+                            _safe_print(f"  + Set member count for {group_name}: {_inferred_count}")
+            _elog(f"STEP 3c complete: {groups_created} group block(s) created")
 
             _elog("STEP 4: Validation pass...")
             # STEP 4: Validation pass (REQUIRED) - ensure no characters named in scene are missing
@@ -6092,9 +6981,9 @@ Respond with ONLY the physical appearance description (no clothing)."""
                     missing_characters.append(char_name)
             
             if missing_characters:
-                print(f"⚠️ VALIDATION FAILED: {len(missing_characters)} character(s) missing identity blocks:")
+                _safe_print(f"⚠️ VALIDATION FAILED: {len(missing_characters)} character(s) missing identity blocks:")
                 for char_name in missing_characters:
-                    print(f"    - {char_name}")
+                    _safe_print(f"    - {char_name}")
                 # Retry: force create identity blocks for missing characters
                 for char_name in missing_characters:
                     lookup_name = char_name
@@ -6102,7 +6991,7 @@ Respond with ONLY the physical appearance description (no clothing)."""
                         canonical = self.screenplay.resolve_character_to_canonical(char_name)
                         if canonical:
                             lookup_name = canonical
-                    print(f"  Retrying creation for: {char_name}")
+                    _safe_print(f"  Retrying creation for: {char_name}")
                     char_id = self.screenplay.create_placeholder_identity_block(
                         lookup_name,
                         "character",
@@ -6152,13 +7041,13 @@ Respond with ONLY the physical appearance description (no clothing)."""
                             if lookup_name not in registry:
                                 overlap = self.screenplay.has_overlapping_registry_name(lookup_name)
                                 if overlap:
-                                    print(f"  [registry guard] Skipping '{lookup_name}' — overlaps with existing '{overlap}'")
+                                    _safe_print(f"  [registry guard] Skipping '{lookup_name}' — overlaps with existing '{overlap}'")
                                 else:
                                     registry.append(lookup_name)
                                     self.screenplay.character_registry = registry
-                            print(f"  + Created identity block for MINOR character {lookup_name} (retry)")
+                            _safe_print(f"  + Created identity block for MINOR character {lookup_name} (retry)")
                         else:
-                            print(f"  + Created identity block placeholder for {char_name} (retry)")
+                            _safe_print(f"  + Created identity block placeholder for {char_name} (retry)")
                 # Re-validate (use lookup_name for consistency)
                 still_missing = []
                 for c in missing_characters:
@@ -6170,17 +7059,21 @@ Respond with ONLY the physical appearance description (no clothing)."""
                     if not self.screenplay.get_identity_block_by_name(lookup_c, "character"):
                         still_missing.append(c)
                 if still_missing:
-                    print(f"⚠️ VALIDATION STILL FAILED after retry: {still_missing}")
+                    _safe_print(f"⚠️ VALIDATION STILL FAILED after retry: {still_missing}")
                 else:
-                    print(f"✓ VALIDATION PASSED after retry: All {len(characters_named_in_scene)} characters have identity blocks")
+                    _safe_print(f"✓ VALIDATION PASSED after retry: All {len(characters_named_in_scene)} characters have identity blocks")
             else:
-                print(f"✓ VALIDATION PASSED: All {len(characters_named_in_scene)} characters have identity blocks")
+                _safe_print(f"✓ VALIDATION PASSED: All {len(characters_named_in_scene)} characters have identity blocks")
             _elog("STEP 4 complete.")
             
             _elog("STEP 4b: Extracting wardrobes (respecting selector state)...")
             _update_progress("Extracting character wardrobes...")
             scene_context = (self.current_scene.title or "") + " " + (self.current_scene.description or "")
+            is_first_scene = self._is_first_scene(self.current_scene)
             selector_state = getattr(self.current_scene, 'character_wardrobe_selector', {}) or {}
+            if is_first_scene:
+                selector_state = {}
+                _elog("  STEP 4b: First scene — ignoring saved selector state, forcing extraction")
             last_variants = getattr(self.screenplay, 'character_last_wardrobe_variant', {}) or {}
 
             for char_name in characters_named_in_scene:
@@ -6191,9 +7084,12 @@ Respond with ONLY the physical appearance description (no clothing)."""
                     if canonical:
                         entity_id = self.screenplay.identity_block_ids.get(f"character:{canonical}".lower())
                 if not entity_id:
+                    _elog(f"  STEP 4b: SKIP wardrobe for '{char_name}' — no entity_id found")
+                    _safe_print(f"  ⚠ SKIP wardrobe for '{char_name}' — entity_id not found")
                     continue
 
                 choice = selector_state.get(entity_id, "change")
+                _elog(f"  STEP 4b: '{char_name}' entity_id={entity_id} choice={choice}")
 
                 if choice == "same":
                     prev_vid = last_variants.get(entity_id)
@@ -6201,18 +7097,28 @@ Respond with ONLY the physical appearance description (no clothing)."""
                         if not hasattr(self.current_scene, 'character_wardrobe_variant_ids'):
                             self.current_scene.character_wardrobe_variant_ids = {}
                         self.current_scene.character_wardrobe_variant_ids[entity_id] = prev_vid
-                        print(f"  = Carried forward wardrobe variant for {char_name} (same)")
-                    continue
+                        _safe_print(f"  = Carried forward wardrobe variant for {char_name} (same)")
+                        continue
+                    # No previous wardrobe exists — fall through to extraction
+                    # instead of silently skipping (handles first scene or
+                    # re-approval after entity deletion).
+                    _elog(f"  STEP 4b: '{char_name}' choice=same but no previous variant — falling through to extract")
+                    _safe_print(f"  ⚠ '{char_name}' choice=same but no previous wardrobe — extracting instead")
 
                 # choice == "change" or "change_in_scene": extract wardrobe text
+                char_species = "Human"
+                meta = self.screenplay.identity_block_metadata.get(entity_id)
+                if meta:
+                    char_species = meta.get("species", "Human") or "Human"
                 wardrobe = self.ai_generator.extract_character_wardrobe_from_scene(
-                    content, char_name, scene_context
+                    content, char_name, scene_context, species=char_species
                 )
+                _elog(f"  STEP 4b: wardrobe result for '{char_name}': '{wardrobe[:80] if wardrobe else '(empty)'}'")
                 if wardrobe:
                     self.screenplay.set_character_wardrobe_for_scene(
                         self.current_scene.scene_id, entity_id, wardrobe
                     )
-                    print(f"  + Extracted wardrobe for {char_name}: {wardrobe[:60]}...")
+                    _safe_print(f"  + Extracted wardrobe for {char_name}: {wardrobe[:60]}...")
 
                     # Reuse existing variant for this scene if one is already assigned
                     existing_vids = getattr(self.current_scene, 'character_wardrobe_variant_ids', {}) or {}
@@ -6226,7 +7132,7 @@ Respond with ONLY the physical appearance description (no clothing)."""
                         self.screenplay.update_wardrobe_variant(
                             entity_id, existing_vid, description=wardrobe
                         )
-                        print(f"  ~ Updated existing wardrobe variant for {char_name} in scene {self.current_scene.scene_number}")
+                        _safe_print(f"  ~ Updated existing wardrobe variant for {char_name} in scene {self.current_scene.scene_number}")
                     else:
                         import uuid as _uuid
                         new_vid = str(_uuid.uuid4())[:8]
@@ -6244,7 +7150,9 @@ Respond with ONLY the physical appearance description (no clothing)."""
                         if not hasattr(self.current_scene, 'character_wardrobe_variant_ids'):
                             self.current_scene.character_wardrobe_variant_ids = {}
                         self.current_scene.character_wardrobe_variant_ids[entity_id] = new_vid
-                        print(f"  + Created pending wardrobe variant '{scene_label}' for {char_name} (image required)")
+                        _safe_print(f"  + Created pending wardrobe variant '{scene_label}' for {char_name} (image required)")
+                else:
+                    _safe_print(f"  ⚠ No wardrobe extracted for {char_name} — AI returned empty")
             
             # Refresh wardrobe UI after extraction
             if hasattr(self, '_refresh_wardrobe_ui') and self.current_scene:
@@ -6256,6 +7164,11 @@ Respond with ONLY the physical appearance description (no clothing)."""
             entities_created = characters_created
             environments_extracted = 0
             scene_desc = self.current_scene.description or ""
+
+            # Clear stale environment_id so the extraction below assigns the
+            # correct primary environment (important when regenerating a scene
+            # whose location changed since the last generation).
+            self.current_scene.environment_id = None
             
             if entities:
                 for entity in entities:
@@ -6283,12 +7196,47 @@ Respond with ONLY the physical appearance description (no clothing)."""
                     
                     # Special handling for extracted environments
                     if entity_type == "environment":
+                        # Detect whether this environment is PRIMARY (scene takes
+                        # place here) or REFERENCED (only mentioned in dialogue,
+                        # carvings, visions, etc.).
+                        import re as _re_env
+                        _env_core = _re_env.sub(r'^[_\{\[]|[_\}\]]$', '', entity_name.strip()).strip().lower()
+                        _paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
+                        _scene_desc_lower = scene_desc.lower()
+
+                        _is_primary = _env_core in _scene_desc_lower
+
+                        if not _is_primary:
+                            for p_idx, para in enumerate(_paragraphs):
+                                para_lower = para.lower()
+                                if _env_core not in para_lower:
+                                    continue
+                                is_dialogue = bool(_re_env.match(r'^[A-Z][A-Z\s\'\-]+\s*\n\s*"', para))
+                                if is_dialogue:
+                                    continue
+                                if p_idx <= 1:
+                                    _is_primary = True
+                                    break
+                                action_text = _re_env.sub(r'\([^)]*\)', '', para).lower()
+                                if _env_core in action_text:
+                                    _is_primary = True
+                                    break
+
+                        if not _is_primary:
+                            env_id = self.screenplay.create_placeholder_identity_block(
+                                entity_name, "environment", self.current_scene.scene_id
+                            )
+                            self.screenplay.update_identity_block_metadata(
+                                env_id, status="referenced", parent_vehicle="",
+                                is_primary_environment=False
+                            )
+                            _safe_print(f"  ℹ Environment '{entity_name}' is referenced only (not visited) — marked as 'referenced'")
+                            entities_created += 1
+                            continue
+
                         # Vehicle interior: ENVIRONMENT with parent_vehicle. Vehicle exterior = VEHICLE only.
-                        # If this environment name implies a vehicle interior (e.g. "Starfall Cruiser – Bridge"),
-                        # ensure the VEHICLE identity exists first, then set parent_vehicle on the environment.
                         parent_vehicle_name = self.ai_generator._parse_vehicle_interior_from_environment_name(entity_name)
                         if parent_vehicle_name:
-                            # Create VEHICLE identity first if it does not exist (exterior). Camera outside = VEHICLE.
                             existing_vehicle = self.screenplay.get_identity_block_by_name(parent_vehicle_name, "vehicle")
                             if not existing_vehicle:
                                 veh_id = self.screenplay.create_placeholder_identity_block(parent_vehicle_name, "vehicle", self.current_scene.scene_id)
@@ -6300,6 +7248,7 @@ Respond with ONLY the physical appearance description (no clothing)."""
                             self.screenplay.update_identity_block_metadata(env_id, parent_vehicle=parent_vehicle_name)
                         else:
                             env_id = self.screenplay.create_placeholder_identity_block(entity_name, "environment", self.current_scene.scene_id)
+                            self.screenplay.update_identity_block_metadata(env_id, parent_vehicle="")
                         # Apply MODE A/B to extracted environments
                         requires_extras = self.ai_generator._scene_requires_extras(scene_desc, content)
                         self.screenplay.update_identity_block_metadata(env_id, extras_present=requires_extras, foreground_zone="clear")
@@ -6309,9 +7258,11 @@ Respond with ONLY the physical appearance description (no clothing)."""
                         env_notes = description
                         if not env_notes:
                             env_notes = self._extract_environment_description_from_content(content, entity_name)
+                        if not env_notes:
+                            env_notes = self._extract_environment_from_content(content, entity_name)
                         if env_notes:
                             self.screenplay.update_identity_block_metadata(env_id, user_notes=env_notes)
-                            print(f"  + Environment user_notes set for {entity_name}: {env_notes[:80]}...")
+                            _safe_print(f"  + Environment user_notes set for {entity_name}: {env_notes[:80]}...")
                         if environments_extracted == 0:
                             self.current_scene.environment_id = env_id
                             self.screenplay.update_identity_block_metadata(env_id, is_primary_environment=True)
@@ -6351,10 +7302,10 @@ Respond with ONLY the physical appearance description (no clothing)."""
                 env_description = self._extract_environment_from_content(content, self.current_scene.title)
                 self.screenplay.update_identity_block_metadata(env_id, user_notes=env_description)
                 
-                print(f"Created fallback environment placeholder (no environments extracted)")
+                _safe_print(f"Created fallback environment placeholder (no environments extracted)")
             
             _elog(f"STEP 5 complete: {entities_created} total entities, {environments_extracted} environments")
-            print(f"Extracted {entities_created} entities from scene content ({environments_extracted} environment(s))")
+            _safe_print(f"Extracted {entities_created} entities from scene content ({environments_extracted} environment(s))")
             
             # ENRICHMENT PASS: scan the full scene for additional descriptive
             # details that may have been introduced after the first mention.
@@ -6364,9 +7315,23 @@ Respond with ONLY the physical appearance description (no clothing)."""
             _elog("STEP 6 complete.")
             
             # VALIDATION PASS (parent_vehicle): environments with parent_vehicle reference existing VEHICLE; no VEHICLE has parent_vehicle
+            # First, re-verify each parent_vehicle relationship — clear stale ones
+            # where the environment name no longer implies a vehicle interior.
+            for entity_id, meta in list(self.screenplay.identity_block_metadata.items()):
+                if meta.get("type") != "environment":
+                    continue
+                parent = (meta.get("parent_vehicle") or "").strip()
+                if not parent:
+                    continue
+                env_name = (meta.get("name") or "").strip()
+                detected = self.ai_generator._parse_vehicle_interior_from_environment_name(env_name)
+                if not detected:
+                    _safe_print(f"  Clearing stale parent_vehicle '{parent}' from environment '{env_name}'")
+                    self.screenplay.update_identity_block_metadata(entity_id, parent_vehicle="")
+
             passed, pv_issues = self.screenplay.validate_parent_vehicle_relationships()
             if not passed and pv_issues:
-                print("parent_vehicle validation:", "; ".join(pv_issues))
+                _safe_print("parent_vehicle validation:", "; ".join(pv_issues))
                 # Auto-correct: ensure any environment with parent_vehicle has the vehicle created
                 for entity_id, meta in list(self.screenplay.identity_block_metadata.items()):
                     if meta.get("type") != "environment":
@@ -6380,17 +7345,74 @@ Respond with ONLY the physical appearance description (no clothing)."""
                             notes = self._extract_entity_details_from_scene(content, parent, "vehicle")
                             if notes:
                                 self.screenplay.update_identity_block_metadata(veh_id, user_notes=notes)
-                        print(f"  Auto-created VEHICLE '{parent}' for environment '{meta.get('name', '')}'")
+                        _safe_print(f"  Auto-created VEHICLE '{parent}' for environment '{meta.get('name', '')}'")
             
             # Refresh the Identity Blocks tab if it exists
             if hasattr(self, 'identity_blocks_tab') and self.identity_blocks_tab:
                 self.identity_blocks_tab.refresh_entity_list()
             
+            # Genre compliance check on identity blocks (with replacement suggestions)
+            if self.ai_generator:
+                _genre_warnings = self.ai_generator.validate_identity_block_genre(self.screenplay)
+                if _genre_warnings:
+                    _elog(f"GENRE WARNINGS: {len(_genre_warnings)} identity block genre violation(s)")
+                    for _gw in _genre_warnings:
+                        _safe_print(f"  ⚠ Genre: {_gw}")
+
+            # Outline entity-name consistency check
+            _outline_warnings = self.screenplay.validate_outline_entity_names()
+            if _outline_warnings:
+                _elog(f"OUTLINE NAME WARNINGS: {len(_outline_warnings)} entity name mismatch(es)")
+                for _ow in _outline_warnings:
+                    _safe_print(f"  ⚠ Outline: {_ow}")
+
+            # Environment name vs content mismatch check
+            _env_warnings = self.screenplay.validate_environment_name_content()
+            if _env_warnings:
+                _elog(f"ENV NAME WARNINGS: {len(_env_warnings)} environment name/content mismatch(es)")
+                for _ew in _env_warnings:
+                    _safe_print(f"  ⚠ EnvName: {_ew}")
+
+            # Unused placeholder entity detection
+            _unused_warnings = self.screenplay.detect_unused_placeholder_entities()
+            if _unused_warnings:
+                _elog(f"UNUSED ENTITIES: {len(_unused_warnings)} placeholder entity/ies not referenced in any scene")
+                for _uw in _unused_warnings:
+                    _safe_print(f"  ⚠ Unused: {_uw}")
+
+            # Recurring objects across scenes that need identity blocks
+            _recurring_warnings = self.screenplay.detect_recurring_objects_needing_identity()
+            if _recurring_warnings:
+                _elog(f"RECURRING OBJECTS: {len(_recurring_warnings)} object(s) appear in multiple scenes without identity blocks")
+                for _rw in _recurring_warnings:
+                    _safe_print(f"  ⚠ Recurring: {_rw}")
+                # Show in UI so the user can see recurring object warnings
+                try:
+                    from PyQt6.QtWidgets import QMessageBox
+                    _msg = (
+                        "The following objects appear in multiple scenes and should have "
+                        "identity blocks generated for visual continuity:\n\n"
+                    )
+                    for _rw in _recurring_warnings:
+                        _msg += f"• {_rw}\n"
+                    _msg += (
+                        "\nGenerate identity blocks for these objects in the "
+                        "Identity Blocks tab to ensure they look consistent across scenes."
+                    )
+                    _box = QMessageBox(self)
+                    _box.setIcon(QMessageBox.Icon.Information)
+                    _box.setWindowTitle("Recurring Objects Detected")
+                    _box.setText(f"{len(_recurring_warnings)} recurring object(s) need identity blocks")
+                    _box.setDetailedText(_msg)
+                    _box.exec()
+                except Exception:
+                    pass
+
             _elog(f"EXTRACTION COMPLETE — identity_block_metadata has {len(self.screenplay.identity_block_metadata)} entries")
         except Exception as e:
             _tb = traceback.format_exc()
             _elog(f"EXCEPTION in extract_entities_from_scene_content:\n{_tb}")
-            print(f"Error extracting entities: {e}")
+            _safe_print(f"Error extracting entities: {e}")
     
     def on_scene_content_error(self, error: str, progress: QProgressDialog):
         """Handle scene content generation error."""
@@ -6432,6 +7454,9 @@ Respond with ONLY the physical appearance description (no clothing)."""
         
         content = self._merge_dialogue_blocks(content)
 
+        # Strip any existing paragraph numbers first to avoid doubling
+        content = self._remove_paragraph_numbers(content)
+
         # Split by double newlines (paragraph breaks)
         paragraphs = content.split('\n\n')
         numbered_paragraphs = []
@@ -6439,7 +7464,6 @@ Respond with ONLY the physical appearance description (no clothing)."""
         for i, para in enumerate(paragraphs, 1):
             para = para.strip()
             if para:
-                # Add paragraph number at the start
                 numbered_paragraphs.append(f"[{i}] {para}")
             else:
                 numbered_paragraphs.append(para)
@@ -6451,12 +7475,14 @@ Respond with ONLY the physical appearance description (no clothing)."""
         if not content or not content.strip():
             return content
         
-        # Remove pattern like "[1] ", "[2] ", etc. at the start of paragraphs
         import re
-        # Pattern matches [number] followed by space at the start of a line or after double newline
-        pattern = r'(\n\n|^)\[\d+\]\s+'
-        cleaned = re.sub(pattern, r'\1', content)
-        return cleaned
+        paragraphs = content.split('\n\n')
+        cleaned = []
+        for para in paragraphs:
+            # Strip ALL leading [N] tags (handles doubled [1] [1] etc.)
+            para = re.sub(r'^(?:\[\d+\]\s*)+', '', para)
+            cleaned.append(para)
+        return '\n\n'.join(cleaned)
     
     def on_tree_items_reordered(self):
         """Handle tree items being reordered via drag and drop."""
@@ -6489,7 +7515,7 @@ Respond with ONLY the physical appearance description (no clothing)."""
         
         lost_scenes = set(scenes_before.keys()) - set(scenes_after.keys())
         if lost_scenes:
-            print(f"ERROR: Lost {len(lost_scenes)} scenes during update: {lost_scenes}")
+            _safe_print(f"ERROR: Lost {len(lost_scenes)} scenes during update: {lost_scenes}")
             # Try to restore from tree
             root = self.tree.topLevelItem(0)
             if root:
@@ -6506,7 +7532,7 @@ Respond with ONLY the physical appearance description (no clothing)."""
                                     if act_item.data(0, Qt.ItemDataRole.UserRole)[1] == act:
                                         if scene not in act.scenes:
                                             act.scenes.append(scene)
-                                            print(f"Restored scene {scene.title} to act {act.act_number}")
+                                            _safe_print(f"Restored scene {scene.title} to act {act.act_number}")
         
         # Renumber acts and scenes to maintain continuity
         self.renumber_acts()
@@ -6611,7 +7637,7 @@ Respond with ONLY the physical appearance description (no clothing)."""
                             new_scenes.append(all_scenes[scene_id])
                         else:
                             # Scene not in collection - this shouldn't happen, but preserve it
-                            print(f"Warning: Scene {scene_id} ({scene.title}) not in collection, adding it")
+                            _safe_print(f"Warning: Scene {scene_id} ({scene.title}) not in collection, adding it")
                             all_scenes[scene_id] = scene
                             new_scenes.append(scene)
                 
@@ -6622,10 +7648,10 @@ Respond with ONLY the physical appearance description (no clothing)."""
         # CRITICAL: Check for lost scenes and preserve them
         lost_scenes = original_scene_ids - scenes_found_in_tree
         if lost_scenes:
-            print(f"ERROR: {len(lost_scenes)} scenes lost during tree update!")
+            _safe_print(f"ERROR: {len(lost_scenes)} scenes lost during tree update!")
             for lost_id in lost_scenes:
                 lost_scene = all_scenes[lost_id]
-                print(f"  - Lost: {lost_scene.title} (ID: {lost_id})")
+                _safe_print(f"  - Lost: {lost_scene.title} (ID: {lost_id})")
                 # Try to restore by finding the act it was originally in
                 # Add it back to the first act as a fallback (better than losing it)
                 if new_acts:
@@ -6634,7 +7660,7 @@ Respond with ONLY the physical appearance description (no clothing)."""
                         # If we can't determine, add to first act
                         if lost_scene not in act.scenes:
                             act.scenes.append(lost_scene)
-                            print(f"  - Restored '{lost_scene.title}' to act {act.act_number}")
+                            _safe_print(f"  - Restored '{lost_scene.title}' to act {act.act_number}")
                             break
         
         # Update the screenplay's acts list
@@ -6643,7 +7669,7 @@ Respond with ONLY the physical appearance description (no clothing)."""
         # Final verification
         final_scene_count = sum(len(act.scenes) for act in self.screenplay.acts)
         if final_scene_count < original_scene_count:
-            print(f"ERROR: Scene count mismatch! Had {original_scene_count}, now have {final_scene_count}")
+            _safe_print(f"ERROR: Scene count mismatch! Had {original_scene_count}, now have {final_scene_count}")
     
     def on_tree_context_menu(self, position):
         """Show context menu for tree items."""
@@ -6876,7 +7902,7 @@ Respond with ONLY the physical appearance description (no clothing)."""
     
     def on_identity_blocks_changed(self):
         """Handle identity blocks being updated."""
-        # Refresh the identity blocks manager to show updated status
         if hasattr(self, 'identity_block_manager') and self.screenplay:
             self.identity_block_manager.refresh_entity_list()
+        self._refresh_char_tab_identity_data()
     

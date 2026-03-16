@@ -1,5 +1,5 @@
 """
-Multi-shot clustering engine for MoviePrompterAI.
+Multi-shot clustering engine for SceneWrite.
 
 Provides model-agnostic multi-shot video generation support.  When the video
 model advertises ``supports_multishot``, consecutive storyboard items that
@@ -38,7 +38,7 @@ _NAME_WORD = r"[A-Z](?:[A-Z]+|'[A-Z]+)"
 _CHAR_PATTERN = re.compile(rf"\b({_HONORIFIC}{_NAME_WORD}(?:[ \t]+{_NAME_WORD})*)\b")
 
 # Identity block ID tags injected by the pipeline
-_ID_TAG = re.compile(r'\((CHARACTER|OBJECT|VEHICLE|ENVIRONMENT)_[A-F0-9]+\)')
+_ID_TAG = re.compile(r'\((CHARACTER|OBJECT|VEHICLE|ENVIRONMENT|GROUP)_[A-F0-9]+\)')
 
 
 def _strip_id_tags(text: str) -> str:
@@ -131,7 +131,10 @@ def _get_item_environment(item: StoryboardItem,
     text = _item_text(item)
     envs = _extract_environments_from_text(text)
     if envs:
-        return sorted(envs)[0]
+        # Reject garbage: real environment names are short and don't contain IDs
+        valid = [e for e in envs if len(e) < 80 and not re.search(r'[A-F0-9]{4,}\)', e)]
+        if valid:
+            return sorted(valid)[0]
     return scene.environment_id or ""
 
 

@@ -1,5 +1,5 @@
 """
-Cinematic Token Detector for MoviePrompterAI.
+Cinematic Token Detector for SceneWrite.
 
 Scans scene text and classifies unmarked tokens for spellcheck-style highlighting.
 

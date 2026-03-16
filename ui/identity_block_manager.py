@@ -1,5 +1,5 @@
 """
-Identity Block Manager Widget for MoviePrompterAI.
+Identity Block Manager Widget for SceneWrite.
 Provides a UI for reviewing, editing, and approving entity identity blocks.
 """
 
@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QGroupBox, QFormLayout, QMessageBox,
     QLineEdit, QProgressDialog, QScrollArea, QSizePolicy,
     QComboBox, QDialog, QApplication, QStyle, QDialogButtonBox,
-    QCheckBox, QFileDialog
+    QCheckBox, QFileDialog, QMenu, QSpinBox
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QThread
 from PyQt6.QtGui import QFont, QColor, QPixmap
@@ -17,6 +17,15 @@ from .image_thumbnail import ClickableImageLabel
 from typing import Optional, Dict, Any, List
 from core.screenplay_engine import Screenplay
 from core.ai_generator import AIGenerator
+
+
+def _safe_print(*args, **kwargs):
+    """Route output through debug_log instead of stdout (hidden in production)."""
+    try:
+        from debug_log import debug_log as _dl
+        _dl(" ".join(str(a) for a in args))
+    except Exception:
+        pass
 
 
 class IdentityBlockGenerationThread(QThread):
@@ -200,8 +209,11 @@ class IdentityBlockManager(QWidget):
         self.entity_tree = QTreeWidget()
         self.entity_tree.setHeaderLabels(["Entity", "Status"])
         self.entity_tree.setColumnWidth(0, 200)
+        self.entity_tree.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
         self.entity_tree.itemSelectionChanged.connect(self.on_entity_selected)
         self.entity_tree.itemDoubleClicked.connect(self.on_entity_double_clicked)
+        self.entity_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.entity_tree.customContextMenuRequested.connect(self._show_entity_context_menu)
         layout.addWidget(self.entity_tree)
         
         # Buttons layout
@@ -234,19 +246,20 @@ class IdentityBlockManager(QWidget):
         return widget
 
     def remove_selected_entity(self):
-        """Remove the currently selected entity from the identity list."""
-        selected_items = self.entity_tree.selectedItems()
+        """Remove the currently selected entities from the identity list."""
+        selected_items = [
+            item for item in self.entity_tree.selectedItems()
+            if item.data(0, Qt.ItemDataRole.UserRole)
+        ]
         if not selected_items or not self.screenplay:
             return
-        
-        item = selected_items[0]
-        entity_id = item.data(0, Qt.ItemDataRole.UserRole)
-        if not entity_id:
-            return
-        
-        # Load entity into editor (sets current_entity_id), then delete
-        self.load_entity(entity_id)
-        self.delete_entity()
+
+        if len(selected_items) > 1:
+            self._delete_selected_entities()
+        else:
+            entity_id = selected_items[0].data(0, Qt.ItemDataRole.UserRole)
+            self.load_entity(entity_id)
+            self.delete_entity()
     
     def update_entity_status_in_tree(self, new_status: str):
         """Update the status of the current entity in the tree without full refresh."""
@@ -305,7 +318,7 @@ class IdentityBlockManager(QWidget):
                     from PyQt6.QtWidgets import QApplication
                     QApplication.processEvents()
                     
-                    print(f"Entity {self.current_entity_id} selection maintained")
+                    _safe_print(f"Entity {self.current_entity_id} selection maintained")
                     
                     # Restore signal blocking state
                     if not was_blocked:
@@ -448,7 +461,77 @@ class IdentityBlockManager(QWidget):
         self.env_extras_group.setLayout(env_extras_layout)
         self.env_extras_group.setVisible(False)
         layout.addWidget(self.env_extras_group)
-        
+
+        # Group controls (only for type group; show/hide in load_entity)
+        self.group_controls_group = QGroupBox("Group Settings")
+        group_ctrl_layout = QFormLayout()
+        self.group_member_count_spin = QSpinBox()
+        self.group_member_count_spin.setRange(2, 50)
+        self.group_member_count_spin.setValue(3)
+        self.group_member_count_spin.setToolTip("Total number of members in this group")
+        self.group_member_count_spin.valueChanged.connect(self._on_group_options_changed)
+        group_ctrl_layout.addRow("Member count:", self.group_member_count_spin)
+        self.group_visible_count_spin = QSpinBox()
+        self.group_visible_count_spin.setRange(0, 50)
+        self.group_visible_count_spin.setValue(0)
+        self.group_visible_count_spin.setToolTip("Visible on-screen at once (0 = same as member count)")
+        self.group_visible_count_spin.valueChanged.connect(self._on_group_options_changed)
+        group_ctrl_layout.addRow("Visible count:", self.group_visible_count_spin)
+        self.group_formation_combo = QComboBox()
+        self.group_formation_combo.addItems([
+            "scattered", "line", "wedge", "cluster", "surrounding", "flanking"
+        ])
+        self.group_formation_combo.setToolTip("Default spatial arrangement of the group")
+        self.group_formation_combo.currentTextChanged.connect(self._on_group_options_changed)
+        group_ctrl_layout.addRow("Formation:", self.group_formation_combo)
+        self.group_individuality_combo = QComboBox()
+        self.group_individuality_combo.addItems(["identical", "slight_variation", "distinct"])
+        self.group_individuality_combo.setToolTip(
+            "identical = all members look the same; slight_variation = minor "
+            "differences (height, build); distinct = each member visually unique"
+        )
+        self.group_individuality_combo.currentTextChanged.connect(self._on_group_options_changed)
+        group_ctrl_layout.addRow("Individuality:", self.group_individuality_combo)
+        self.group_uniform_edit = QLineEdit()
+        self.group_uniform_edit.setPlaceholderText("e.g. polished silver breastplates with winged sun emblem")
+        self.group_uniform_edit.textChanged.connect(self._on_group_options_changed)
+        group_ctrl_layout.addRow("Uniform:", self.group_uniform_edit)
+        self.group_controls_group.setLayout(group_ctrl_layout)
+        self.group_controls_group.setVisible(False)
+        layout.addWidget(self.group_controls_group)
+
+        # Alias controls (link this entity as the same person as another)
+        self.alias_controls_group = QGroupBox("Character Alias")
+        alias_layout = QVBoxLayout()
+        alias_help = QLabel(
+            "Link entities that are the same person under different names "
+            "(e.g. HOODED FIGURE → TALON → LYRA STORMWEAVER). "
+            "Select the canonical (real) identity below."
+        )
+        alias_help.setWordWrap(True)
+        alias_help.setStyleSheet("color: #666; font-style: italic;")
+        alias_layout.addWidget(alias_help)
+        alias_row = QHBoxLayout()
+        self.alias_combo = QComboBox()
+        self.alias_combo.setToolTip("Select the canonical identity this entity is an alias of")
+        self.alias_combo.addItem("(none — this is the canonical identity)", "")
+        alias_row.addWidget(self.alias_combo, stretch=1)
+        self.alias_link_btn = QPushButton("Link")
+        self.alias_link_btn.setToolTip("Set this entity as an alias of the selected canonical entity")
+        self.alias_link_btn.clicked.connect(self._on_alias_link)
+        alias_row.addWidget(self.alias_link_btn)
+        self.alias_unlink_btn = QPushButton("Unlink")
+        self.alias_unlink_btn.setToolTip("Remove the alias link")
+        self.alias_unlink_btn.clicked.connect(self._on_alias_unlink)
+        alias_row.addWidget(self.alias_unlink_btn)
+        alias_layout.addLayout(alias_row)
+        self.alias_status_label = QLabel("")
+        self.alias_status_label.setWordWrap(True)
+        alias_layout.addWidget(self.alias_status_label)
+        self.alias_controls_group.setLayout(alias_layout)
+        self.alias_controls_group.setVisible(False)
+        layout.addWidget(self.alias_controls_group)
+
         # User notes group — label changes dynamically for characters vs other entities
         self.notes_group = QGroupBox("User Notes (Short Description)")
         notes_layout = QVBoxLayout()
@@ -655,13 +738,186 @@ class IdentityBlockManager(QWidget):
     def _on_show_all_toggled(self, checked: bool):
         """Toggle between scene-filtered and global entity views."""
         self.refresh_entity_list()
-    
+
+    def _show_entity_context_menu(self, position):
+        """Show right-click context menu for the entity tree."""
+        menu = QMenu(self)
+
+        selected_items = [
+            item for item in self.entity_tree.selectedItems()
+            if item.data(0, Qt.ItemDataRole.UserRole)
+        ]
+        single = len(selected_items) == 1
+        any_selected = len(selected_items) > 0
+
+        # Gather metadata for all selected items
+        selected_metas = []
+        for item in selected_items:
+            eid = item.data(0, Qt.ItemDataRole.UserRole)
+            meta = (self.screenplay.get_identity_block_metadata_by_id(eid)
+                    if self.screenplay else None) or {}
+            selected_metas.append((eid, meta))
+
+        # Determine types in selection
+        selected_types = {(m.get("type") or "").lower() for _, m in selected_metas}
+        all_obj_or_vehicle = selected_types <= {"object", "vehicle"} and len(selected_metas) > 0
+
+        if single:
+            entity_id, meta = selected_metas[0]
+            status = meta.get("status", "")
+            has_block = bool(meta.get("identity_block"))
+            has_ref_prompt = bool(meta.get("reference_image_prompt"))
+            is_approved = status == "approved"
+
+            gen_action = menu.addAction("Generate Identity Block")
+            gen_action.setEnabled(bool(self.ai_generator))
+            gen_action.triggered.connect(self.generate_identity_block)
+
+            approve_action = menu.addAction("Approve Identity Block")
+            approve_action.setEnabled(has_block)
+            approve_action.triggered.connect(self.approve_identity_block)
+
+            menu.addSeparator()
+
+            gen_ref_action = menu.addAction("Generate Reference Image Prompt")
+            gen_ref_action.setEnabled(is_approved and has_block and bool(self.ai_generator))
+            gen_ref_action.triggered.connect(self.generate_reference_image_prompt)
+
+            copy_ref_action = menu.addAction("Copy Reference Prompt to Clipboard")
+            copy_ref_action.setEnabled(has_ref_prompt)
+            copy_ref_action.triggered.connect(self.copy_reference_prompt_to_clipboard)
+
+            entity_type = (meta.get("type") or "").lower()
+            if entity_type in ("object", "vehicle"):
+                menu.addSeparator()
+                is_passive = status == "passive"
+                if is_passive:
+                    unpassive_action = menu.addAction("Remove Passive Label")
+                    unpassive_action.triggered.connect(self._unmark_passive_entity)
+                else:
+                    passive_action = menu.addAction("Mark as Passive (Name Only)")
+                    passive_action.triggered.connect(self._mark_passive_entity)
+
+            menu.addSeparator()
+
+        elif any_selected and all_obj_or_vehicle:
+            n = len(selected_items)
+
+            gen_action = menu.addAction(f"Generate Identity Blocks ({n})")
+            gen_action.setEnabled(bool(self.ai_generator))
+            gen_action.triggered.connect(self._generate_selected_identity_blocks)
+
+            any_has_block = any(bool(m.get("identity_block")) for _, m in selected_metas)
+            approve_action = menu.addAction(f"Approve Identity Blocks ({n})")
+            approve_action.setEnabled(any_has_block)
+            approve_action.triggered.connect(self._approve_selected_identity_blocks)
+
+            menu.addSeparator()
+
+            any_approved = any(
+                m.get("status") == "approved" and bool(m.get("identity_block"))
+                for _, m in selected_metas
+            )
+            gen_ref_action = menu.addAction(f"Generate Reference Image Prompts ({n})")
+            gen_ref_action.setEnabled(any_approved and bool(self.ai_generator))
+            gen_ref_action.triggered.connect(self._generate_selected_reference_prompts)
+
+            menu.addSeparator()
+
+            passive_count = sum(1 for _, m in selected_metas if m.get("status") == "passive")
+            non_passive_count = n - passive_count
+            if non_passive_count > 0:
+                passive_action = menu.addAction(
+                    f"Mark as Passive ({non_passive_count})"
+                    if non_passive_count < n else f"Mark as Passive ({n})"
+                )
+                passive_action.triggered.connect(self._mark_passive_entity)
+            if passive_count > 0:
+                unpassive_action = menu.addAction(
+                    f"Remove Passive Label ({passive_count})"
+                    if passive_count < n else f"Remove Passive Label ({n})"
+                )
+                unpassive_action.triggered.connect(self._unmark_passive_entity)
+
+            menu.addSeparator()
+
+        if any_selected:
+            delete_action = menu.addAction("Delete Entity" if single else f"Delete {len(selected_items)} Entities")
+            delete_action.triggered.connect(
+                self.delete_entity if single else self._delete_selected_entities
+            )
+            menu.addSeparator()
+
+        select_all_action = menu.addAction("Select All")
+        select_all_action.triggered.connect(self.select_all_entities)
+
+        add_action = menu.addAction("Add Entity...")
+        add_action.triggered.connect(self.add_manual_entity)
+
+        refresh_action = menu.addAction("Refresh List")
+        refresh_action.triggered.connect(self.refresh_entity_list)
+
+        menu.exec(self.entity_tree.viewport().mapToGlobal(position))
+
+    def _delete_selected_entities(self):
+        """Delete all currently selected entities after confirmation."""
+        if not self.screenplay:
+            return
+        selected_items = [
+            item for item in self.entity_tree.selectedItems()
+            if item.data(0, Qt.ItemDataRole.UserRole)
+        ]
+        if not selected_items:
+            return
+
+        names = []
+        for item in selected_items:
+            eid = item.data(0, Qt.ItemDataRole.UserRole)
+            meta = self.screenplay.identity_block_metadata.get(eid, {})
+            names.append(meta.get("name", eid))
+
+        reply = QMessageBox.question(
+            self,
+            "Confirm Delete",
+            f"Are you sure you want to delete {len(names)} entities?\n\n"
+            + "\n".join(f"  • {n}" for n in names),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        for item in selected_items:
+            eid = item.data(0, Qt.ItemDataRole.UserRole)
+            meta = self.screenplay.identity_block_metadata.get(eid, {})
+            entity_key = f"{meta.get('type', '')}:{meta.get('name', '')}".lower()
+            self.screenplay.identity_block_metadata.pop(eid, None)
+            self.screenplay.identity_blocks.pop(eid, None)
+            self.screenplay.identity_block_ids.pop(entity_key, None)
+
+        self.identity_blocks_changed.emit()
+        self.clear_editor()
+        self.refresh_entity_list()
+        self._show_status(f"{len(names)} entities deleted")
+
     def refresh_entity_list(self):
         """Refresh the entity list from screenplay, filtered by the current scene."""
         self.entity_tree.clear()
         
         if not self.screenplay:
             return
+
+        # Build dict of recurring object names → warning text for visual indicator
+        self._recurring_object_info: dict = {}
+        try:
+            _warnings = self.screenplay.detect_recurring_objects_needing_identity()
+            for w in _warnings:
+                import re as _re
+                m = _re.search(r'\[([^\]]+)\] appears in', w)
+                if m:
+                    self._recurring_object_info[m.group(1).lower()] = w
+        except Exception:
+            pass
 
         # Determine which entity IDs to show
         show_all = self.show_all_checkbox.isChecked()
@@ -672,6 +928,7 @@ class IdentityBlockManager(QWidget):
         # Group entities by type
         environments = []
         characters = []
+        groups = []
         vehicles = []
         objects = []
         
@@ -687,6 +944,8 @@ class IdentityBlockManager(QWidget):
                 environments.append(entity_data)
             elif entity_type == "character":
                 characters.append(entity_data)
+            elif entity_type == "group":
+                groups.append(entity_data)
             elif entity_type == "vehicle":
                 vehicles.append(entity_data)
             elif entity_type == "object":
@@ -706,6 +965,13 @@ class IdentityBlockManager(QWidget):
             for entity in characters:
                 self._add_entity_item(char_parent, entity)
             char_parent.setExpanded(True)
+
+        if groups:
+            group_parent = QTreeWidgetItem(self.entity_tree, ["Groups", ""])
+            group_parent.setFont(0, QFont("Arial", 10, QFont.Weight.Bold))
+            for entity in groups:
+                self._add_entity_item(group_parent, entity)
+            group_parent.setExpanded(True)
         
         if vehicles:
             veh_parent = QTreeWidgetItem(self.entity_tree, ["Vehicles", ""])
@@ -726,7 +992,13 @@ class IdentityBlockManager(QWidget):
         name = entity.get("name", "Unknown")
         status = entity.get("status", "unknown")
         entity_id = entity.get("entity_id", "")
+        entity_type = (entity.get("type") or "").lower()
         linked_group_id = entity.get("linked_group_id", "") or ""
+
+        # Recurring object indicator
+        _recurring_info = getattr(self, "_recurring_object_info", {})
+        is_recurring = entity_type == "object" and name.lower() in _recurring_info
+        display_name = f"🔄 {name}" if is_recurring else name
         
         # Format status
         status_text = status.capitalize()
@@ -736,11 +1008,21 @@ class IdentityBlockManager(QWidget):
             status_text = "✓ Approved"
         elif status == "generating":
             status_text = "⏳ Generating"
+        elif status == "passive":
+            status_text = "◇ Passive"
+        elif status == "referenced":
+            status_text = "👁 Referenced"
         if linked_group_id:
             status_text = f"{status_text} 🔗 Linked"
+        if is_recurring:
+            status_text = f"{status_text} 🔄 Recurring"
         
-        item = QTreeWidgetItem(parent, [name, status_text])
+        item = QTreeWidgetItem(parent, [display_name, status_text])
         item.setData(0, Qt.ItemDataRole.UserRole, entity_id)
+
+        if is_recurring:
+            item.setToolTip(0, _recurring_info.get(name.lower(), ""))
+            item.setToolTip(1, "This object appears in multiple scenes — generate an identity block for visual continuity")
         
         # Tick icon for completed (approved) entities
         if status == "approved":
@@ -757,6 +1039,20 @@ class IdentityBlockManager(QWidget):
             item.setForeground(1, QColor("#4CAF50"))  # Green
         elif status == "generating":
             item.setForeground(1, QColor("#2196F3"))  # Blue
+        elif status == "passive":
+            item.setForeground(0, QColor("#9E9E9E"))  # Grey name
+            item.setForeground(1, QColor("#9E9E9E"))  # Grey status
+            font = item.font(0)
+            font.setItalic(True)
+            item.setFont(0, font)
+        elif status == "referenced":
+            item.setForeground(0, QColor("#78909C"))  # Blue-grey name
+            item.setForeground(1, QColor("#78909C"))  # Blue-grey status
+            font = item.font(0)
+            font.setItalic(True)
+            item.setFont(0, font)
+            item.setToolTip(0, "This environment is referenced but not visited in this scene")
+            item.setToolTip(1, "Mentioned in dialogue, visions, or lore — not a scene location")
     
     def filter_entities(self, text: str):
         """Filter entities by search text."""
@@ -786,15 +1082,15 @@ class IdentityBlockManager(QWidget):
         if not selected_items:
             self.clear_editor()
             return
-        
-        item = selected_items[0]
-        entity_id = item.data(0, Qt.ItemDataRole.UserRole)
-        
-        if not entity_id or not self.screenplay:
-            self.clear_editor()
-            return
-        
-        self.load_entity(entity_id)
+
+        # Load the most recently selected entity (last in list) into the editor
+        for item in reversed(selected_items):
+            entity_id = item.data(0, Qt.ItemDataRole.UserRole)
+            if entity_id and self.screenplay:
+                self.load_entity(entity_id)
+                return
+
+        self.clear_editor()
     
     def on_entity_double_clicked(self, item: QTreeWidgetItem, column: int):
         """Handle double-click on entity."""
@@ -829,7 +1125,10 @@ class IdentityBlockManager(QWidget):
             self.entity_scene_label.setText("Global")
         
         status = metadata.get("status", "")
-        self.entity_status_label.setText(status.capitalize())
+        status_text = status.capitalize()
+        if metadata.get("source") == "series_bible":
+            status_text += "  [Series Bible]"
+        self.entity_status_label.setText(status_text)
         
         # ---------- CHARACTER: show wardrobe only, redirect to Character Details ----------
         if entity_type == "character":
@@ -892,6 +1191,12 @@ class IdentityBlockManager(QWidget):
                     "Examples:\n"
                     "  'Ancient alien artifact, glowing blue crystal, ornate metallic frame'\n"
                     "  'Weathered leather-bound journal, brass clasp, yellowed pages'"
+                )
+            elif entity_type == "group":
+                self.user_notes_edit.setPlaceholderText(
+                    "Examples:\n"
+                    "  'Elite imperial soldiers in polished silver armor with winged sun emblems'\n"
+                    "  'Ragged rebel fighters in mismatched gear, bandanas and improvised weapons'"
                 )
             else:
                 self.user_notes_edit.setPlaceholderText(
@@ -964,7 +1269,42 @@ class IdentityBlockManager(QWidget):
             self.is_primary_env_check.blockSignals(False)
         else:
             self.env_extras_group.setVisible(False)
-        
+
+        # Group controls (only for type group)
+        if metadata.get("type") == "group":
+            self.group_controls_group.setVisible(True)
+            self.group_member_count_spin.blockSignals(True)
+            self.group_member_count_spin.setValue(int(metadata.get("member_count", 3)))
+            self.group_member_count_spin.blockSignals(False)
+            self.group_visible_count_spin.blockSignals(True)
+            self.group_visible_count_spin.setValue(int(metadata.get("member_count_visible", 0)))
+            self.group_visible_count_spin.blockSignals(False)
+            self.group_formation_combo.blockSignals(True)
+            formation = metadata.get("formation", "scattered")
+            idx_f = self.group_formation_combo.findText(formation)
+            if idx_f >= 0:
+                self.group_formation_combo.setCurrentIndex(idx_f)
+            self.group_formation_combo.blockSignals(False)
+            self.group_individuality_combo.blockSignals(True)
+            individuality = metadata.get("individuality", "identical")
+            idx_i = self.group_individuality_combo.findText(individuality)
+            if idx_i >= 0:
+                self.group_individuality_combo.setCurrentIndex(idx_i)
+            self.group_individuality_combo.blockSignals(False)
+            self.group_uniform_edit.blockSignals(True)
+            self.group_uniform_edit.setText(metadata.get("uniform_description", "") or "")
+            self.group_uniform_edit.blockSignals(False)
+        else:
+            self.group_controls_group.setVisible(False)
+
+        # Alias controls (character/group entities)
+        etype = (metadata.get("type") or "").lower()
+        if etype in ("character", "group"):
+            self.alias_controls_group.setVisible(True)
+            self._populate_alias_combo(entity_id, metadata)
+        else:
+            self.alias_controls_group.setVisible(False)
+
         # Update button states
         self.update_button_states()
 
@@ -1044,6 +1384,118 @@ class IdentityBlockManager(QWidget):
             is_primary_environment=self.is_primary_env_check.isChecked()
         )
 
+    def _on_group_options_changed(self):
+        """Persist group settings to metadata."""
+        if not self.current_entity_id or not self.screenplay:
+            return
+        metadata = self.screenplay.get_identity_block_metadata_by_id(self.current_entity_id)
+        if not metadata or metadata.get("type") != "group":
+            return
+        self.screenplay.update_identity_block_metadata(
+            self.current_entity_id,
+            member_count=self.group_member_count_spin.value(),
+            member_count_visible=self.group_visible_count_spin.value(),
+            formation=self.group_formation_combo.currentText(),
+            individuality=self.group_individuality_combo.currentText(),
+            uniform_description=self.group_uniform_edit.text().strip(),
+        )
+
+    # ── Alias system UI methods ────────────────────────────────────
+
+    def _populate_alias_combo(self, entity_id: str, metadata: dict):
+        """Populate the alias combo box with eligible canonical entities."""
+        self.alias_combo.blockSignals(True)
+        self.alias_combo.clear()
+        self.alias_combo.addItem("(none — this is the canonical identity)", "")
+
+        current_alias_of = metadata.get("alias_of", "")
+        selected_idx = 0
+
+        if self.screenplay:
+            for eid, m in self.screenplay.identity_block_metadata.items():
+                if eid == entity_id:
+                    continue
+                etype = (m.get("type") or "").lower()
+                if etype not in ("character", "group"):
+                    continue
+                ename = m.get("name", eid)
+                self.alias_combo.addItem(f"{ename} ({eid[:8]}…)", eid)
+                if eid == current_alias_of:
+                    selected_idx = self.alias_combo.count() - 1
+
+        self.alias_combo.setCurrentIndex(selected_idx)
+        self.alias_combo.blockSignals(False)
+
+        # Update status label
+        if current_alias_of and self.screenplay:
+            canon_meta = self.screenplay.identity_block_metadata.get(current_alias_of, {})
+            canon_name = canon_meta.get("name", current_alias_of)
+            self.alias_status_label.setText(
+                f"✓ Linked as alias of {canon_name}"
+            )
+            self.alias_status_label.setStyleSheet("color: #2e7d32; font-weight: bold;")
+        else:
+            aliases = metadata.get("aliases") or []
+            if aliases and self.screenplay:
+                alias_names = []
+                for aid in aliases:
+                    am = self.screenplay.identity_block_metadata.get(aid, {})
+                    alias_names.append(am.get("name", aid))
+                self.alias_status_label.setText(
+                    f"Canonical identity — aliases: {', '.join(alias_names)}"
+                )
+                self.alias_status_label.setStyleSheet("color: #1565c0; font-weight: bold;")
+            else:
+                self.alias_status_label.setText("")
+                self.alias_status_label.setStyleSheet("")
+
+    def _on_alias_link(self):
+        """Link current entity as an alias of the selected canonical entity."""
+        if not self.current_entity_id or not self.screenplay:
+            return
+        canonical_id = self.alias_combo.currentData()
+        if not canonical_id:
+            QMessageBox.information(
+                self, "No Target",
+                "Select a canonical entity from the dropdown first."
+            )
+            return
+        canon_meta = self.screenplay.identity_block_metadata.get(canonical_id, {})
+        canon_name = canon_meta.get("name", canonical_id)
+        cur_meta = self.screenplay.identity_block_metadata.get(self.current_entity_id, {})
+        cur_name = cur_meta.get("name", self.current_entity_id)
+
+        ok = self.screenplay.link_entity_alias(self.current_entity_id, canonical_id)
+        if ok:
+            QMessageBox.information(
+                self, "Alias Linked",
+                f"'{cur_name}' is now an alias of '{canon_name}'.\n\n"
+                f"Both entities keep their own identity blocks (for disguise "
+                f"appearances), but the system knows they are the same person."
+            )
+            self._populate_alias_combo(
+                self.current_entity_id,
+                self.screenplay.identity_block_metadata.get(self.current_entity_id, {})
+            )
+        else:
+            QMessageBox.warning(self, "Error", "Failed to create alias link.")
+
+    def _on_alias_unlink(self):
+        """Remove the alias link from the current entity."""
+        if not self.current_entity_id or not self.screenplay:
+            return
+        ok = self.screenplay.unlink_entity_alias(self.current_entity_id)
+        if ok:
+            self._populate_alias_combo(
+                self.current_entity_id,
+                self.screenplay.identity_block_metadata.get(self.current_entity_id, {})
+            )
+        else:
+            QMessageBox.information(
+                self, "Not an Alias",
+                "This entity is not currently linked as an alias."
+            )
+
     def _fit_notes_to_content(self):
         """Resize user_notes_edit to fit its text content with a small margin."""
         doc = self.user_notes_edit.document()
@@ -1118,7 +1570,6 @@ class IdentityBlockManager(QWidget):
 
     def select_all_entities(self):
         """Select all entity items in the tree (skipping category headers)."""
-        self.entity_tree.setSelectionMode(QTreeWidget.SelectionMode.MultiSelection)
         self.entity_tree.clearSelection()
         for i in range(self.entity_tree.topLevelItemCount()):
             category_item = self.entity_tree.topLevelItem(i)
@@ -1127,7 +1578,6 @@ class IdentityBlockManager(QWidget):
                 child = category_item.child(j)
                 if not child.isHidden():
                     child.setSelected(True)
-        self.entity_tree.setSelectionMode(QTreeWidget.SelectionMode.SingleSelection)
     
     def generate_identity_block(self):
         """Generate identity block from user notes using AI."""
@@ -1192,7 +1642,58 @@ class IdentityBlockManager(QWidget):
             scene_context = self.ai_generator._extract_environment_only_context(
                 scene_context, entity_name
             )
-        
+
+        # For environments: extract spatial layout implications from the full generated
+        # scene content (character actions reveal architecture: freestanding furniture,
+        # exits, passages, hidden doors, structural ceiling, etc.)
+        if entity_type == "environment" and self.ai_generator:
+            full_scene_text = ""
+            _scene_id = metadata.get("scene_id", "")
+            if _scene_id:
+                _scene_obj = self.screenplay.get_scene(_scene_id)
+                if _scene_obj:
+                    _scene_meta = getattr(_scene_obj, "metadata", None) or {}
+                    full_scene_text = _scene_meta.get("generated_content", "") or ""
+            if not full_scene_text:
+                for _s in self.screenplay.get_all_scenes():
+                    if _s.description and metadata.get("name", "") in _s.description:
+                        _s_meta = getattr(_s, "metadata", None) or {}
+                        full_scene_text = _s_meta.get("generated_content", "") or ""
+                        if full_scene_text:
+                            break
+            if full_scene_text:
+                spatial_layout = self.ai_generator._extract_spatial_layout_from_actions(full_scene_text)
+                if spatial_layout:
+                    scene_context += (
+                        "\n\nSPATIAL LAYOUT (derived from character movement in the scene — "
+                        "must be reflected in the environment architecture and furniture arrangement):\n"
+                        + spatial_layout
+                    )
+
+        # For environments: append passive entity names and an exclusion list of
+        # non-passive entities so only passive items get baked into the description.
+        if entity_type == "environment" and self.screenplay:
+            passive_names = self.screenplay.get_passive_entity_names()
+            if passive_names:
+                scene_context += (
+                    "\n\nPASSIVE SET DRESSING (include in the environment description): "
+                    + ", ".join(passive_names)
+                )
+
+            non_passive = []
+            meta_all = getattr(self.screenplay, "identity_block_metadata", {}) or {}
+            for _eid, emeta in meta_all.items():
+                etype = (emeta.get("type") or "").lower()
+                if etype in ("character", "object", "vehicle") and emeta.get("status") != "passive":
+                    ename = (emeta.get("name") or "").strip()
+                    if ename:
+                        non_passive.append(ename)
+            if non_passive:
+                scene_context += (
+                    "\n\nDO NOT DESCRIBE THESE ENTITIES (they have their own identity blocks): "
+                    + ", ".join(non_passive)
+                )
+
         # Start generation thread
         self.generation_thread = IdentityBlockGenerationThread(
             self.ai_generator,
@@ -1358,13 +1859,17 @@ class IdentityBlockManager(QWidget):
                     if scene_id:
                         source_scene = self.screenplay.get_scene(scene_id)
                         scene_lighting = self.ai_generator._extract_lighting_from_scene(source_scene)
+                ss = getattr(self.screenplay, "story_settings", None) or {}
+                vs_key = ss.get("visual_style") or "photorealistic"
                 try:
                     ref_prompt = self.ai_generator.generate_reference_image_prompt(
                         entity_name=entity_name,
                         entity_type=entity_type,
                         identity_block=metadata.get("identity_block", ""),
                         metadata=metadata,
-                        scene_lighting=scene_lighting
+                        scene_lighting=scene_lighting,
+                        visual_style=vs_key,
+                        content_rating=ss.get("content_rating", ""),
                     )
                     if ref_prompt and ref_prompt.strip():
                         self.screenplay.update_identity_block_metadata(
@@ -1393,6 +1898,234 @@ class IdentityBlockManager(QWidget):
         # Unblock signals LAST
         self.entity_tree.blockSignals(False)
     
+    def _mark_passive_entity(self):
+        """Mark selected object/vehicle entities as passive (name-only, no identity block needed)."""
+        selected = [
+            item for item in self.entity_tree.selectedItems()
+            if item.data(0, Qt.ItemDataRole.UserRole)
+        ]
+        if not selected or not self.screenplay:
+            return
+        count = 0
+        for item in selected:
+            entity_id = item.data(0, Qt.ItemDataRole.UserRole)
+            meta = self.screenplay.get_identity_block_metadata_by_id(entity_id) or {}
+            if (meta.get("type") or "").lower() in ("object", "vehicle") and meta.get("status") != "passive":
+                self.screenplay.update_identity_block_metadata(
+                    entity_id, status="passive", identity_block=""
+                )
+                count += 1
+        if count:
+            self.identity_blocks_changed.emit()
+            self.refresh_entity_list()
+            label = "entity" if count == 1 else "entities"
+            self._show_status(f"{count} {label} marked as passive (name only)")
+
+    def _unmark_passive_entity(self):
+        """Remove the passive label from selected entities, resetting to placeholder status."""
+        selected = [
+            item for item in self.entity_tree.selectedItems()
+            if item.data(0, Qt.ItemDataRole.UserRole)
+        ]
+        if not selected or not self.screenplay:
+            return
+        count = 0
+        for item in selected:
+            entity_id = item.data(0, Qt.ItemDataRole.UserRole)
+            meta = self.screenplay.get_identity_block_metadata_by_id(entity_id) or {}
+            if (meta.get("type") or "").lower() in ("object", "vehicle") and meta.get("status") == "passive":
+                self.screenplay.update_identity_block_metadata(
+                    entity_id, status="placeholder"
+                )
+                count += 1
+        if count:
+            self.identity_blocks_changed.emit()
+            self.refresh_entity_list()
+            label = "entity" if count == 1 else "entities"
+            self._show_status(f"Passive label removed from {count} {label}")
+
+    def _approve_selected_identity_blocks(self):
+        """Approve identity blocks for all selected entities that have a generated block."""
+        if not self.screenplay:
+            return
+        selected = [
+            item for item in self.entity_tree.selectedItems()
+            if item.data(0, Qt.ItemDataRole.UserRole)
+        ]
+        if not selected:
+            return
+        count = 0
+        for item in selected:
+            eid = item.data(0, Qt.ItemDataRole.UserRole)
+            meta = self.screenplay.get_identity_block_metadata_by_id(eid) or {}
+            if meta.get("identity_block") and meta.get("status") != "approved":
+                entity_type = (meta.get("type") or "").lower()
+                if entity_type == "character":
+                    self.screenplay.update_identity_block_metadata(eid, status="approved")
+                else:
+                    self.screenplay.update_identity_block_metadata(
+                        eid, status="approved",
+                        user_notes=meta.get("user_notes", ""),
+                        identity_block=meta.get("identity_block", "")
+                    )
+                count += 1
+        if count:
+            self.identity_blocks_changed.emit()
+            self.refresh_entity_list()
+            label = "block" if count == 1 else "blocks"
+            self._show_status(f"{count} identity {label} approved")
+        else:
+            self._show_status("No unapproved blocks found in selection")
+
+    def _generate_selected_identity_blocks(self):
+        """Generate identity blocks for all selected object/vehicle entities."""
+        if not self.screenplay or not self.ai_generator:
+            return
+        selected = [
+            item for item in self.entity_tree.selectedItems()
+            if item.data(0, Qt.ItemDataRole.UserRole)
+        ]
+        if not selected:
+            return
+
+        items_to_generate = []
+        for item in selected:
+            eid = item.data(0, Qt.ItemDataRole.UserRole)
+            meta = self.screenplay.get_identity_block_metadata_by_id(eid) or {}
+            entity_type = (meta.get("type") or "").lower()
+            if entity_type not in ("object", "vehicle"):
+                continue
+            user_notes = (meta.get("user_notes") or "").strip()
+            if not user_notes:
+                continue
+            entity_name = meta.get("name", "")
+            scene_context = ""
+            scene_id = meta.get("scene_id", "")
+            if scene_id:
+                scene = self.screenplay.get_scene(scene_id)
+                if scene and scene.description:
+                    scene_context = scene.description
+            if not scene_context:
+                for scene in self.screenplay.get_all_scenes():
+                    if scene.description and entity_name in scene.description:
+                        scene_context = scene.description
+                        break
+            items_to_generate.append((eid, entity_name, entity_type, user_notes, scene_context))
+
+        if not items_to_generate:
+            self._show_status("No eligible items to generate (need user notes)")
+            return
+
+        progress = QProgressDialog(
+            f"Generating identity blocks (0/{len(items_to_generate)})...",
+            "Cancel", 0, len(items_to_generate), self
+        )
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.setWindowTitle("Batch Generate Identity Blocks")
+        progress.setMinimumDuration(0)
+        progress.show()
+        QApplication.processEvents()
+
+        generated = 0
+        for i, (eid, name, etype, notes, ctx) in enumerate(items_to_generate):
+            if progress.wasCanceled():
+                break
+            progress.setLabelText(f"Generating identity block for {name}... ({i+1}/{len(items_to_generate)})")
+            progress.setValue(i)
+            QApplication.processEvents()
+            try:
+                block = self.ai_generator.generate_identity_block_from_notes(
+                    name, etype, notes, ctx, self.screenplay
+                )
+                self.screenplay.update_identity_block_metadata(
+                    eid, status="placeholder", identity_block=block, user_notes=notes
+                )
+                generated += 1
+            except Exception as e:
+                _safe_print(f"WARNING: Failed to generate identity block for {name}: {e}")
+
+        progress.setValue(len(items_to_generate))
+        progress.close()
+
+        if generated:
+            self.identity_blocks_changed.emit()
+            self.refresh_entity_list()
+            label = "block" if generated == 1 else "blocks"
+            self._show_status(f"{generated} identity {label} generated — review and approve")
+
+    def _generate_selected_reference_prompts(self):
+        """Generate reference image prompts for all selected approved entities."""
+        if not self.screenplay or not self.ai_generator:
+            return
+        selected = [
+            item for item in self.entity_tree.selectedItems()
+            if item.data(0, Qt.ItemDataRole.UserRole)
+        ]
+        if not selected:
+            return
+
+        items_to_generate = []
+        for item in selected:
+            eid = item.data(0, Qt.ItemDataRole.UserRole)
+            meta = self.screenplay.get_identity_block_metadata_by_id(eid) or {}
+            if meta.get("status") != "approved" or not meta.get("identity_block"):
+                continue
+            entity_name = meta.get("name", "Unknown")
+            entity_type = meta.get("type", "object")
+            scene_lighting = ""
+            if entity_type == "environment":
+                scene_id = meta.get("scene_id", "")
+                if scene_id:
+                    source_scene = self.screenplay.get_scene(scene_id)
+                    scene_lighting = self.ai_generator._extract_lighting_from_scene(source_scene)
+            items_to_generate.append((eid, entity_name, entity_type, meta, scene_lighting))
+
+        if not items_to_generate:
+            self._show_status("No approved entities in selection")
+            return
+
+        ss = getattr(self.screenplay, "story_settings", None) or {}
+        vs_key = ss.get("visual_style") or "photorealistic"
+        content_rating = ss.get("content_rating", "")
+
+        progress = QProgressDialog(
+            f"Generating reference prompts (0/{len(items_to_generate)})...",
+            "Cancel", 0, len(items_to_generate), self
+        )
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.setWindowTitle("Batch Generate Reference Prompts")
+        progress.setMinimumDuration(0)
+        progress.show()
+        QApplication.processEvents()
+
+        generated = 0
+        for i, (eid, name, etype, meta, lighting) in enumerate(items_to_generate):
+            if progress.wasCanceled():
+                break
+            progress.setLabelText(f"Generating reference prompt for {name}... ({i+1}/{len(items_to_generate)})")
+            progress.setValue(i)
+            QApplication.processEvents()
+            try:
+                ref_prompt = self.ai_generator.generate_reference_image_prompt(
+                    entity_name=name, entity_type=etype,
+                    identity_block=meta.get("identity_block", ""),
+                    metadata=meta, scene_lighting=lighting,
+                    visual_style=vs_key, content_rating=content_rating,
+                )
+                self.screenplay.update_identity_block_metadata(eid, reference_image_prompt=ref_prompt)
+                generated += 1
+            except Exception as e:
+                _safe_print(f"WARNING: Failed to generate reference prompt for {name}: {e}")
+
+        progress.setValue(len(items_to_generate))
+        progress.close()
+
+        if generated:
+            self.identity_blocks_changed.emit()
+            self.refresh_entity_list()
+            label = "prompt" if generated == 1 else "prompts"
+            self._show_status(f"{generated} reference {label} generated")
+
     def delete_entity(self):
         """Delete the current entity."""
         if not self.current_entity_id or not self.screenplay:
@@ -1468,13 +2201,16 @@ class IdentityBlockManager(QWidget):
                 source_scene = self.screenplay.get_scene(scene_id)
                 scene_lighting = self.ai_generator._extract_lighting_from_scene(source_scene)
         
-        # Generate the reference image prompt (pass metadata for environment MODE A/B)
+        ss = getattr(self.screenplay, "story_settings", None) or {}
+        vs_key = ss.get("visual_style") or "photorealistic"
         ref_prompt = self.ai_generator.generate_reference_image_prompt(
             entity_name=entity_name,
             entity_type=entity_type,
             identity_block=identity_block,
             metadata=metadata,
-            scene_lighting=scene_lighting
+            scene_lighting=scene_lighting,
+            visual_style=vs_key,
+            content_rating=ss.get("content_rating", ""),
         )
         
         # Block tree selection signals to prevent interference
@@ -1526,3 +2262,89 @@ class IdentityBlockManager(QWidget):
         )
         self.identity_blocks_changed.emit()
         self._show_status("Reference image prompt saved")
+
+    def batch_regenerate_reference_prompts(self, visual_style: str = "") -> dict:
+        """Regenerate all existing reference image prompts using the given visual style.
+
+        Only entities that already have an approved identity block AND an existing
+        reference image prompt are regenerated.  Wardrobe variant reference prompts
+        on the screenplay are also regenerated.
+
+        Args:
+            visual_style: The style key from story settings (e.g. "comic_book").
+
+        Returns:
+            {"identity_count": int, "wardrobe_count": int, "errors": list[str]}
+        """
+        result = {"identity_count": 0, "wardrobe_count": 0, "errors": []}
+        if not self.screenplay or not self.ai_generator:
+            return result
+
+        vs_key = visual_style or "photorealistic"
+        _batch_ss = getattr(self.screenplay, "story_settings", None) or {}
+        _batch_cr = _batch_ss.get("content_rating", "")
+
+        for entity_id, meta in self.screenplay.identity_block_metadata.items():
+            if meta.get("status") != "approved":
+                continue
+            ib_text = meta.get("identity_block", "").strip()
+            old_rip = meta.get("reference_image_prompt", "").strip()
+            if not ib_text or not old_rip:
+                continue
+
+            entity_name = meta.get("name", "Unknown")
+            entity_type = meta.get("type", "object")
+            scene_lighting = ""
+            if entity_type == "environment":
+                scene_id = meta.get("scene_id", "")
+                if scene_id:
+                    source_scene = self.screenplay.get_scene(scene_id)
+                    if source_scene:
+                        scene_lighting = self.ai_generator._extract_lighting_from_scene(source_scene)
+            try:
+                new_rip = self.ai_generator.generate_reference_image_prompt(
+                    entity_name=entity_name,
+                    entity_type=entity_type,
+                    identity_block=ib_text,
+                    metadata=meta,
+                    scene_lighting=scene_lighting,
+                    visual_style=vs_key,
+                    content_rating=_batch_cr,
+                )
+                if new_rip and new_rip.strip():
+                    self.screenplay.update_identity_block_metadata(
+                        entity_id, reference_image_prompt=new_rip.strip()
+                    )
+                    result["identity_count"] += 1
+            except Exception as exc:
+                result["errors"].append(f"{entity_name}: {exc}")
+
+        wv = getattr(self.screenplay, "character_wardrobe_variants", {})
+        for entity_id, variants in wv.items():
+            ib_meta = self.screenplay.get_identity_block_metadata_by_id(entity_id)
+            entity_name = ib_meta.get("name", "Unknown") if ib_meta else "Unknown"
+            for v in variants:
+                ib_text = v.get("identity_block", "").strip()
+                old_rip = v.get("reference_image_prompt", "").strip()
+                if not ib_text or not old_rip:
+                    continue
+                try:
+                    new_rip = self.ai_generator.generate_reference_image_prompt(
+                        entity_name=entity_name,
+                        entity_type="character",
+                        identity_block=ib_text,
+                        visual_style=vs_key,
+                        content_rating=_batch_cr,
+                    )
+                    if new_rip and new_rip.strip():
+                        v["reference_image_prompt"] = new_rip.strip()
+                        result["wardrobe_count"] += 1
+                except Exception as exc:
+                    label = v.get("label", v.get("variant_id", "?"))
+                    result["errors"].append(f"{entity_name} wardrobe '{label}': {exc}")
+
+        if result["identity_count"] > 0 or result["wardrobe_count"] > 0:
+            self.identity_blocks_changed.emit()
+            self.refresh_entity_list()
+
+        return result

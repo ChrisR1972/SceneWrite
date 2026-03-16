@@ -1,5 +1,5 @@
 """
-Advertisement Framework for MoviePrompterAI.
+Advertisement Framework for SceneWrite.
 
 Structured cinematic commercial mode for micro advertisement production.
 Enforces a 6-beat template, escalation logic, hero shot requirements,

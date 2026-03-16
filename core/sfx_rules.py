@@ -1,5 +1,5 @@
 """
-SFX Rules for MoviePrompterAI / screenplay sound effects.
+SFX Rules for SceneWrite / screenplay sound effects.
 Enforces strict SFX Whitelist for (parenthetical) sound markup.
 
 CINEMATIC GRAMMAR SYSTEM:
@@ -546,7 +546,7 @@ def enforce_sfx_grammar(text: str) -> Tuple[str, List[str]]:
 def get_sfx_rules_prompt_text() -> str:
     """Return the SFX Rules block for inclusion in AI prompts."""
     return """
-SFX RULES (MANDATORY — MoviePrompterAI):
+SFX RULES (MANDATORY — SceneWrite):
 - ALL audible events MUST use (lowercase_underscore_format) markup.
 - Use ONLY approved SFX from the whitelist. 
 - NEVER use: character names, locations, dialogue, narrative phrases, emotions (silence, tension, drama, fear, anticipation, relief, music, score, mood, emotion).

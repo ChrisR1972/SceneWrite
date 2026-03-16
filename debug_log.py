@@ -4,10 +4,28 @@ No dependencies, always works.
 """
 
 import os
+import sys
 import traceback
 from datetime import datetime
 
-DEBUG_LOG_FILE = os.path.join(os.getcwd(), 'debug_crash.log')
+
+def _get_log_directory() -> str:
+    """Return a user-writable directory for log files."""
+    try:
+        if sys.platform == "win32":
+            base = os.environ.get("APPDATA", os.path.expanduser("~"))
+        elif sys.platform == "darwin":
+            base = os.path.join(os.path.expanduser("~"), "Library", "Application Support")
+        else:
+            base = os.environ.get("XDG_CONFIG_HOME", os.path.join(os.path.expanduser("~"), ".config"))
+        log_dir = os.path.join(base, "SceneWrite")
+        os.makedirs(log_dir, exist_ok=True)
+        return log_dir
+    except Exception:
+        return os.getcwd()
+
+
+DEBUG_LOG_FILE = os.path.join(_get_log_directory(), 'debug_crash.log')
 
 def debug_log(message):
     """Write a debug message to the log file."""

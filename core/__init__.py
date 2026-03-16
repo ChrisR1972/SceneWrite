@@ -1,2 +1,2 @@
-"""Core modules for MoviePrompterAI."""
+"""Core modules for SceneWrite."""
 

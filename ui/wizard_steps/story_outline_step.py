@@ -17,10 +17,11 @@ from core.workflow_profile import WorkflowProfileManager, WorkflowProfile
 
 
 def _safe_print(*args, **kwargs):
-    """Print that catches OSError [Errno 22] on Windows when stdout can't handle Unicode."""
+    """Route output through debug_log instead of stdout (hidden in production)."""
     try:
-        print(*args, **kwargs)
-    except OSError:
+        from debug_log import debug_log as _dl
+        _dl(" ".join(str(a) for a in args))
+    except Exception:
         pass
 
 
@@ -1433,14 +1434,13 @@ IMPORTANT: This character appears in the above story content. Please create a de
                     existing_char_map[display_name.lower()] = new_char
                     existing_char_names.add(display_name.lower())
         
-        # Trim to the target maximum (spinbox is an upper bound, not exact count)
         target_character_count = getattr(self, 'character_count', 4)
         if len(existing_characters) > target_character_count:
             existing_characters = existing_characters[:target_character_count]
         current_character_count = len(existing_characters)
-        additional_needed = 0  # No longer pad to exact count — AI generates as many as needed
+        additional_needed = max(0, target_character_count - current_character_count)
         
-        _safe_print(f"After processing, have {current_character_count} characters (max {target_character_count})")
+        _safe_print(f"After processing, have {current_character_count} characters (target {target_character_count}, generating {additional_needed} more)")
         
         # Get names of existing characters to avoid duplicates
         existing_names = {char.get("name", "").lower() for char in existing_characters}
@@ -1633,7 +1633,7 @@ TASK: Create a new character that fits naturally into this story. The character 
             self.generate_character_details_button.setEnabled(False)
             self.generate_character_details_button.setText("Generating...")
         
-        print("Manual character generation requested...")
+        _safe_print("Manual character generation requested...")
         
         # Show progress dialog for character generation
         char_progress = QProgressDialog(
@@ -1888,7 +1888,7 @@ TASK: Create a new character that fits naturally into this story. The character 
                 self.save_current_character()
             except Exception as e:
                 # Log error but don't crash
-                print(f"Error saving character: {e}")
+                _safe_print(f"Error saving character: {e}")
         
         # Load new character data
         try:
@@ -1925,7 +1925,7 @@ TASK: Create a new character that fits naturally into this story. The character 
                 self.char_physical_edit.clear()
         except Exception as e:
             # Prevent crash on error
-            print(f"Error loading character: {e}")
+            _safe_print(f"Error loading character: {e}")
             self.char_name_edit.clear()
             self.char_outline_edit.clear()
             self.char_growth_edit.clear()
@@ -1963,7 +1963,7 @@ TASK: Create a new character that fits naturally into this story. The character 
                     name = characters[self.current_character_index]["name"] or "Unnamed Character"
                     item.setText(name)
         except Exception as e:
-            print(f"Error saving character: {e}")
+            _safe_print(f"Error saving character: {e}")
     
     def on_character_data_changed(self):
         """Handle character data changes."""
@@ -2074,7 +2074,7 @@ TASK: Create a new character that fits naturally into this story. The character 
                 self.outline_data["locations"] = self.ai_generator._extract_locations_from_text(combined, max_locations=50)
                 passed, issues = self.ai_generator._validate_entity_markup(combined)
                 if not passed and issues:
-                    print("Wizard entity markup validation:", "; ".join(issues))
+                    _safe_print("Wizard entity markup validation:", "; ".join(issues))
             return self.outline_data
 
     def has_characters_missing_physical_appearance(self) -> bool:

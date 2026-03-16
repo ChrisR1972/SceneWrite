@@ -1,0 +1,91 @@
+<!--
+  Stripe Checkout integration for scenewrite.app
+  
+  SETUP:
+  1. Replace STRIPE_PUBLISHABLE_KEY with your pk_live_... key
+  2. Create a Stripe Checkout session on your server or use Stripe Payment Links
+  3. Add this snippet to your scenewrite.app pricing section
+  
+  OPTION A: Stripe Payment Links (simplest — no backend needed)
+  ─────────────────────────────────────────────────────────────
+  1. Go to Stripe Dashboard > Payment Links
+  2. Create a link for your product
+  3. Replace the button href below with your Payment Link URL
+  
+  OPTION B: Stripe Checkout via Cloudflare Worker
+  ─────────────────────────────────────────────────
+  Add a /api/create-checkout endpoint to your worker (see below)
+  and use the JavaScript integration.
+-->
+
+<!-- ═══════════ OPTION A: Payment Link (paste your URL) ═══════════ -->
+
+<a href="https://buy.stripe.com/YOUR_PAYMENT_LINK_ID"
+   style="display:inline-block; background:#0078d4; color:#fff; 
+          padding:14px 36px; border-radius:8px; font-size:16px; 
+          font-weight:600; text-decoration:none; transition:background 0.2s;"
+   onmouseover="this.style.background='#1a8ae8'"
+   onmouseout="this.style.background='#0078d4'">
+  Buy SceneWrite — $XX
+</a>
+
+
+<!-- ═══════════ OPTION B: Stripe Checkout via JS (advanced) ═══════════ -->
+
+<!--
+<script src="https://js.stripe.com/v3/"></script>
+<script>
+  const stripe = Stripe('pk_live_YOUR_PUBLISHABLE_KEY');
+  
+  document.getElementById('checkout-btn').addEventListener('click', async () => {
+    const response = await fetch('https://api.scenewrite.app/api/create-checkout', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    const { sessionId } = await response.json();
+    await stripe.redirectToCheckout({ sessionId });
+  });
+</script>
+
+<button id="checkout-btn"
+  style="background:#0078d4; color:#fff; padding:14px 36px; border:none;
+         border-radius:8px; font-size:16px; font-weight:600; cursor:pointer;">
+  Buy SceneWrite — $XX
+</button>
+-->
+
+
+<!--
+  ═══════════ Worker endpoint for Option B ═══════════
+  
+  Add this to server/src/worker.js if you want server-side checkout:
+  
+  // At the top of the fetch handler, add:
+  if (request.method === "POST" && path === "/api/create-checkout") {
+    return await handleCreateCheckout(request, env);
+  }
+  
+  // Then add this function:
+  async function handleCreateCheckout(request, env) {
+    const response = await fetch("https://api.stripe.com/v1/checkout/sessions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${env.STRIPE_SECRET_KEY}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({
+        "mode": "payment",
+        "line_items[0][price]": env.STRIPE_PRICE_ID,  // price_xxx from Stripe
+        "line_items[0][quantity]": "1",
+        "success_url": "https://scenewrite.app/success?session_id={CHECKOUT_SESSION_ID}",
+        "cancel_url": "https://scenewrite.app/#pricing",
+      }),
+    });
+    const session = await response.json();
+    return jsonResponse({ sessionId: session.id });
+  }
+  
+  // Add these secrets via wrangler:
+  //   wrangler secret put STRIPE_SECRET_KEY
+  //   wrangler secret put STRIPE_PRICE_ID
+-->

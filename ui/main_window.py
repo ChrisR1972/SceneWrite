@@ -1,5 +1,5 @@
 """
-Main application window for MoviePrompterAI.
+Main application window for SceneWrite.
 """
 
 from PyQt6.QtWidgets import (
@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
     QFileDialog, QInputDialog, QProgressDialog, QDialog,
     QLineEdit, QTextEdit, QFormLayout, QDialogButtonBox,
     QDockWidget, QToolButton, QMenu, QCheckBox, QComboBox, QGroupBox, QSpinBox,
-    QApplication
+    QApplication, QLabel
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread
 from PyQt6.QtGui import QAction, QIcon, QFont
@@ -33,19 +33,32 @@ from .story_creation_wizard import StoryCreationWizard
 from .ai_chat_panel import AIChatPanel
 from .higgsfield_panel import HiggsfieldPanel
 from .help_dialogs import InstructionsDialog, AboutDialog, LicenseDialog
+from .update_dialog import UpdateCheckThread, UpdateAvailableDialog
+from .activation_dialog import ActivationDialog, TrialExpiredDialog
+from core.license_manager import (
+    LicenseStatus, LicenseState, check_license, get_machine_id,
+)
 from config import config, get_app_directory, get_stories_directory
+
+def _safe_print(*args, **kwargs):
+    """Route output through debug_log instead of stdout (hidden in production)."""
+    try:
+        from debug_log import debug_log as _dl
+        _dl(" ".join(str(a) for a in args))
+    except Exception:
+        pass
 
 # Logger functions - temporarily disabled to prevent crashes
 def log_exception(msg, exc):
     try:
         import traceback
-        print(f"ERROR: {msg}: {exc}")
+        _safe_print(f"ERROR: {msg}: {exc}")
         traceback.print_exc()
     except:
         pass
 def log_error(msg):
     try:
-        print(f"ERROR: {msg}")
+        _safe_print(f"ERROR: {msg}")
     except:
         pass
 def log_info(msg):
@@ -313,6 +326,28 @@ class NovelImportThread(QThread):
             self.error.emit(str(e))
 
 
+class _ToastOverlay(QLabel):
+    """Lightweight overlay for status notifications that auto-hides."""
+
+    def __init__(self, text: str, parent: QMainWindow, duration_ms: int = 4000):
+        super().__init__(text, parent)
+        self.setStyleSheet(
+            "background-color: rgba(40, 120, 60, 220); color: #ffffff; "
+            "padding: 10px 24px; border-radius: 6px; font-size: 13px; font-weight: bold;"
+        )
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.adjustSize()
+        pw = parent.width()
+        self.move((pw - self.width()) // 2, 30)
+        self.raise_()
+        self.show()
+        QTimer.singleShot(duration_ms, self._dismiss)
+
+    def _dismiss(self):
+        self.hide()
+        self.deleteLater()
+
+
 class MainWindow(QMainWindow):
     """Main application window."""
     
@@ -337,10 +372,12 @@ class MainWindow(QMainWindow):
             self.current_filename: Optional[str] = None
             self._has_unsaved_changes: bool = False
             self.ai_generator: Optional[AIGenerator] = None
+            self._pending_story_settings: Optional[dict] = None
             debug_log("Creating HiggsfieldExporter...")
             self.exporter = HiggsfieldExporter()
             debug_log("HiggsfieldExporter created")
             self.generation_thread: Optional[StoryboardGenerationThread] = None
+            self._license_state: Optional[LicenseState] = None
             
             # UI components
             self.framework_view: Optional[StoryFrameworkView] = None
@@ -366,6 +403,10 @@ class MainWindow(QMainWindow):
             debug_log("Setting up auto-save...")
             self.setup_auto_save()
             debug_log("Auto-save setup complete")
+
+            debug_log("Scheduling background update check...")
+            QTimer.singleShot(3000, self.start_update_check)
+
             debug_log("MainWindow.__init__ completed successfully")
         except Exception as e:
             try:
@@ -384,7 +425,7 @@ class MainWindow(QMainWindow):
         
         try:
             debug_log("Setting window title...")
-            self.setWindowTitle("MoviePrompterAI")
+            self.setWindowTitle("SceneWrite")
             
             # Get screen size and set reasonable window size
             from PyQt6.QtWidgets import QApplication
@@ -472,7 +513,7 @@ class MainWindow(QMainWindow):
                 pass
             import traceback
             error_msg = f"Error initializing UI: {str(e)}\n\n{traceback.format_exc()}"
-            print(error_msg)
+            _safe_print(error_msg)
             QMessageBox.critical(None, "Initialization Error", error_msg)
             raise
     
@@ -561,6 +602,12 @@ class MainWindow(QMainWindow):
         export_prompts_action = QAction("Export Prompts Only...", self)
         export_prompts_action.triggered.connect(lambda: self.export_screenplay("prompts"))
         export_menu.addAction(export_prompts_action)
+
+        export_menu.addSeparator()
+
+        export_platform_action = QAction("Export Prompts for Platform...", self)
+        export_platform_action.triggered.connect(self.export_for_platform)
+        export_menu.addAction(export_platform_action)
         
         file_menu.addSeparator()
         
@@ -569,6 +616,41 @@ class MainWindow(QMainWindow):
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
         
+        # Series menu (Episodic Series System)
+        series_menu = menubar.addMenu("Series")
+
+        new_series_action = QAction("New Series...", self)
+        new_series_action.triggered.connect(self.new_series)
+        series_menu.addAction(new_series_action)
+
+        new_episode_action = QAction("New Episode...", self)
+        new_episode_action.triggered.connect(self.new_episode)
+        series_menu.addAction(new_episode_action)
+
+        series_menu.addSeparator()
+
+        open_series_action = QAction("Open Series Dashboard...", self)
+        open_series_action.triggered.connect(self.open_series_dashboard)
+        series_menu.addAction(open_series_action)
+
+        edit_bible_action = QAction("Edit Series Bible...", self)
+        edit_bible_action.triggered.connect(self.edit_series_bible)
+        series_menu.addAction(edit_bible_action)
+
+        series_menu.addSeparator()
+
+        convert_action = QAction("Convert Current Story to Series...", self)
+        convert_action.triggered.connect(self.convert_to_series)
+        series_menu.addAction(convert_action)
+
+        series_menu.addSeparator()
+
+        finalize_action = QAction("Finalize Episode...", self)
+        finalize_action.triggered.connect(self.finalize_episode)
+        series_menu.addAction(finalize_action)
+
+        self.series_menu = series_menu
+
         # Settings menu
         settings_menu = menubar.addMenu("Settings")
         
@@ -600,6 +682,18 @@ class MainWindow(QMainWindow):
         license_action = QAction("License", self)
         license_action.triggered.connect(self.show_license)
         help_menu.addAction(license_action)
+
+        help_menu.addSeparator()
+
+        enter_key_action = QAction("Enter License Key...", self)
+        enter_key_action.triggered.connect(self.show_activation_dialog)
+        help_menu.addAction(enter_key_action)
+
+        help_menu.addSeparator()
+
+        update_action = QAction("Check for Updates...", self)
+        update_action.triggered.connect(self.check_for_updates_manual)
+        help_menu.addAction(update_action)
     
     def create_toolbar(self):
         """Create the toolbar."""
@@ -691,7 +785,7 @@ class MainWindow(QMainWindow):
                 self.framework_view.hide()
 
             self.update_status_bar()
-            self.setWindowTitle(f"MoviePrompterAI - {os.path.basename(filepath)}")
+            self.setWindowTitle(f"SceneWrite - {os.path.basename(filepath)}")
 
             if self.chat_panel:
                 self.chat_panel.set_screenplay(screenplay)
@@ -865,6 +959,8 @@ class MainWindow(QMainWindow):
     
     def new_screenplay(self):
         """Create a new screenplay using the wizard."""
+        if not self.require_license("AI Story Generation"):
+            return
         if self.current_screenplay:
             reply = QMessageBox.question(
                 self, "New Story (AI Generated)",
@@ -881,6 +977,8 @@ class MainWindow(QMainWindow):
     
     def quick_micro_story(self):
         """Create a quick micro story (1 act, 1-5 scenes) in a single step."""
+        if not self.require_license("AI Story Generation"):
+            return
         if self.current_screenplay:
             reply = QMessageBox.question(
                 self, "Quick Micro Story",
@@ -1012,7 +1110,7 @@ class MainWindow(QMainWindow):
             self.current_screenplay = screenplay
             self.current_filename = None
             self._mark_unsaved()
-            self.setWindowTitle(f"MoviePrompterAI - {screenplay.title or 'Untitled Micro Story'}")
+            self.setWindowTitle(f"SceneWrite - {screenplay.title or 'Untitled Micro Story'}")
             
             # Update views
             if self.framework_view:
@@ -1120,6 +1218,19 @@ class MainWindow(QMainWindow):
     
     def on_wizard_completed(self, screenplay: Screenplay):
         """Handle wizard completion."""
+        if self._pending_story_settings:
+            pending = self._pending_story_settings
+            ss = getattr(screenplay, "story_settings", None) or {}
+            pending_audio = pending.pop("audio_settings", None)
+            pending_pc = pending.pop("platform_config", None)
+            ss.update(pending)
+            if pending_audio:
+                ss.setdefault("audio_settings", {}).update(pending_audio)
+            if pending_pc:
+                ss.setdefault("platform_config", {}).update(pending_pc)
+            screenplay.story_settings = ss
+            self._pending_story_settings = None
+
         self.current_screenplay = screenplay
         self.current_filename = None
         self._mark_unsaved()
@@ -1143,8 +1254,7 @@ class MainWindow(QMainWindow):
             self.hf_panel.set_screenplay(screenplay)
         
         self.update_status_bar()
-        title = screenplay.title or "Untitled Story"
-        self.setWindowTitle(f"MoviePrompterAI - {title}")
+        self._update_window_title(screenplay)
     
     def create_chat_panel(self):
         """Create and setup the AI chat panel as a dock widget."""
@@ -1342,7 +1452,7 @@ class MainWindow(QMainWindow):
                 if self.framework_view:
                     self.framework_view.load_scene_data(scene)
                     self.framework_view.update_tree()
-                self.status_bar.showMessage("Scene content updated", 3000)
+                self._show_toast("Scene content updated")
             
             elif change_type == "regenerate_items" and self.chat_panel.selected_items and self.chat_panel.current_scene:
                 # Regenerate storyboard items
@@ -1362,160 +1472,77 @@ class MainWindow(QMainWindow):
                         self.framework_view.load_storyboard_items()
             
             elif change_type == "edit_character_outline" and self.current_screenplay:
-                # Edit character outline in story_outline
-                print(f"DEBUG on_chat_changes_applied: Received edit_character_outline signal")
-                print(f"DEBUG on_chat_changes_applied: change_data type: {type(change_data)}, keys: {list(change_data.keys()) if isinstance(change_data, dict) else 'not a dict'}")
-                
                 character_name = change_data.get("character_name", "")
                 new_outline = change_data.get("character_outline", "")
                 new_growth_arc = change_data.get("character_growth_arc", "")
-                
-                # Debug logging
-                print(f"DEBUG: edit_character_outline - character_name: {character_name}, has_outline: {bool(new_outline)}, has_growth: {bool(new_growth_arc)}")
-                print(f"DEBUG: change_data keys: {list(change_data.keys())}")
-                print(f"DEBUG: new_outline length: {len(new_outline) if new_outline else 0}, new_growth_arc length: {len(new_growth_arc) if new_growth_arc else 0}")
-                if new_outline:
-                    print(f"DEBUG: new_outline preview: {new_outline[:100]}...")
-                if new_growth_arc:
-                    print(f"DEBUG: new_growth_arc preview: {new_growth_arc[:100]}...")
-                
+
                 if not character_name:
                     QMessageBox.warning(self, "Error", "No character name provided in the change data.")
                     return
-                
                 if not new_outline and not new_growth_arc:
                     QMessageBox.warning(self, "Error", f"No character outline or growth arc provided for {character_name}.")
                     return
-                
-                # Update character in story_outline
+
                 if not self.current_screenplay.story_outline:
                     self.current_screenplay.story_outline = {}
-                
                 if "characters" not in self.current_screenplay.story_outline:
                     self.current_screenplay.story_outline["characters"] = []
-                
+
                 characters = self.current_screenplay.story_outline["characters"]
                 character_found = False
-                
-                # Normalize character name for matching (case-insensitive, strip whitespace)
                 character_name_normalized = character_name.strip()
-                
+
                 for char in characters:
                     if not isinstance(char, dict):
                         continue
-                    
                     char_name = char.get("name", "").strip()
-                    # Case-insensitive matching
                     if char_name.lower() == character_name_normalized.lower():
-                        # Update existing character
                         old_outline = char.get("outline", "")
                         old_growth = char.get("growth_arc", "")
-                        
-                        print(f"DEBUG: Found character {char_name}, updating outline...")
-                        print(f"DEBUG: Old outline length: {len(old_outline)}, New outline length: {len(new_outline)}")
-                        
+
                         if new_outline:
-                            # If we have an old outline and the new one is shorter, check if it contains the old text
                             if old_outline and len(new_outline) < len(old_outline):
-                                # New outline is shorter - check if it contains old text
                                 if old_outline.lower() not in new_outline.lower():
-                                    # Old text not found - merge them to ensure we extend, not replace
-                                    # Prepend old outline to new one if new doesn't contain it
                                     char["outline"] = f"{old_outline} {new_outline}"
-                                    print(f"DEBUG: Merged outlines (old not found in new)")
                                 else:
-                                    # Old text is in new - use new as is (might be rephrased but contains content)
                                     char["outline"] = new_outline
-                                    print(f"DEBUG: Using new outline (contains old text)")
                             else:
-                                # New is longer or no old outline - use new
                                 char["outline"] = new_outline
-                                print(f"DEBUG: Using new outline (longer or no old)")
-                        
+
                         if new_growth_arc:
-                            print(f"DEBUG: Old growth arc length: {len(old_growth)}, New growth arc length: {len(new_growth_arc)}")
-                            # For growth arc, always ensure we extend, never shorten
                             if old_growth:
-                                # Check if new contains old text
                                 if old_growth.lower() not in new_growth_arc.lower():
-                                    # Old text not found - merge them to ensure we extend, not replace
                                     char["growth_arc"] = f"{old_growth} {new_growth_arc}"
-                                    print(f"DEBUG: Merged growth arcs (old not found in new)")
                                 elif len(new_growth_arc) < len(old_growth):
-                                    # New is shorter even though it contains old text - this shouldn't happen for extends
-                                    # Merge to preserve all content
                                     char["growth_arc"] = f"{old_growth} {new_growth_arc}"
-                                    print(f"DEBUG: Merged growth arcs (new shorter than old, preventing shortening)")
                                 else:
-                                    # New is longer and contains old - use new
                                     char["growth_arc"] = new_growth_arc
-                                    print(f"DEBUG: Using new growth arc (longer and contains old)")
                             else:
-                                # No old growth arc - use new
                                 char["growth_arc"] = new_growth_arc
-                                print(f"DEBUG: Using new growth arc (no old)")
-                        
+
                         character_found = True
-                        print(f"DEBUG: Character {char_name} updated successfully")
                         break
-                
+
                 if not character_found:
-                    # Create new character entry
-                    print(f"DEBUG: Character {character_name} not found, creating new entry")
                     new_char = {
                         "name": character_name,
-                        "outline": new_outline if new_outline else "",
-                        "growth_arc": new_growth_arc if new_growth_arc else ""
+                        "outline": new_outline or "",
+                        "growth_arc": new_growth_arc or ""
                     }
                     characters.append(new_char)
-                    character_found = True
-                
-                # Verify the changes were actually applied
-                if character_found:
-                    # Double-check the character was updated
-                    updated_char = None
-                    for char in characters:
-                        if isinstance(char, dict) and char.get("name", "").strip().lower() == character_name_normalized.lower():
-                            updated_char = char
-                            break
-                    
-                    if updated_char:
-                        final_outline = updated_char.get("outline", "")
-                        final_growth = updated_char.get("growth_arc", "")
-                        print(f"DEBUG: Final outline length: {len(final_outline)}, Final growth arc length: {len(final_growth)}")
-                        
-                        # Verify we didn't shorten anything (only check if we had old values)
-                        if new_outline:
-                            # Find the character again to get old values for comparison
-                            for char_check in characters:
-                                if isinstance(char_check, dict) and char_check.get("name", "").strip().lower() == character_name_normalized.lower():
-                                    # We already updated, so we can't compare old vs new here
-                                    # But we can log what was applied
-                                    break
-                
+
                 self.current_screenplay.updated_at = datetime.now().isoformat()
-                
-                # Mark screenplay as modified so user knows to save
                 self.setWindowModified(True)
                 self._mark_unsaved()
-                
-                # Refresh any views that show character information
-                # Note: The character tab/view would need to be refreshed if it exists
-                # Try to refresh framework view if it exists
+
                 if self.framework_view:
-                    # Framework view shows character info in Character Details tab, refresh it
                     try:
                         self.framework_view.update_character_details()
-                        print(f"DEBUG: Character details tab refreshed")
-                    except Exception as e:
-                        print(f"DEBUG: Error refreshing character details: {e}")
-                        import traceback
-                        traceback.print_exc()
-                    # Also update tree in case character names changed
+                    except Exception:
+                        pass
                     self.framework_view.update_tree()
-                
-                self.status_bar.showMessage(f"Character outline for {character_name} updated", 3000)
-                print(f"DEBUG: Character outline update complete for {character_name}")
+
+                self._show_toast(f"Character outline for {character_name} updated")
             
             elif change_type == "edit_scene" and self.chat_panel.current_scene:
                 # Edit scene properties or content
@@ -1621,11 +1648,10 @@ class MainWindow(QMainWindow):
                     scene.metadata["generated_content"] = new_content
                     scene.updated_at = datetime.now().isoformat()
                     
-                    # Refresh framework view to show updated content
                     if self.framework_view:
                         self.framework_view.load_scene_data(scene)
                         self.framework_view.update_tree()
-                    self.status_bar.showMessage("Scene content updated", 3000)
+                    self._show_toast("Scene content updated")
                 else:
                     # Handle property edits (description, title, character_focus, etc.)
                     edits = change_data.get("edits", {})
@@ -1664,31 +1690,254 @@ class MainWindow(QMainWindow):
                     self.framework_view.load_storyboard_items()
             
             elif change_type == "add_items" and self.chat_panel.current_scene:
-                # Add new storyboard items
                 new_items = change_data.get("new_items", [])
                 scene = self.chat_panel.current_scene
                 for item in new_items:
-                    scene.add_storyboard_item(item)
+                    if isinstance(item, StoryboardItem):
+                        scene.add_storyboard_item(item)
+                    elif isinstance(item, dict):
+                        sb_item = StoryboardItem(
+                            storyline=item.get("storyline", ""),
+                            prompt=item.get("prompt", ""),
+                            dialogue=item.get("dialogue", ""),
+                            duration=item.get("duration", 5)
+                        )
+                        scene.add_storyboard_item(sb_item)
                 if self.framework_view:
                     self.framework_view.renumber_storyboard_items()
                     self.framework_view.load_storyboard_items()
-            
+                self._show_toast(f"Added {len(new_items)} storyboard item(s)")
+
             elif change_type == "remove_items" and self.chat_panel.selected_items and self.chat_panel.current_scene:
-                # Remove selected items
                 scene = self.chat_panel.current_scene
+                removed_count = 0
                 for item in self.chat_panel.selected_items:
                     if item in scene.storyboard_items:
                         scene.storyboard_items.remove(item)
+                        removed_count += 1
                 if self.framework_view:
                     self.framework_view.renumber_storyboard_items()
                     self.framework_view.load_storyboard_items()
-            
+                self._show_toast(f"Removed {removed_count} storyboard item(s)")
+
+            elif change_type == "edit_premise" and self.current_screenplay:
+                if change_data.get("premise"):
+                    self.current_screenplay.premise = change_data["premise"]
+                if change_data.get("title"):
+                    self.current_screenplay.title = change_data["title"]
+                    self.setWindowTitle(f"SceneWrite - {change_data['title']}")
+                if change_data.get("genres"):
+                    genres = change_data["genres"]
+                    if isinstance(genres, str):
+                        genres = [g.strip() for g in genres.split(",") if g.strip()]
+                    self.current_screenplay.genre = genres
+                if change_data.get("atmosphere"):
+                    self.current_screenplay.atmosphere = change_data["atmosphere"]
+                self.current_screenplay.updated_at = datetime.now().isoformat()
+                if self.framework_view:
+                    self.framework_view.update_premise_tab()
+                    self.framework_view.update_tree()
+                self._show_toast("Story premise updated")
+
+            elif change_type == "edit_story_outline" and self.current_screenplay:
+                if not self.current_screenplay.story_outline:
+                    self.current_screenplay.story_outline = {}
+                if change_data.get("main_storyline"):
+                    self.current_screenplay.story_outline["main_storyline"] = change_data["main_storyline"]
+                if change_data.get("subplots"):
+                    self.current_screenplay.story_outline["subplots"] = change_data["subplots"]
+                if change_data.get("conclusion"):
+                    self.current_screenplay.story_outline["conclusion"] = change_data["conclusion"]
+                self.current_screenplay.updated_at = datetime.now().isoformat()
+                if self.framework_view:
+                    self.framework_view.update_premise_tab()
+                    self.framework_view.update_tree()
+                self._show_toast("Story outline updated")
+
+            elif change_type == "regenerate_framework" and self.current_screenplay:
+                if not change_data.get("confirm"):
+                    QMessageBox.warning(self, "Error", "Framework regeneration was not confirmed.")
+                    return
+                reply = QMessageBox.question(
+                    self, "Regenerate Framework",
+                    "This will replace the entire story framework (all acts and scenes). "
+                    "Generated scene content and storyboard items will be lost.\n\n"
+                    "Are you sure you want to continue?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+                self._regenerate_framework_from_chat(change_data)
+
+            elif change_type == "edit_series_bible" and self.current_screenplay:
+                sm = getattr(self.current_screenplay, "series_metadata", None) or {}
+                bible_path = sm.get("series_bible_path", "")
+                if not bible_path or not os.path.exists(bible_path):
+                    QMessageBox.warning(self, "Error", "No Series Bible found for this story.")
+                    return
+                try:
+                    from core.series_bible import SeriesBible
+                    bible = SeriesBible.load(bible_path)
+                    wc = bible.world_context or {}
+                    if change_data.get("setting_description"):
+                        wc["setting_description"] = change_data["setting_description"]
+                    if change_data.get("time_period"):
+                        wc["time_period"] = change_data["time_period"]
+                    if change_data.get("rules_and_lore"):
+                        wc["rules_and_lore"] = change_data["rules_and_lore"]
+                    if change_data.get("tone"):
+                        wc["tone"] = change_data["tone"]
+                    bible.world_context = wc
+                    bible.save(bible_path)
+                    self._show_toast("Series Bible updated")
+                except Exception as e:
+                    QMessageBox.critical(self, "Error", f"Failed to update Series Bible:\n{str(e)}")
+
+            elif change_type == "edit_identity_block" and self.current_screenplay:
+                entity_name = change_data.get("entity_name", "")
+                entity_type = change_data.get("entity_type", "")
+                user_notes = change_data.get("user_notes", "")
+                if not entity_name:
+                    QMessageBox.warning(self, "Error", "No entity name provided.")
+                    return
+                entity_id = self._find_entity_id(entity_name, entity_type)
+                if entity_id:
+                    self.current_screenplay.update_identity_block_metadata(
+                        entity_id, user_notes=user_notes
+                    )
+                    self.current_screenplay.updated_at = datetime.now().isoformat()
+                    self._show_toast(f"Identity block for {entity_name} updated")
+                else:
+                    QMessageBox.warning(self, "Error", f"Could not find identity block for '{entity_name}'.")
+
+            elif change_type == "approve_identity_block" and self.current_screenplay:
+                entity_name = change_data.get("entity_name", "")
+                entity_type = change_data.get("entity_type", "")
+                if not entity_name:
+                    QMessageBox.warning(self, "Error", "No entity name provided.")
+                    return
+                entity_id = self._find_entity_id(entity_name, entity_type)
+                if entity_id:
+                    meta = self.current_screenplay.get_identity_block_metadata_by_id(entity_id)
+                    ib = (meta or {}).get("identity_block", "")
+                    if not ib:
+                        QMessageBox.warning(self, "Error",
+                            f"Cannot approve '{entity_name}' — no identity block generated yet. "
+                            "Generate one first using the Identity Block Manager.")
+                        return
+                    self.current_screenplay.update_identity_block_metadata(
+                        entity_id, status="approved"
+                    )
+                    self.current_screenplay.updated_at = datetime.now().isoformat()
+                    self._show_toast(f"Identity block for {entity_name} approved")
+                else:
+                    QMessageBox.warning(self, "Error", f"Could not find identity block for '{entity_name}'.")
+
             self.update_status_bar()
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to apply changes:\n{str(e)}")
-    
+
+    # ------------------------------------------------------------------
+    # Chat-change helpers
+    # ------------------------------------------------------------------
+
+    def _find_entity_id(self, entity_name: str, entity_type: str) -> str | None:
+        """Resolve entity_name + entity_type to an identity-block entity_id."""
+        if not self.current_screenplay:
+            return None
+        name_lower = entity_name.strip().lower()
+        # Direct lookup via identity_block_ids registry
+        lookup_key = f"{entity_type}:{entity_name}".lower()
+        eid = self.current_screenplay.identity_block_ids.get(lookup_key)
+        if eid:
+            return eid
+        # Fallback: scan metadata
+        for eid, meta in (self.current_screenplay.identity_block_metadata or {}).items():
+            if not isinstance(meta, dict):
+                continue
+            if (meta.get("name") or "").strip().lower() == name_lower:
+                if not entity_type or (meta.get("type") or "").lower() == entity_type.lower():
+                    return eid
+        return None
+
+    def _regenerate_framework_from_chat(self, change_data: dict):
+        """Regenerate the story framework in a background thread triggered from the chat."""
+        if not self.ai_generator or not self.current_screenplay:
+            return
+        sp = self.current_screenplay
+        series_bible = None
+        custom_dur = getattr(sp, "custom_duration_seconds", 0) or 0
+        sm = getattr(sp, "series_metadata", None) or {}
+        bible_path = sm.get("series_bible_path", "")
+        if bible_path and os.path.exists(bible_path):
+            try:
+                from core.series_bible import SeriesBible
+                series_bible = SeriesBible.load(bible_path)
+            except Exception:
+                pass
+
+        self._regen_thread = FrameworkGenerationThread(
+            self.ai_generator,
+            premise=sp.premise,
+            title=sp.title,
+            length=sp.length if hasattr(sp, "length") else "Medium",
+            atmosphere=sp.atmosphere,
+            genres=sp.genre,
+            story_outline=sp.story_outline,
+            intent=sp.intent if hasattr(sp, "intent") else "General Story",
+            series_bible=series_bible,
+            custom_duration_seconds=custom_dur,
+        )
+        self._regen_thread.finished.connect(self._on_regen_framework_done)
+        self._regen_thread.error.connect(self._on_regen_framework_error)
+        self._regen_thread.start()
+        self.status_bar.showMessage("Regenerating framework...")
+        if self.chat_panel:
+            self.chat_panel.add_message("system", "Framework regeneration in progress...")
+
+    def _on_regen_framework_done(self, new_sp: "Screenplay"):
+        """Handle completion of framework regeneration from chat."""
+        if not self.current_screenplay:
+            return
+        self.current_screenplay.acts = new_sp.acts
+        if new_sp.story_outline:
+            self.current_screenplay.story_outline = new_sp.story_outline
+        self.current_screenplay.updated_at = datetime.now().isoformat()
+        if self.framework_view:
+            self.framework_view.screenplay = self.current_screenplay
+            self.framework_view.update_tree()
+            self.framework_view.update_premise_tab()
+        self._mark_unsaved()
+        self._show_toast("Framework regenerated successfully")
+        if self.chat_panel:
+            self.chat_panel.add_message("system", "Framework regeneration complete.")
+
+    def _on_regen_framework_error(self, error_msg: str):
+        """Handle framework regeneration error."""
+        QMessageBox.critical(self, "Error", f"Framework regeneration failed:\n{error_msg}")
+        if self.chat_panel:
+            self.chat_panel.add_message("system", f"Framework regeneration failed: {error_msg}", is_error=True)
+
+    def _show_toast(self, message: str, duration_ms: int = 4000):
+        """Show a brief toast-style notification on the status bar and as a fading overlay."""
+        self.status_bar.showMessage(message, duration_ms)
+        try:
+            toast = _ToastOverlay(message, self, duration_ms)
+            toast.show()
+        except Exception:
+            pass
+
     def open_screenplay(self):
         """Open an existing screenplay."""
+        if self.current_screenplay and self._has_unsaved_changes:
+            reply = QMessageBox.question(
+                self, "Unsaved Changes",
+                "You have unsaved changes. Open a different story anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.No:
+                return
+
         filename, _ = QFileDialog.getOpenFileName(
             self, "Open Storyboard", get_stories_directory(),
             "JSON Files (*.json);;All Files (*.*)"
@@ -1715,7 +1964,7 @@ class MainWindow(QMainWindow):
                     self.framework_view.hide()
                 
                 self.update_status_bar()
-                self.setWindowTitle(f"MoviePrompterAI - {os.path.basename(filename)}")
+                self.setWindowTitle(f"SceneWrite - {os.path.basename(filename)}")
                 
                 # Update chat panel and Higgsfield panel
                 if self.chat_panel:
@@ -1822,9 +2071,18 @@ class MainWindow(QMainWindow):
         if not self.current_screenplay:
             return
         
-        default_name = (self.current_screenplay.title or "Untitled Story").strip()
-        default_name = re.sub(r'[<>:"/\\|?*]', '', default_name) or "Untitled Story"
-        default_path = os.path.join(get_stories_directory(), default_name + ".json")
+        meta = getattr(self.current_screenplay, "series_metadata", None)
+        if meta and meta.get("series_folder"):
+            from core.series_manager import SeriesManager
+            ep_filename = SeriesManager.build_episode_filename(
+                meta.get("episode_number", 1),
+                meta.get("episode_title", ""),
+            )
+            default_path = os.path.join(meta["series_folder"], ep_filename)
+        else:
+            default_name = (self.current_screenplay.title or "Untitled Story").strip()
+            default_name = re.sub(r'[<>:"/\\|?*]', '', default_name) or "Untitled Story"
+            default_path = os.path.join(get_stories_directory(), default_name + ".json")
         
         filename, _ = QFileDialog.getSaveFileName(
             self, "Save Story", default_path,
@@ -1839,7 +2097,7 @@ class MainWindow(QMainWindow):
                 self.current_filename = filename
                 self._mark_saved()
                 self.update_status_bar()
-                self.setWindowTitle(f"MoviePrompterAI - {os.path.basename(filename)}")
+                self._update_window_title()
                 self.status_bar.showMessage("Saved successfully", 2000)
                 
                 # Track in recent files
@@ -1850,6 +2108,8 @@ class MainWindow(QMainWindow):
     
     def export_screenplay(self, format_type: str):
         """Export the screenplay in the specified format."""
+        if not self.require_license("Export"):
+            return
         if not self.current_screenplay:
             QMessageBox.warning(self, "No Storyboard", "No storyboard to export.")
             return
@@ -1919,6 +2179,82 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 QMessageBox.critical(self, "Export Error", f"Failed to export:\n{str(e)}")
     
+    def export_for_platform(self):
+        """Export prompts formatted for a specific AI video platform."""
+        if not self.require_license("Platform Export"):
+            return
+        if not self.current_screenplay:
+            QMessageBox.warning(self, "No Storyboard", "No storyboard to export.")
+            return
+        all_items = self.current_screenplay.get_all_storyboard_items()
+        if not all_items:
+            QMessageBox.warning(self, "No Storyboard", "No storyboard items to export.")
+            return
+
+        from core.prompt_adapters import get_available_platforms, get_adapter
+
+        platforms = get_available_platforms()
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Export Prompts for Platform")
+        dialog.setModal(True)
+        dialog.resize(420, 300)
+        layout = QVBoxLayout(dialog)
+
+        layout.addWidget(QLabel("Select target platform:"))
+
+        from PyQt6.QtWidgets import QListWidget, QListWidgetItem
+        platform_list = QListWidget()
+        for p in platforms:
+            item = QListWidgetItem(f"{p['name']}  —  {p['description']}")
+            item.setData(Qt.ItemDataRole.UserRole, p["id"])
+            platform_list.addItem(item)
+        platform_list.setCurrentRow(0)
+        layout.addWidget(platform_list)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        selected = platform_list.currentItem()
+        if not selected:
+            return
+        platform_id = selected.data(Qt.ItemDataRole.UserRole)
+        adapter = get_adapter(platform_id)
+        if not adapter:
+            return
+
+        base_name = self.current_filename or "storyboard"
+        if base_name.endswith(".json"):
+            base_name = base_name[:-5]
+        suggested = f"{base_name}_{platform_id}{adapter.file_extension}"
+
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            f"Export Prompts for {adapter.platform_name}",
+            suggested,
+            f"Text Files (*{adapter.file_extension});;All Files (*.*)",
+        )
+        if not filename:
+            return
+
+        try:
+            adapter.export(self.current_screenplay, filename)
+            self.status_bar.showMessage(
+                f"Exported {adapter.platform_name} prompts to {os.path.basename(filename)}",
+                3000,
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Export Error", f"Failed to export:\n{str(e)}"
+            )
+
     def show_premise_dialog(self):
         """Show the premise dialog."""
         dialog = PremiseDialog(self, self.ai_generator)
@@ -1938,10 +2274,12 @@ class MainWindow(QMainWindow):
         self.framework_view.show()
         self.timeline_view.hide()
         self.update_status_bar()
-        self.setWindowTitle(f"MoviePrompterAI - {title or 'Untitled Story'}")
+        self.setWindowTitle(f"SceneWrite - {title or 'Untitled Story'}")
     
     def generate_storyboard(self):
         """Generate a storyboard from the current premise."""
+        if not self.require_license("Storyboard Generation"):
+            return
         if not self.current_screenplay or not self.current_screenplay.premise:
             QMessageBox.warning(
                 self, "No Premise",
@@ -2057,7 +2395,7 @@ class MainWindow(QMainWindow):
         try:
             self._mark_unsaved()
             if not item:
-                print("Warning: on_item_saved called with None item")
+                _safe_print("Warning: on_item_saved called with None item")
                 return
             
             if self.framework_view and hasattr(self.framework_view, 'isVisible') and self.framework_view.isVisible():
@@ -2065,7 +2403,7 @@ class MainWindow(QMainWindow):
                     if hasattr(self.framework_view, 'refresh'):
                         self.framework_view.refresh()
                 except Exception as e:
-                    print(f"Error refreshing framework view: {e}")
+                    _safe_print(f"Error refreshing framework view: {e}")
                     import traceback
                     traceback.print_exc()
             
@@ -2074,25 +2412,27 @@ class MainWindow(QMainWindow):
                     if hasattr(self.timeline_view, 'refresh'):
                         self.timeline_view.refresh()
                 except Exception as e:
-                    print(f"Error refreshing timeline view: {e}")
+                    _safe_print(f"Error refreshing timeline view: {e}")
                     import traceback
                     traceback.print_exc()
             
             try:
                 self.update_status_bar()
             except Exception as e:
-                print(f"Error updating status bar: {e}")
+                _safe_print(f"Error updating status bar: {e}")
                 import traceback
                 traceback.print_exc()
                 
         except Exception as e:
-            print(f"Error in on_item_saved: {e}")
+            _safe_print(f"Error in on_item_saved: {e}")
             import traceback
             traceback.print_exc()
             QMessageBox.warning(self, "Save Warning", f"Item was saved but there was an error updating the display:\n{str(e)}")
     
     def generate_story_framework(self):
         """Generate a story framework from the current premise (Phase 1)."""
+        if not self.require_license("Framework Generation"):
+            return
         if not self.current_screenplay or not self.current_screenplay.premise:
             QMessageBox.warning(
                 self, "No Premise",
@@ -2262,7 +2602,7 @@ class MainWindow(QMainWindow):
                 log_exception("Error updating after scene save", e)
             except:
                 import traceback
-                print(f"Error updating after scene save: {e}")
+                _safe_print(f"Error updating after scene save: {e}")
                 traceback.print_exc()
             try:
                 log_path = get_log_file_path()
@@ -2280,27 +2620,28 @@ class MainWindow(QMainWindow):
         """Show settings dialog (all tabs)."""
         dialog = SettingsDialog(self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            # Reinitialize AI generator with new settings
-            if self.ai_generator:
-                self.ai_generator.reload_settings()
-            else:
-                self.init_ai_generator()
-            # Update auto-save interval
+            self._refresh_ai_generator()
             self.setup_auto_save()
-            # Apply UI settings (theme and font size)
             from config import config
             ui_settings = config.get_ui_settings()
             dialog.apply_ui_settings(ui_settings["theme"], ui_settings["font_size"])
-    
+
     def show_ai_settings(self):
         """Show AI settings dialog."""
         dialog = SettingsDialog(self, show_tab="ai")
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            # Reinitialize AI generator with new settings
-            if self.ai_generator:
-                self.ai_generator.reload_settings()
-            else:
-                self.init_ai_generator()
+            self._refresh_ai_generator()
+
+    def _refresh_ai_generator(self):
+        """Reload or create the AI generator after settings change and propagate to all panels."""
+        if self.ai_generator:
+            self.ai_generator.reload_settings()
+        else:
+            self.init_ai_generator()
+        if self.chat_panel:
+            self.chat_panel.set_ai_generator(self.ai_generator)
+        if self.framework_view:
+            self.framework_view.set_ai_generator(self.ai_generator)
     
     def show_instructions(self):
         """Show instructions dialog."""
@@ -2316,7 +2657,324 @@ class MainWindow(QMainWindow):
         """Show license dialog."""
         dialog = LicenseDialog(self)
         dialog.exec()
-    
+
+    # ── License System ───────────────────────────────────────────────
+
+    def set_license_state(self, state: LicenseState):
+        """Store the license state and update UI restrictions accordingly."""
+        self._license_state = state
+        restricted = state.status not in (
+            LicenseStatus.VALID,
+            LicenseStatus.TRIAL_ACTIVE,
+        )
+        if restricted:
+            self.status_bar.showMessage(state.message or "License required for full features.")
+        elif state.status == LicenseStatus.TRIAL_ACTIVE and state.days_remaining is not None:
+            self.status_bar.showMessage(
+                f"Trial: {state.days_remaining} day{'s' if state.days_remaining != 1 else ''} remaining",
+                0,
+            )
+
+    @property
+    def is_licensed(self) -> bool:
+        """True if the app has a valid license or active trial."""
+        if self._license_state is None:
+            return True  # not yet checked
+        return self._license_state.status in (
+            LicenseStatus.VALID,
+            LicenseStatus.TRIAL_ACTIVE,
+        )
+
+    def require_license(self, feature_name: str = "This feature") -> bool:
+        """Gate a feature behind license validation.
+
+        Returns True if the user is licensed and may proceed.
+        Shows a message and returns False otherwise.
+        """
+        if self.is_licensed:
+            return True
+        QMessageBox.warning(
+            self,
+            "License Required",
+            f"{feature_name} requires an active license or trial.\n\n"
+            "Go to Help > Enter License Key to activate.",
+        )
+        return False
+
+    def show_activation_dialog(self):
+        """Show the license activation dialog from the menu."""
+        dlg = ActivationDialog(parent=self, allow_trial=False, allow_close=True)
+        dlg.exec()
+        if dlg.was_activated:
+            self._license_state = check_license()
+            self.set_license_state(self._license_state)
+            self.status_bar.showMessage("License activated.", 5000)
+
+    # ── Update System ────────────────────────────────────────────────
+
+    def start_update_check(self):
+        """Launch a background thread to check for updates (called once at startup)."""
+        self._update_thread = UpdateCheckThread()
+        self._update_thread.update_available.connect(self._on_update_available)
+        self._update_thread.start()
+
+    def _on_update_available(self, info):
+        """Handle the signal from the background update checker."""
+        dlg = UpdateAvailableDialog(info, parent=self)
+        dlg.exec()
+
+    def check_for_updates_manual(self):
+        """Triggered from Help > Check for Updates (always checks, ignores interval)."""
+        from core.update_checker import check_for_update, record_update_check
+
+        self.status_bar.showMessage("Checking for updates...")
+        QApplication.processEvents()
+
+        info = check_for_update()
+        record_update_check(config)
+
+        if info is not None:
+            self.status_bar.clearMessage()
+            dlg = UpdateAvailableDialog(info, parent=self)
+            dlg.exec()
+        else:
+            self.status_bar.showMessage("You're running the latest version.", 5000)
+            QMessageBox.information(
+                self, "No Updates",
+                "You are already running the latest version of SceneWrite."
+            )
+
+    # ── Episodic Series System ───────────────────────────────────────
+
+    def _update_window_title(self, screenplay=None):
+        sp = screenplay or self.current_screenplay
+        if not sp:
+            self.setWindowTitle("SceneWrite")
+            return
+        meta = getattr(sp, "series_metadata", None)
+        if meta:
+            series_title = meta.get("series_title", "")
+            ep_num = meta.get("episode_number", "")
+            ep_title = meta.get("episode_title", "")
+            self.setWindowTitle(f"SceneWrite - {series_title} - Episode {ep_num}: {ep_title}")
+        else:
+            title = sp.title or "Untitled Story"
+            self.setWindowTitle(f"SceneWrite - {title}")
+
+    def _get_current_series_folder(self) -> str:
+        if self.current_screenplay and getattr(self.current_screenplay, "series_metadata", None):
+            return self.current_screenplay.series_metadata.get("series_folder", "")
+        return ""
+
+    def new_series(self):
+        """Start a new series by opening the wizard in series mode."""
+        self.new_screenplay()
+
+    def new_episode(self):
+        """Add a new episode to an existing series by opening the wizard."""
+        self.new_screenplay()
+
+    def open_series_dashboard(self):
+        """Open the Series Dashboard for an existing series."""
+        from core.series_manager import SeriesManager
+        from ui.series_dashboard import SeriesDashboard
+
+        folder = self._get_current_series_folder()
+        if not folder:
+            series_list = SeriesManager.list_all_series()
+            if not series_list:
+                QMessageBox.information(self, "No Series", "No series found. Create one via File > New Story.")
+                return
+            from PyQt6.QtWidgets import QInputDialog
+            titles = [s["title"] for s in series_list]
+            chosen, ok = QInputDialog.getItem(self, "Select Series", "Choose a series:", titles, 0, False)
+            if not ok:
+                return
+            idx = titles.index(chosen)
+            folder = series_list[idx]["folder"]
+
+        try:
+            bible = SeriesManager.load_series(folder)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load series:\n{e}")
+            return
+
+        dashboard = SeriesDashboard(bible, folder, self)
+        dashboard.episode_open_requested.connect(self._open_episode_file)
+        dashboard.new_episode_requested.connect(self.new_episode)
+        dashboard.edit_bible_requested.connect(lambda: self._open_bible_editor(bible, folder))
+        dashboard.exec()
+
+    def edit_series_bible(self):
+        """Open the Series Bible editor for the current series."""
+        from core.series_manager import SeriesManager
+
+        folder = self._get_current_series_folder()
+        if not folder:
+            series_list = SeriesManager.list_all_series()
+            if not series_list:
+                QMessageBox.information(self, "No Series", "No series found.")
+                return
+            from PyQt6.QtWidgets import QInputDialog
+            titles = [s["title"] for s in series_list]
+            chosen, ok = QInputDialog.getItem(self, "Select Series", "Choose a series:", titles, 0, False)
+            if not ok:
+                return
+            idx = titles.index(chosen)
+            folder = series_list[idx]["folder"]
+
+        try:
+            bible = SeriesManager.load_series(folder)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load series:\n{e}")
+            return
+
+        self._open_bible_editor(bible, folder)
+
+    def _open_bible_editor(self, bible, folder):
+        from ui.series_bible_editor import SeriesBibleEditor
+        editor = SeriesBibleEditor(bible, folder, self)
+        editor.exec()
+
+    def _open_episode_file(self, filepath: str):
+        """Open a specific episode file from the series dashboard."""
+        if not os.path.isfile(filepath):
+            QMessageBox.warning(self, "File Not Found", f"Episode file not found:\n{filepath}")
+            return
+        if self.current_screenplay and self._has_unsaved_changes:
+            reply = QMessageBox.question(
+                self, "Unsaved Changes",
+                "You have unsaved changes. Open a different episode anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.No:
+                return
+        try:
+            screenplay = Screenplay.load_from_file(filepath)
+            self.current_screenplay = screenplay
+            self.current_filename = filepath
+            self._has_unsaved_changes = False
+            if self.framework_view:
+                self.framework_view.set_screenplay(screenplay)
+                self.framework_view.set_ai_generator(self.ai_generator)
+                self.framework_view.show()
+            if self.chat_panel:
+                self.chat_panel.set_screenplay(screenplay)
+                self.chat_panel.set_ai_generator(self.ai_generator)
+            if hasattr(self, 'hf_panel') and self.hf_panel:
+                self.hf_panel.set_screenplay(screenplay)
+            self.update_status_bar()
+            self._update_window_title(screenplay)
+            config.add_recent_file(filepath)
+            self._update_recent_files_menu()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to open episode:\n{e}")
+
+    def convert_to_series(self):
+        """Convert the current standalone story into Episode 1 of a new series."""
+        from core.series_manager import SeriesManager
+
+        if not self.current_screenplay:
+            QMessageBox.warning(self, "No Story", "No story is currently loaded.")
+            return
+
+        if getattr(self.current_screenplay, "series_metadata", None):
+            QMessageBox.information(self, "Already a Series", "This story is already part of a series.")
+            return
+
+        title, ok = QInputDialog.getText(
+            self, "Series Title",
+            "Enter a title for the new series:",
+            QLineEdit.EchoMode.Normal,
+            self.current_screenplay.title or "",
+        )
+        if not ok or not title.strip():
+            return
+
+        try:
+            folder, bible = SeriesManager.convert_to_series(self.current_screenplay, title.strip())
+            # Save the screenplay into the series folder as Episode 1
+            ep_filename = SeriesManager.build_episode_filename(1, self.current_screenplay.series_metadata.get("episode_title", "Pilot"))
+            ep_path = os.path.join(folder, ep_filename)
+            self.current_screenplay.save_to_file(ep_path)
+            self.current_filename = ep_path
+            self._mark_unsaved()
+            self._update_window_title()
+            self.update_status_bar()
+            QMessageBox.information(
+                self, "Converted",
+                f"Story converted to series '{title.strip()}'.\n"
+                f"Saved as Episode 1 in:\n{folder}"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to convert to series:\n{e}")
+
+    def finalize_episode(self):
+        """Finalize the current episode and update the Series Bible."""
+        from core.series_manager import SeriesManager
+
+        if not self.current_screenplay:
+            QMessageBox.warning(self, "No Story", "No story is currently loaded.")
+            return
+
+        meta = getattr(self.current_screenplay, "series_metadata", None)
+        if not meta:
+            QMessageBox.information(self, "Not an Episode", "The current story is not part of a series.")
+            return
+
+        folder = meta.get("series_folder", "")
+        if not folder or not SeriesManager.is_series_folder(folder):
+            QMessageBox.warning(self, "Series Not Found", "Cannot locate the series folder.")
+            return
+
+        reply = QMessageBox.question(
+            self, "Finalize Episode",
+            f"Finalize Episode {meta.get('episode_number', '?')}: {meta.get('episode_title', '')}?\n\n"
+            "This will mark the episode as complete and update the Series Bible.\n"
+            "You can optionally generate an AI summary afterwards.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            bible = SeriesManager.load_series(folder)
+
+            summary = ""
+            if self.ai_generator:
+                gen_reply = QMessageBox.question(
+                    self, "Generate Summary",
+                    "Would you like to generate an AI summary for this episode?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                if gen_reply == QMessageBox.StandardButton.Yes:
+                    try:
+                        result = self.ai_generator.generate_episode_summary(self.current_screenplay)
+                        summary = result.get("summary", "")
+                        timeline_events = result.get("timeline_events", [])
+                        SeriesManager.finalize_episode(
+                            self.current_screenplay, bible, folder,
+                            summary=summary,
+                            story_arc=result.get("story_arc", ""),
+                            timeline_events=timeline_events,
+                        )
+                    except Exception as e:
+                        QMessageBox.warning(self, "Summary Failed", f"AI summary failed: {e}\nFinalizing without summary.")
+                        SeriesManager.finalize_episode(self.current_screenplay, bible, folder)
+                else:
+                    SeriesManager.finalize_episode(self.current_screenplay, bible, folder)
+            else:
+                SeriesManager.finalize_episode(self.current_screenplay, bible, folder)
+
+            # Save the screenplay
+            if self.current_filename:
+                self.current_screenplay.save_to_file(self.current_filename)
+            self._update_window_title()
+            self.update_status_bar()
+            QMessageBox.information(self, "Finalized", "Episode finalized and Series Bible updated.")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to finalize episode:\n{e}")
+
     def show_ui_settings(self):
         """Show UI settings dialog."""
         dialog = SettingsDialog(self, show_tab="ui")
@@ -2329,22 +2987,168 @@ class MainWindow(QMainWindow):
             self.apply_ui_settings(ui_settings["theme"], ui_settings["font_size"])
     
     def show_story_settings(self):
-        """Show story settings dialog for the current project."""
-        if not self.current_screenplay:
-            QMessageBox.information(
-                self, "No Project",
-                "Open or create a story first to configure story settings."
+        """Show story settings dialog for the current project or pre-creation defaults."""
+        if self.current_screenplay:
+            ss = getattr(self.current_screenplay, "story_settings", None) or {}
+            old_visual_style = ss.get("visual_style") or "photorealistic"
+
+            story_tab = self.framework_view.story_settings_tab
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Story Settings")
+            dialog.setModal(True)
+            dialog.resize(600, 650)
+            layout = QVBoxLayout(dialog)
+            layout.addWidget(story_tab)
+            story_tab.show()
+            story_tab.load_settings(self.current_screenplay)
+            dialog.exec()
+            layout.removeWidget(story_tab)
+            story_tab.setParent(self.framework_view)
+            story_tab.hide()
+
+            ss = getattr(self.current_screenplay, "story_settings", None) or {}
+            new_visual_style = ss.get("visual_style") or "photorealistic"
+            if new_visual_style != old_visual_style:
+                self._offer_batch_regenerate_reference_prompts(new_visual_style)
+        else:
+            import types
+            from core.screenplay_engine import get_default_story_settings
+            from .story_settings_tab import StorySettingsTab
+
+            initial = self._pending_story_settings or get_default_story_settings()
+            proxy = types.SimpleNamespace(story_settings=dict(initial))
+
+            story_tab = StorySettingsTab()
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Story Settings — Pre-Creation Defaults")
+            dialog.setModal(True)
+            dialog.resize(600, 650)
+            layout = QVBoxLayout(dialog)
+            info_label = QLabel(
+                "Configure story settings before creating a new story.\n"
+                "These settings will be applied when you create your next story."
             )
+            info_label.setWordWrap(True)
+            info_label.setStyleSheet(
+                "color: #666; padding: 8px; font-style: italic;"
+            )
+            layout.addWidget(info_label)
+            layout.addWidget(story_tab)
+            story_tab.load_settings(proxy)
+            dialog.exec()
+
+            self._pending_story_settings = proxy.story_settings
+
+    def _offer_batch_regenerate_reference_prompts(self, new_style: str):
+        """Ask user whether to regenerate all prompts after a visual style change."""
+        from core.screenplay_engine import VISUAL_STYLE_OPTIONS
+
+        ibm = getattr(self.framework_view, "identity_block_manager", None)
+        if not ibm or not ibm.ai_generator or not self.current_screenplay:
             return
-        story_tab = self.framework_view.story_settings_tab
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Story Settings")
-        dialog.setModal(True)
-        dialog.resize(550, 500)
-        layout = QVBoxLayout(dialog)
-        layout.addWidget(story_tab)
-        story_tab.load_settings(self.current_screenplay)
-        dialog.exec()
+
+        ref_count = 0
+        for meta in self.current_screenplay.identity_block_metadata.values():
+            if meta.get("status") == "approved" and meta.get("reference_image_prompt", "").strip():
+                ref_count += 1
+        wv = getattr(self.current_screenplay, "character_wardrobe_variants", {})
+        for variants in wv.values():
+            for v in variants:
+                if v.get("identity_block", "").strip() and v.get("reference_image_prompt", "").strip():
+                    ref_count += 1
+
+        sb_count = 0
+        for scene in self.current_screenplay.get_all_scenes():
+            for item in scene.storyboard_items:
+                if (getattr(item, "image_prompt", "") or "").strip():
+                    sb_count += 1
+
+        total_count = ref_count + sb_count
+        if total_count == 0:
+            return
+
+        style_name = VISUAL_STYLE_OPTIONS.get(new_style, new_style)
+        detail_lines = []
+        if ref_count:
+            detail_lines.append(f"  - {ref_count} reference image prompt(s)")
+        if sb_count:
+            detail_lines.append(f"  - {sb_count} storyboard hero frame prompt(s)")
+        detail_text = "\n".join(detail_lines)
+
+        reply = QMessageBox.question(
+            self,
+            "Regenerate Prompts for New Style?",
+            f"You changed the visual style to '{style_name}'.\n\n"
+            f"The following existing prompts still use the previous style:\n"
+            f"{detail_text}\n\n"
+            f"Would you like to regenerate them all now to match the new style?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        progress = QProgressDialog(
+            "Regenerating prompts for new visual style...", None, 0, 0, self
+        )
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setCancelButton(None)
+        progress.show()
+        QApplication.processEvents()
+
+        try:
+            result = ibm.batch_regenerate_reference_prompts(new_style)
+
+            sb_regen = self._batch_regenerate_storyboard_keyframes()
+
+            progress.close()
+
+            parts = []
+            if result["identity_count"]:
+                parts.append(f"{result['identity_count']} identity block(s)")
+            if result["wardrobe_count"]:
+                parts.append(f"{result['wardrobe_count']} wardrobe variant(s)")
+            if sb_regen:
+                parts.append(f"{sb_regen} storyboard hero frame(s)")
+            msg = f"Regenerated prompts for {', '.join(parts)}."
+            if result["errors"]:
+                msg += f"\n\n{len(result['errors'])} error(s) occurred:\n" + "\n".join(
+                    result["errors"][:5]
+                )
+            total = result["identity_count"] + result["wardrobe_count"] + sb_regen
+            if total > 0:
+                QMessageBox.information(self, "Regeneration Complete", msg)
+            elif result["errors"]:
+                QMessageBox.warning(self, "Regeneration Failed", msg)
+        except Exception as exc:
+            progress.close()
+            QMessageBox.critical(
+                self, "Error", f"Batch regeneration failed:\n\n{str(exc)}"
+            )
+
+    def _batch_regenerate_storyboard_keyframes(self) -> int:
+        """Regenerate all storyboard item keyframe (hero frame) prompts using current visual style.
+
+        Uses build_keyframe_prompt which resolves the visual style from story settings.
+        Returns the number of items regenerated.
+        """
+        from core.video_prompt_builder import build_keyframe_prompt
+
+        if not self.current_screenplay:
+            return 0
+
+        count = 0
+        for scene in self.current_screenplay.get_all_scenes():
+            for item in scene.storyboard_items:
+                old_prompt = (getattr(item, "image_prompt", "") or "").strip()
+                if not old_prompt:
+                    continue
+                new_prompt = build_keyframe_prompt(item, self.current_screenplay, scene)
+                if new_prompt and new_prompt.strip():
+                    item.image_prompt = new_prompt.strip()
+                    count += 1
+        return count
 
     def apply_ui_settings(self, theme: str, font_size: int):
         """Apply theme and font size to the application."""

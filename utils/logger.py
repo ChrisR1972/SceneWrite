@@ -1,5 +1,5 @@
 """
-Logging utility for MoviePrompterAI.
+Logging utility for SceneWrite.
 Safe to import - never raises exceptions.
 """
 
@@ -23,9 +23,9 @@ def get_log_file_path():
                 # Fallback to current directory if APPDATA not set
                 app_dir = os.path.join(os.getcwd(), 'logs')
             else:
-                app_dir = os.path.join(appdata, 'MoviePrompterAI')
+                app_dir = os.path.join(appdata, 'SceneWrite')
         else:  # Linux/Mac
-            app_dir = os.path.join(os.path.expanduser('~'), '.movieprompterai')
+            app_dir = os.path.join(os.path.expanduser('~'), '.scenewrite')
         
         # Create directory if it doesn't exist
         try:
@@ -39,14 +39,14 @@ def get_log_file_path():
                 pass
         
         # Log file path
-        log_file = os.path.join(app_dir, 'movieprompterai.log')
+        log_file = os.path.join(app_dir, 'scenewrite.log')
         return log_file
     except Exception:
         # Ultimate fallback - use current directory
         try:
-            return os.path.join(os.getcwd(), 'movieprompterai.log')
+            return os.path.join(os.getcwd(), 'scenewrite.log')
         except:
-            return 'movieprompterai.log'
+            return 'scenewrite.log'
 
 
 def setup_logger():
@@ -68,7 +68,7 @@ def setup_logger():
         log_file = get_log_file_path()
         
         # Create logger
-        logger = logging.getLogger('MoviePrompterAI')
+        logger = logging.getLogger('SceneWrite')
         logger.setLevel(logging.DEBUG)
         
         # Remove existing handlers to avoid duplicates
@@ -100,7 +100,7 @@ def setup_logger():
     except Exception:
         # If everything fails, return a logger with null handler
         try:
-            logger = logging.getLogger('MoviePrompterAI')
+            logger = logging.getLogger('SceneWrite')
             logger.addHandler(logging.NullHandler())
             return logger
         except:
@@ -130,7 +130,7 @@ def get_logger():
         return _logger
     except Exception:
         # Return a null logger if setup fails
-        logger = logging.getLogger('MoviePrompterAI')
+        logger = logging.getLogger('SceneWrite')
         if not logger.handlers:
             logger.addHandler(logging.NullHandler())
         return logger

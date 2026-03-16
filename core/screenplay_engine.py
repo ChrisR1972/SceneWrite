@@ -1,5 +1,5 @@
 """
-Core screenplay data models and engine for MoviePrompterAI.
+Core screenplay data models and engine for SceneWrite.
 
 Source-of-truth hierarchy (narrative consistency): (1) Premise, (2) Story Structure
 (scene summaries), (3) Scene Content, (4) Storyboard. Lower layers must not contradict
@@ -13,6 +13,15 @@ from dataclasses import dataclass, field
 import datetime
 from enum import Enum
 import json
+
+
+def _safe_print(*args, **kwargs):
+    """Route output through debug_log instead of stdout (hidden in production)."""
+    try:
+        from debug_log import debug_log as _dl
+        _dl(" ".join(str(a) for a in args))
+    except Exception:
+        pass
 import os
 import uuid
 
@@ -23,6 +32,7 @@ def get_default_story_settings() -> Dict[str, Any]:
     projects saved before story_settings existed.
     """
     return {
+        "generation_platform": "higgsfield",
         "supports_multishot": False,
         "max_generation_duration_seconds": 15,
         "aspect_ratio": "16:9",
@@ -31,9 +41,11 @@ def get_default_story_settings() -> Dict[str, Any]:
         "cinematic_beat_density": "balanced",
         "camera_movement_intensity": "subtle",
         "prompt_output_format": "cinematic_script",
-        "higgsfield_model": "higgsfield-ai/dop/standard",
-        "higgsfield_image_model": "higgsfield-ai/soul/standard",
+        "video_model": "higgsfield-ai/dop/standard",
+        "image_model": "higgsfield-ai/soul/standard",
         "default_focal_length": 35,
+        "platform_config": {},
+        "content_rating": "unrestricted",
         "audio_settings": {
             "dialogue_generation_mode": "generate",
             "sfx_density": "cinematic",
@@ -94,6 +106,7 @@ APERTURE_STYLE_OPTIONS = {
 VISUAL_STYLE_OPTIONS = {
     "photorealistic": "Photorealistic",
     "anime_cartoon": "Anime / Cartoon",
+    "3d_cartoon_pixar": "3D Cartoon",
     "vintage_retro": "Vintage / Retro",
     "film_noir": "Film Noir",
     "watercolor": "Watercolor / Painted",
@@ -108,6 +121,14 @@ VISUAL_STYLE_OPTIONS = {
     "oil_painting": "Oil Painting",
     "vaporwave_synthwave": "Vaporwave / Synthwave",
     "documentary_raw": "Documentary / Raw",
+    "grindhouse_70s": "70s Grindhouse",
+}
+
+CONTENT_RATING_OPTIONS = {
+    "unrestricted": "Unrestricted",
+    "teen": "Teen (PG-13)",
+    "family_friendly": "Family Friendly (PG)",
+    "child_safe": "Child Safe (G)",
 }
 
 FOCAL_LENGTH_RANGE = (8, 50)  # mm — matches Cinema Studio 2.0 optics
@@ -533,6 +554,8 @@ class StoryboardItem:
     camera_motion: str = "static"
     mood_tone: str = ""
     lighting_description: str = ""
+    composition_notes: str = ""  # Blocking: entity positions, facing directions, spatial relationships
+    prompts_generated: bool = False  # True after user clicks "Generate All Prompts"
     metadata: Dict[str, Any] = field(default_factory=dict)
     created_at: str = ""
     updated_at: str = ""
@@ -581,6 +604,8 @@ class StoryboardItem:
             "camera_motion": getattr(self, "camera_motion", "static"),
             "mood_tone": getattr(self, "mood_tone", ""),
             "lighting_description": getattr(self, "lighting_description", ""),
+            "composition_notes": getattr(self, "composition_notes", ""),
+            "prompts_generated": getattr(self, "prompts_generated", False),
             "metadata": self.metadata,
             "created_at": self.created_at,
             "updated_at": self.updated_at
@@ -649,6 +674,10 @@ class StoryboardItem:
             item.mood_tone = data["mood_tone"]
         if "lighting_description" in data:
             item.lighting_description = data["lighting_description"]
+        if "composition_notes" in data:
+            item.composition_notes = data["composition_notes"]
+        if "prompts_generated" in data:
+            item.prompts_generated = bool(data["prompts_generated"])
         return item
 
 class Screenplay:
@@ -659,7 +688,8 @@ class Screenplay:
         self.premise = premise
         self.genre: List[str] = []
         self.atmosphere: str = ""
-        self.story_length: str = "medium"  # micro, short, medium, long (from wizard)
+        self.story_length: str = "medium"  # micro, short, medium, long, custom (from wizard)
+        self.custom_duration_seconds: int = 0  # 0 = not custom; >0 = target total duration in seconds
         self.intent: str = "General Story"  # Story intent (General Story, Advertisement, Social Media, Visual Art)
         self.audio_strategy: str = "generated_with_video"  # "generated_with_video", "added_in_post", "no_audio"
         self.story_settings: Dict[str, Any] = get_default_story_settings()
@@ -684,7 +714,7 @@ class Screenplay:
         self.identity_block_metadata: Dict[str, Dict[str, Any]] = {}
         # Maps entity_id -> {
         #     "name": str,
-        #     "type": str (character/vehicle/object/environment),
+        #     "type": str (character/vehicle/object/environment/group),
         #     "scene_id": str (for per-scene environments),
         #     "status": str ("placeholder", "generating", "approved"),
         #     "user_notes": str (short description from user),
@@ -713,6 +743,9 @@ class Screenplay:
         # Wardrobe variant system
         self.character_wardrobe_variants: Dict[str, List[Dict[str, Any]]] = {}  # entity_id -> list of variant dicts
         self.character_last_wardrobe_variant: Dict[str, str] = {}  # entity_id -> last used variant_id
+        
+        # Episodic series metadata (None for standalone stories)
+        self.series_metadata: Optional[Dict[str, Any]] = None
         
         # Initialize timestamps
         self.created_at = datetime.datetime.now().isoformat()
@@ -892,6 +925,20 @@ class Screenplay:
                 return existing
         return None
     
+    _BUILDING_VENUE_WORDS = frozenset({
+        "club", "bar", "pub", "tavern", "inn", "restaurant", "cafe", "diner",
+        "shop", "store", "market", "mall", "theater", "theatre", "cinema",
+        "church", "temple", "mosque", "cathedral", "chapel", "shrine",
+        "school", "university", "college", "academy", "library", "museum",
+        "hospital", "clinic", "office", "building", "tower", "house", "home",
+        "apartment", "flat", "mansion", "palace", "castle", "fortress", "fort",
+        "hotel", "motel", "hostel", "lodge", "resort", "gym", "arena", "stadium",
+        "park", "garden", "zoo", "gallery", "salon", "studio", "warehouse",
+        "factory", "plant", "station", "garage", "barn", "shed", "bunker",
+        "basement", "attic", "cellar", "lab", "laboratory", "morgue", "prison",
+        "jail", "precinct", "headquarters", "hq", "base", "compound",
+    })
+
     def _is_valid_entity_name(self, entity_name: str, entity_type: str) -> bool:
         """Reject malformed entity names (dialogue blocks, compound text, common words, etc.)."""
         if not entity_name or not isinstance(entity_name, str):
@@ -912,6 +959,12 @@ class Screenplay:
         # Reject overly long names (likely paragraph content, not a single entity)
         if len(n) > 80:
             return False
+        # For vehicles: reject building/venue words that are never vehicles
+        if entity_type == "vehicle":
+            import re
+            core = re.sub(r'^(?:the|a|an)\s+', '', n, flags=re.IGNORECASE).strip().lower()
+            if core in self._BUILDING_VENUE_WORDS:
+                return False
         # For characters: reject if it looks like multiple names/dialogue concatenated
         if entity_type == "character":
             # Pattern like "NAME1\n\"dialogue\"\n\nNAME2" would have been caught by newline/quote
@@ -925,7 +978,7 @@ class Screenplay:
         
         Args:
             entity_name: Name of the entity
-            entity_type: Type (character/vehicle/object/environment)
+            entity_type: Type (character/vehicle/object/environment/group)
             scene_id: Scene ID for environment blocks
             
         Returns:
@@ -983,11 +1036,13 @@ class Screenplay:
                     if ratio > best_ratio:
                         best_ratio = ratio
                         best_id = existing_id
-                    # Full-name matching: if shortened name is first name of existing (e.g. "Victor" vs "Victor Kane")
+                    # Full-name matching: if shortened name is a whole word in existing (e.g. "Victor" vs "Victor Kane")
                     if not best_id or best_ratio < 0.88:
                         first_word = (normalized_name.split() or [""])[0].lower()
                         existing_first = (existing_norm.split() or [""])[0].lower()
-                        if first_word == existing_first or first_word in existing_norm.lower() or existing_first in normalized_name.lower():
+                        existing_words = set(existing_norm.lower().split())
+                        new_words = set(normalized_name.lower().split())
+                        if first_word == existing_first or first_word in existing_words or existing_first in new_words:
                             if len(existing_norm) >= len(normalized_name):
                                 best_ratio = max(best_ratio, 0.90)
                                 best_id = existing_id
@@ -1033,6 +1088,12 @@ class Screenplay:
             # Optional linking/grouping (used by Identity Blocks Merge feature)
             "linked_group_id": "",
             "linked_role": "",
+            # Character alias system: links multiple entity IDs as the same
+            # person under different names (e.g. HOODED FIGURE → TALON → LYRA).
+            # alias_of: entity_id of the canonical identity this is an alias for
+            # aliases: list of entity_ids that are aliases OF this entity
+            "alias_of": "",
+            "aliases": [],
             "created_at": datetime.datetime.now().isoformat(),
             "updated_at": datetime.datetime.now().isoformat()
         }
@@ -1049,6 +1110,14 @@ class Screenplay:
             base_metadata["foreground_zone"] = "clear"
             base_metadata["is_primary_environment"] = True  # Default to primary; user can change
             base_metadata["parent_vehicle"] = ""  # Vehicle name when this is a vehicle interior; must match existing VEHICLE identity
+        # Group-only: collective entity fields (e.g. IMPERIAL SOLDIERS, CITY GUARDS).
+        # Groups share a uniform visual identity but represent multiple individuals.
+        if entity_type == "group":
+            base_metadata["member_count"] = 3
+            base_metadata["member_count_visible"] = 0  # 0 = same as member_count
+            base_metadata["uniform_description"] = ""
+            base_metadata["formation"] = "scattered"  # scattered / line / wedge / cluster / surrounding / flanking
+            base_metadata["individuality"] = "slight_variation"  # identical / slight_variation / distinct
         self.identity_block_metadata[entity_id] = base_metadata
         
         # Register the ID mapping using BOTH the original name and normalized name
@@ -1063,7 +1132,73 @@ class Screenplay:
     
     # Environment extras keys (allowed when updating even if not previously in dict, for backward compat)
     _ENVIRONMENT_EXTRAS_KEYS = frozenset({"extras_present", "extras_density", "extras_activities", "extras_depth", "foreground_zone", "is_primary_environment", "parent_vehicle"})
+    # Group entity keys (member count, formation, individuality, uniform)
+    _GROUP_KEYS = frozenset({"member_count", "member_count_visible", "uniform_description", "formation", "individuality"})
     _ALWAYS_ALLOWED_KEYS = frozenset({"image_path", "reference_image_prompt"})
+    # Alias keys (allowed on any entity type)
+    _ALIAS_KEYS = frozenset({"alias_of", "aliases"})
+
+    # ── Character Alias System ────────────────────────────────────────
+
+    def link_entity_alias(self, alias_entity_id: str, canonical_entity_id: str) -> bool:
+        """Link *alias_entity_id* as an alias of *canonical_entity_id*.
+
+        Both entities keep their own identity blocks (the alias may have a
+        disguise appearance), but the system knows they are the same person.
+        The canonical entity's ``aliases`` list is updated, and the alias
+        entity's ``alias_of`` field is set.
+
+        Returns True on success, False if either ID is unknown.
+        """
+        if alias_entity_id not in self.identity_block_metadata:
+            return False
+        if canonical_entity_id not in self.identity_block_metadata:
+            return False
+        if alias_entity_id == canonical_entity_id:
+            return False
+
+        alias_meta = self.identity_block_metadata[alias_entity_id]
+        canon_meta = self.identity_block_metadata[canonical_entity_id]
+
+        alias_meta["alias_of"] = canonical_entity_id
+        existing = canon_meta.get("aliases") or []
+        if alias_entity_id not in existing:
+            existing.append(alias_entity_id)
+        canon_meta["aliases"] = existing
+
+        self.updated_at = datetime.datetime.now().isoformat()
+        return True
+
+    def unlink_entity_alias(self, alias_entity_id: str) -> bool:
+        """Remove the alias link from *alias_entity_id*."""
+        if alias_entity_id not in self.identity_block_metadata:
+            return False
+        alias_meta = self.identity_block_metadata[alias_entity_id]
+        canon_id = alias_meta.get("alias_of", "")
+        if not canon_id:
+            return False
+        alias_meta["alias_of"] = ""
+        if canon_id in self.identity_block_metadata:
+            canon_meta = self.identity_block_metadata[canon_id]
+            existing = canon_meta.get("aliases") or []
+            canon_meta["aliases"] = [a for a in existing if a != alias_entity_id]
+        self.updated_at = datetime.datetime.now().isoformat()
+        return True
+
+    def get_canonical_entity(self, entity_id: str) -> str:
+        """Return the canonical entity ID for *entity_id*.
+
+        If the entity is an alias, returns the ``alias_of`` target.
+        Otherwise returns *entity_id* itself.
+        """
+        meta = self.identity_block_metadata.get(entity_id, {})
+        canon = meta.get("alias_of", "")
+        return canon if canon and canon in self.identity_block_metadata else entity_id
+
+    def get_all_aliases(self, canonical_entity_id: str) -> List[str]:
+        """Return all alias entity IDs for a canonical entity."""
+        meta = self.identity_block_metadata.get(canonical_entity_id, {})
+        return list(meta.get("aliases") or [])
 
     def update_identity_block_metadata(self, entity_id: str, **kwargs) -> None:
         """Update identity block metadata fields.
@@ -1076,7 +1211,7 @@ class Screenplay:
             return
         meta = self.identity_block_metadata[entity_id]
         for key, value in kwargs.items():
-            if key in meta or key in self._ALWAYS_ALLOWED_KEYS or (meta.get("type") == "environment" and key in self._ENVIRONMENT_EXTRAS_KEYS):
+            if key in meta or key in self._ALWAYS_ALLOWED_KEYS or key in self._ALIAS_KEYS or (meta.get("type") == "environment" and key in self._ENVIRONMENT_EXTRAS_KEYS) or (meta.get("type") == "group" and key in self._GROUP_KEYS):
                 meta[key] = value if (key != "parent_vehicle") else (str(value).strip() if value else "")
         meta["updated_at"] = datetime.datetime.now().isoformat()
         
@@ -1087,15 +1222,15 @@ class Screenplay:
         self.updated_at = datetime.datetime.now().isoformat()
     
     def get_pending_identity_blocks(self) -> List[Dict[str, Any]]:
-        """Get all identity blocks that need user review (status != 'approved').
+        """Get all identity blocks that need user review (status not approved/passive).
         
         Returns:
             List of identity block metadata dicts with entity_id included
         """
         pending = []
         for entity_id, metadata in self.identity_block_metadata.items():
-            if metadata.get("status") != "approved":
-                # Include entity_id in the returned dict
+            status = metadata.get("status", "")
+            if status not in ("approved", "passive", "referenced"):
                 block_data = metadata.copy()
                 block_data["entity_id"] = entity_id
                 pending.append(block_data)
@@ -1114,7 +1249,17 @@ class Screenplay:
                 block_data["entity_id"] = entity_id
                 approved.append(block_data)
         return approved
-    
+
+    def get_passive_entity_names(self) -> List[str]:
+        """Return names of all entities marked as passive (name-only, no identity block)."""
+        names: List[str] = []
+        for _entity_id, metadata in self.identity_block_metadata.items():
+            if metadata.get("status") == "passive":
+                name = (metadata.get("name") or "").strip()
+                if name:
+                    names.append(name)
+        return names
+
     def get_identity_blocks_for_scene(self, scene_id: str) -> Dict[str, List[str]]:
         """Get environment and entity identity blocks for a specific scene.
         
@@ -1170,6 +1315,10 @@ class Screenplay:
     
     def get_character_wardrobe_for_scene(self, scene_id: str, entity_id: str) -> str:
         """Get wardrobe description for a character in a specific scene.
+
+        Falls back to the wardrobe variant description when the scene's
+        ``character_wardrobe`` dict is missing an entry but a variant ID is
+        recorded for this scene.
         
         Args:
             scene_id: The scene ID
@@ -1182,7 +1331,19 @@ class Screenplay:
         if not scene:
             return ""
         wardrobe = getattr(scene, "character_wardrobe", None) or {}
-        return wardrobe.get(entity_id, "")
+        desc = wardrobe.get(entity_id, "")
+        if desc:
+            return desc
+
+        # Fallback: resolve via the variant ID stored on this scene
+        variant_ids = getattr(scene, "character_wardrobe_variant_ids", None) or {}
+        vid = variant_ids.get(entity_id)
+        if vid:
+            variants = getattr(self, "character_wardrobe_variants", {}).get(entity_id, [])
+            for v in variants:
+                if v.get("variant_id") == vid:
+                    return v.get("description", "")
+        return ""
     
     def set_character_wardrobe_for_scene(self, scene_id: str, entity_id: str, wardrobe: str) -> None:
         """Set wardrobe description for a character in a specific scene.
@@ -1272,6 +1433,312 @@ class Screenplay:
                     issues.append(f"ENVIRONMENT '{name}' has parent_vehicle '{parent}' but no VEHICLE identity named '{parent}' exists")
         return (len(issues) == 0, issues)
 
+    def validate_outline_entity_names(self) -> List[str]:
+        """Compare entity names referenced in ``story_outline`` (main_storyline,
+        conclusion) against the actual identity block registry.
+
+        Returns a list of human-readable warnings for mismatches — e.g. the
+        outline says ``{The Wayfarer}`` but all scenes use ``{Stormchaser}``.
+        """
+        import re as _re
+        warnings: List[str] = []
+        outline = getattr(self, "story_outline", None) or {}
+        if not isinstance(outline, dict):
+            return warnings
+
+        text_fields = [
+            ("main_storyline", outline.get("main_storyline", "")),
+            ("conclusion", outline.get("conclusion", "")),
+        ]
+        for subplot in outline.get("subplots", []) or []:
+            if isinstance(subplot, dict):
+                text_fields.append(("subplot", subplot.get("description", "")))
+            elif isinstance(subplot, str):
+                text_fields.append(("subplot", subplot))
+
+        # Collect all known entity names by type
+        known: Dict[str, set] = {"vehicle": set(), "environment": set(), "object": set()}
+        for _eid, m in self.identity_block_metadata.items():
+            etype = (m.get("type") or "").lower()
+            ename = (m.get("name") or "").strip().lower()
+            if etype in known and ename:
+                known[etype].add(ename)
+
+        for field_label, text in text_fields:
+            if not text:
+                continue
+            # {vehicle names}
+            for m in _re.finditer(r'\{+([^{}]+)\}+', text):
+                vname = m.group(1).strip().lower()
+                if vname and vname not in known["vehicle"]:
+                    closest = self._find_closest_entity_name(vname, known["vehicle"])
+                    hint = f" (did you mean '{closest}'?)" if closest else ""
+                    warnings.append(
+                        f"Outline {field_label} references vehicle '{m.group(1).strip()}' "
+                        f"but no VEHICLE identity block matches{hint}"
+                    )
+            # _environment names_
+            for m in _re.finditer(r'(?<!\w)_([^_]+)_(?!\w)', text):
+                ename = m.group(1).strip().lower()
+                if ename and ename not in known["environment"]:
+                    closest = self._find_closest_entity_name(ename, known["environment"])
+                    hint = f" (did you mean '{closest}'?)" if closest else ""
+                    warnings.append(
+                        f"Outline {field_label} references environment '{m.group(1).strip()}' "
+                        f"but no ENVIRONMENT identity block matches{hint}"
+                    )
+
+        return warnings
+
+    @staticmethod
+    def _find_closest_entity_name(target: str, candidates: set) -> str:
+        """Return the candidate with the highest word-overlap to *target*, or ''."""
+        if not candidates:
+            return ""
+        target_words = set(target.lower().split())
+        best, best_score = "", 0
+        for c in candidates:
+            score = len(target_words & set(c.lower().split()))
+            if score > best_score:
+                best, best_score = c, score
+        return best.title() if best_score > 0 else ""
+
+    def validate_environment_name_content(self) -> List[str]:
+        """Detect environments whose name doesn't match their identity block text.
+
+        For example, an environment named 'Cockpit' whose block describes a
+        'stone observatory atop the Shattered Spire'.  Returns warnings.
+        """
+        import re as _re
+        warnings: List[str] = []
+        for eid, m in self.identity_block_metadata.items():
+            if (m.get("type") or "").lower() != "environment":
+                continue
+            name = (m.get("name") or "").strip()
+            block_text = (self.identity_blocks.get(eid, "") or "").lower()
+            if not name or not block_text or len(block_text) < 40:
+                continue
+            # Check if any significant word from the name appears in the block
+            name_words = [w for w in name.lower().split() if len(w) > 3
+                          and w not in ("the", "with", "from", "this", "that", "same")]
+            if not name_words:
+                continue
+            hits = sum(1 for w in name_words if w in block_text)
+            if hits == 0:
+                warnings.append(
+                    f"ENVIRONMENT '{name}' ({eid}): name doesn't appear in its "
+                    f"identity block text — possible mismatch"
+                )
+        return warnings
+
+    def detect_unused_placeholder_entities(self) -> List[str]:
+        """Find identity blocks that are still 'placeholder' status and have
+        no scene content reference.  These are likely orphans from story
+        generation that were created but never used.
+
+        Returns a list of human-readable descriptions.
+        """
+        all_scenes = self.get_all_scenes()
+        # Build a set of entity names mentioned across all scene content
+        all_content = ""
+        for scene in all_scenes:
+            all_content += " " + (getattr(scene, "description", "") or "")
+            meta = getattr(scene, "metadata", None) or {}
+            all_content += " " + (meta.get("generated_content", "") or "")
+        all_content_upper = all_content.upper()
+
+        unused: List[str] = []
+        for eid, m in self.identity_block_metadata.items():
+            status = (m.get("status") or "").lower()
+            if status not in ("placeholder",):
+                continue
+            ename = (m.get("name") or "").strip()
+            etype = (m.get("type") or "").lower()
+            if not ename:
+                continue
+            # Check if this entity appears in any scene content
+            if ename.upper() not in all_content_upper:
+                unused.append(
+                    f"{etype.upper()} '{ename}' ({eid}) is placeholder and "
+                    f"not referenced in any scene content"
+                )
+        return unused
+
+    # Generic set-dressing objects that don't need their own identity blocks
+    # even when they recur across scenes (they're part of the environment).
+    _GENERIC_SET_DRESSING: frozenset = frozenset({
+        "door", "doors", "table", "tables", "chair", "chairs", "wall", "walls",
+        "floor", "floors", "ceiling", "window", "windows", "staircase", "stairs",
+        "steps", "railing", "railings", "bench", "benches", "shelf", "shelves",
+        "lamp", "lamps", "lantern", "lanterns", "torch", "torches", "candle",
+        "candles", "rug", "rugs", "carpet", "curtain", "curtains", "drape",
+        "drapes", "pillar", "pillars", "column", "columns", "beam", "beams",
+        "fence", "gate", "archway", "corridor", "hallway", "passage",
+        "bed", "cot", "mattress", "blanket", "pillow", "barrel", "barrels",
+        "crate", "crates", "box", "boxes", "bucket", "rope", "ladder",
+        "sign", "banner", "flag", "rock", "rocks", "boulder", "tree", "trees",
+        "bush", "bushes", "grass", "vine", "vines", "path", "trail",
+    })
+
+    def detect_recurring_objects_needing_identity(self) -> List[str]:
+        """Find [bracketed] objects that appear across multiple scenes but lack
+        an identity block.  These recurring props need dedicated identity blocks
+        so they look visually consistent across scenes.
+
+        Returns a list of human-readable warning strings sorted by scene count
+        (most recurring first).
+        """
+        import re as _re
+
+        all_scenes = self.get_all_scenes()
+        _safe_print(f"  [recurring-objects] Scanning {len(all_scenes)} scene(s)...")
+        if len(all_scenes) < 2:
+            _safe_print("  [recurring-objects] < 2 scenes — skipping")
+            return []
+
+        # Map: normalised object name → set of (scene_id, scene_title)
+        object_scenes: Dict[str, set] = {}
+        # Keep the original casing for display
+        object_display_name: Dict[str, str] = {}
+
+        scenes_with_content = 0
+        for scene in all_scenes:
+            meta = getattr(scene, "metadata", None) or {}
+            # Combine generated content AND scene description to catch objects
+            # mentioned in the story outline even before content is generated
+            parts = []
+            gc = meta.get("generated_content", "") or ""
+            if gc:
+                parts.append(gc)
+            desc = getattr(scene, "description", "") or ""
+            if desc:
+                parts.append(desc)
+            content = " ".join(parts)
+            if not content.strip():
+                continue
+            scenes_with_content += 1
+
+            # Extract all [bracketed] names from this scene
+            for m in _re.finditer(r'\[([^\]\[]+)\]', content):
+                raw = m.group(1).strip()
+                if not raw or len(raw) < 2:
+                    continue
+                # Skip paragraph numbers like [1], [2]
+                if _re.match(r'^\d+$', raw):
+                    continue
+                key = raw.lower()
+                # Skip generic set dressing
+                if key in self._GENERIC_SET_DRESSING:
+                    continue
+                if key not in object_scenes:
+                    object_scenes[key] = set()
+                    object_display_name[key] = raw
+                object_scenes[key].add((scene.scene_id, scene.title or f"Scene {scene.scene_number}"))
+
+        _safe_print(f"  [recurring-objects] {scenes_with_content} scene(s) have content, found {len(object_scenes)} unique object(s)")
+
+        # Filter to objects appearing in 2+ scenes
+        recurring = {k: v for k, v in object_scenes.items() if len(v) >= 2}
+        if recurring:
+            _safe_print(f"  [recurring-objects] {len(recurring)} object(s) appear in 2+ scenes: {list(recurring.keys())[:10]}")
+        else:
+            _safe_print(f"  [recurring-objects] No objects appear in 2+ scenes")
+            # Also list all objects and their scene counts for debugging
+            if object_scenes:
+                for k, v in sorted(object_scenes.items(), key=lambda x: -len(x[1]))[:10]:
+                    _safe_print(f"    [{object_display_name[k]}] → {len(v)} scene(s)")
+            return []
+
+        # Check which recurring objects need attention
+        warnings: List[str] = []
+        for key, scene_set in sorted(recurring.items(), key=lambda x: -len(x[1])):
+            display = object_display_name[key]
+
+            # Look up the object's identity block status (if any)
+            obj_status = ""
+            obj_has_content = False
+            name_lower = display.strip().lower()
+            lookup_id = self.identity_block_ids.get(f"object:{name_lower}")
+            if not lookup_id:
+                for eid, m in self.identity_block_metadata.items():
+                    if (m.get("type") or "").lower() == "object" and (m.get("name") or "").strip().lower() == name_lower:
+                        lookup_id = eid
+                        break
+            if lookup_id:
+                obj_meta = self.identity_block_metadata.get(lookup_id, {})
+                obj_status = (obj_meta.get("status") or "").lower()
+                obj_has_content = bool((self.identity_blocks.get(lookup_id) or "").strip())
+
+            # Skip objects with approved/generated identity blocks that have real content
+            if obj_status in ("approved", "generated") and obj_has_content:
+                continue
+
+            # Check if this object is baked into an environment identity block
+            baked_env_id = None
+            for eid, meta in self.identity_block_metadata.items():
+                if (meta.get("type") or "").lower() != "environment":
+                    continue
+                env_text = (
+                    (self.identity_blocks.get(eid) or "")
+                    + " " + (meta.get("user_notes") or "")
+                ).lower()
+                if key in env_text:
+                    baked_env_id = eid
+                    break
+
+            # Determine which environments the object appears in
+            env_ids = set()
+            scenes_without_env = 0
+            for sid, _ in scene_set:
+                for s in all_scenes:
+                    if s.scene_id == sid:
+                        if s.environment_id:
+                            env_ids.add(s.environment_id)
+                        else:
+                            scenes_without_env += 1
+                        break
+
+            scene_names = sorted(title for _, title in scene_set)
+            scene_list = ", ".join(scene_names[:5])
+            if len(scene_names) > 5:
+                scene_list += f" (+{len(scene_names) - 5} more)"
+
+            count = len(scene_set)
+
+            # Only suppress baked-in objects if ALL scenes share the same
+            # environment and that environment is the one the object is baked into.
+            # Scenes without an assigned environment are treated as unknown
+            # (the object may travel there).
+            all_same_baked_env = (
+                baked_env_id
+                and len(env_ids) == 1
+                and baked_env_id in env_ids
+                and scenes_without_env == 0
+            )
+            if all_same_baked_env:
+                continue
+
+            if len(env_ids) > 1 or (env_ids and scenes_without_env > 0):
+                priority = "HIGH"
+                reason = "travels across different environments"
+            elif scenes_without_env > 0:
+                priority = "HIGH"
+                reason = "appears in multiple scenes (environments not yet assigned)"
+            else:
+                priority = "MEDIUM"
+                reason = "recurs in same environment"
+
+            has_block_note = ""
+            if lookup_id and obj_status == "placeholder":
+                has_block_note = " (has placeholder — generate identity)"
+
+            warnings.append(
+                f"[{priority}] [{display}] appears in {count} scenes "
+                f"({scene_list}) — {reason}.{has_block_note}"
+            )
+
+        return warnings
+
     def get_identity_block_metadata_by_id(self, entity_id: str) -> Optional[Dict[str, Any]]:
         """Get identity block metadata by entity ID.
         
@@ -1312,9 +1779,9 @@ class Screenplay:
     def get_entity_ids_for_scene(self, scene: 'StoryScene') -> set:
         """Return the set of entity IDs that belong to a given scene.
 
-        Characters are matched *only* through authoritative scene-level
-        links (wardrobe, wardrobe_variant_ids, image_assignments) — never
-        through ``metadata["scene_id"]`` which can be set on wizard
+        Characters are matched through authoritative scene-level links
+        (character_focus, wardrobe, wardrobe_variant_ids, image_assignments)
+        — never through ``metadata["scene_id"]`` which can be set on wizard
         characters that aren't actually present in the scene.
 
         Environments, objects, and vehicles use ``metadata["scene_id"]``
@@ -1330,6 +1797,20 @@ class Screenplay:
             ids.add(eid)
         for eid in getattr(scene, "character_wardrobe_variant_ids", {}):
             ids.add(eid)
+
+        # Characters listed in character_focus (populated during story creation)
+        for char_name in getattr(scene, "character_focus", []) or []:
+            stripped = char_name.strip()
+            if not stripped:
+                continue
+            lookup = f"character:{stripped}".lower()
+            eid = self.identity_block_ids.get(lookup)
+            if not eid and getattr(self, "character_registry_frozen", False):
+                canonical = self.resolve_character_to_canonical(stripped)
+                if canonical:
+                    eid = self.identity_block_ids.get(f"character:{canonical}".lower())
+            if eid:
+                ids.add(eid)
 
         # Environment assigned to the scene
         env_id = getattr(scene, "environment_id", None)
@@ -1376,6 +1857,94 @@ class Screenplay:
                     ids.add(eid)
 
         return ids
+
+    def auto_populate_image_assignments(self, scene: 'StoryScene') -> int:
+        """Auto-fill ``image_assignments`` on every storyboard item in *scene*.
+
+        Uses the same priority logic as the UI editor:
+          1. Characters/entities named in the item's text
+          2. Characters in the scene's ``character_focus``
+          3. Scene-level objects/vehicles mentioned anywhere in the scene
+
+        Returns the number of items that received assignments.
+        """
+        meta = self.identity_block_metadata or {}
+        scene_entity_ids = self.get_entity_ids_for_scene(scene)
+
+        scene_char_focus: set = set()
+        for name in getattr(scene, "character_focus", []) or []:
+            stripped = name.strip()
+            if stripped:
+                scene_char_focus.add(stripped.upper())
+
+        scene_text_upper = ""
+        parts = []
+        for si in getattr(scene, "storyboard_items", []):
+            parts.append(getattr(si, "storyline", "") or "")
+            parts.append(getattr(si, "image_prompt", "") or "")
+            parts.append(getattr(si, "visual_description", "") or "")
+        parts.append(getattr(scene, "description", "") or "")
+        scene_meta = getattr(scene, "metadata", None) or {}
+        parts.append(scene_meta.get("generated_content", "") or "")
+        scene_text_upper = " ".join(parts).upper()
+
+        count = 0
+        for item in getattr(scene, "storyboard_items", []):
+            if getattr(item, "image_assignments", None):
+                continue
+            item_text = " ".join([
+                getattr(item, "storyline", "") or "",
+                getattr(item, "image_prompt", "") or "",
+                getattr(item, "prompt", "") or "",
+                getattr(item, "visual_description", "") or "",
+                getattr(item, "dialogue", "") or "",
+            ]).upper()
+
+            tier1, tier2, tier3 = [], [], []
+            for eid, m in meta.items():
+                if scene_entity_ids and eid not in scene_entity_ids:
+                    continue
+                etype = (m.get("type") or "").lower()
+                status = m.get("status", "")
+                if etype not in ("character", "object", "vehicle", "group"):
+                    continue
+                if status == "passive":
+                    continue
+                img = (m.get("image_path") or "").strip()
+                if not img:
+                    continue
+                ename = (m.get("name") or "").strip()
+                entry = {
+                    "path": img,
+                    "entity_id": eid,
+                    "entity_name": ename,
+                    "entity_type": etype,
+                }
+                if ename and ename.upper() in item_text:
+                    tier1.append(entry)
+                elif etype in ("character", "group") and ename.upper() in scene_char_focus:
+                    tier2.append(entry)
+                elif etype in ("object", "vehicle") and ename and ename.upper() in scene_text_upper:
+                    tier3.append(entry)
+
+            ranked = tier1 + tier2 + tier3
+            slots = ("image_1", "image_2", "image_3")
+            assignments = {}
+            for i, entry in enumerate(ranked[:len(slots)]):
+                assignments[slots[i]] = entry
+            if assignments:
+                item.image_assignments = assignments
+                count += 1
+
+            # Environment start image
+            if not (getattr(item, "environment_start_image", "") or "").strip():
+                env_id = getattr(scene, "environment_id", None)
+                if env_id and env_id in meta:
+                    env_path = (meta[env_id].get("image_path") or "").strip()
+                    if env_path:
+                        item.environment_start_image = env_path
+
+        return count
 
     def get_all_scenes(self) -> List[StoryScene]:
         """Get all scenes from all acts in order."""
@@ -1479,6 +2048,14 @@ class Screenplay:
             "character_last_wardrobe_variant": getattr(self, "character_last_wardrobe_variant", {}),
         }
         
+        # Only write series_metadata when present (backward compatible)
+        if getattr(self, "series_metadata", None):
+            result["series_metadata"] = self.series_metadata
+        
+        # Only write custom_duration_seconds when active (backward compatible)
+        if getattr(self, "custom_duration_seconds", 0) > 0:
+            result["custom_duration_seconds"] = self.custom_duration_seconds
+        
         # New structure
         if self.acts:
             result["acts"] = [act.to_dict() for act in self.acts]
@@ -1502,6 +2079,7 @@ class Screenplay:
         screenplay.genre = data.get("genre", [])
         screenplay.atmosphere = data.get("atmosphere", "")
         screenplay.story_length = data.get("story_length", "medium")
+        screenplay.custom_duration_seconds = data.get("custom_duration_seconds", 0)
         _LEGACY_INTENT_MAP = {
             "Horror Short": "General Story",
             "Trailer / Teaser": "General Story",
@@ -1523,22 +2101,37 @@ class Screenplay:
         screenplay.identity_blocks = data.get("identity_blocks", {})
         screenplay.identity_block_ids = data.get("identity_block_ids", {})
         screenplay.identity_block_metadata = data.get("identity_block_metadata", {})
-        # Backward-compat: ensure all entities have image_path and reference_image_prompt keys
+        # Backward-compat: ensure all entities have required keys
         for _eid, _meta in screenplay.identity_block_metadata.items():
             if "image_path" not in _meta:
                 _meta["image_path"] = ""
             if "reference_image_prompt" not in _meta:
                 _meta["reference_image_prompt"] = ""
+            if "alias_of" not in _meta:
+                _meta["alias_of"] = ""
+            if "aliases" not in _meta:
+                _meta["aliases"] = []
         screenplay.character_registry = data.get("character_registry", [])
         screenplay.character_registry_frozen = data.get("character_registry_frozen", False)
         # Load story settings with backward-compatible merge
-        saved_ss = data.get("story_settings", {})
+        saved_ss = data.get("story_settings") or {}
         defaults_ss = get_default_story_settings()
         defaults_ss.update(saved_ss)
         if "audio_settings" in saved_ss:
             merged_audio = get_default_story_settings()["audio_settings"]
             merged_audio.update(saved_ss["audio_settings"])
             defaults_ss["audio_settings"] = merged_audio
+        # Backward compat: migrate old higgsfield_model / higgsfield_image_model keys
+        if "higgsfield_model" in defaults_ss and "video_model" not in saved_ss:
+            defaults_ss["video_model"] = defaults_ss.pop("higgsfield_model")
+        elif "higgsfield_model" in defaults_ss:
+            defaults_ss.pop("higgsfield_model", None)
+        if "higgsfield_image_model" in defaults_ss and "image_model" not in saved_ss:
+            defaults_ss["image_model"] = defaults_ss.pop("higgsfield_image_model")
+        elif "higgsfield_image_model" in defaults_ss:
+            defaults_ss.pop("higgsfield_image_model", None)
+        defaults_ss.setdefault("generation_platform", "higgsfield")
+        defaults_ss.setdefault("platform_config", {})
         screenplay.story_settings = defaults_ss
         # Backward-compat: normalize characters to list and infer species
         if screenplay.story_outline and isinstance(screenplay.story_outline, dict):
@@ -1569,12 +2162,15 @@ class Screenplay:
                     if "character_arc" in ch and "growth_arc" not in ch:
                         ch["growth_arc"] = ch.pop("character_arc", "")
                     ch.setdefault("physical_appearance", "")
+                    has_explicit_species = "species" in ch
                     ch.setdefault("species", "Human")
                     if "role" in ch and ch["role"] in ("Main Character", "Supporting Character"):
                         ch["role"] = "main" if ch["role"] == "Main Character" else "minor"
                     raw_sp = str(ch.get("species", "") or "").strip()
                     if raw_sp and raw_sp != "Human":
                         ch["species"] = normalize_species_label(raw_sp)
+                        continue
+                    if has_explicit_species:
                         continue
                     char_name = str(ch.get("name", "")).strip()
                     char_ctx = ""
@@ -1602,6 +2198,8 @@ class Screenplay:
         # Wardrobe variant system
         screenplay.character_wardrobe_variants = data.get("character_wardrobe_variants", {})
         screenplay.character_last_wardrobe_variant = data.get("character_last_wardrobe_variant", {})
+        # Episodic series metadata (None for standalone stories)
+        screenplay.series_metadata = data.get("series_metadata", None)
         # Load brand context if present
         brand_context_data = data.get("brand_context")
         if brand_context_data:

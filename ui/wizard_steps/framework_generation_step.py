@@ -91,7 +91,7 @@ class FrameworkGenerationStepWidget(QWidget):
         
         layout.addStretch()
     
-    def start_generation(self, premise: str, title: str, genres: List[str], atmosphere: str, story_outline: Dict[str, Any], length: str = "medium", intent: str = "General Story", brand_context=None):
+    def start_generation(self, premise: str, title: str, genres: List[str], atmosphere: str, story_outline: Dict[str, Any], length: str = "medium", intent: str = "General Story", brand_context=None, series_bible=None, custom_duration_seconds: int = 0):
         """Start framework generation."""
         if not self.ai_generator:
             QMessageBox.warning(self, "AI Not Available", "AI generator is not configured.")
@@ -104,19 +104,22 @@ class FrameworkGenerationStepWidget(QWidget):
         self.premise_meta_label.setText(f"Title: {safe_title} | Genres: {safe_genres} | Atmosphere: {safe_atmosphere}")
         self.premise_text.setPlainText(premise.strip() if premise else "")
         
-        # Use the user-selected length (micro, short, medium, or long)
         # Validate length
-        if length not in ["micro", "short", "medium", "long"]:
-            length = "medium"  # Default to medium if invalid
+        if length not in ["micro", "short", "medium", "long", "custom"]:
+            length = "medium"
         
         # Display length info
         length_descriptions = {
             "micro": "Micro (1 act, 1-5 scenes)",
             "short": "Short (3 acts, 9-15 scenes)",
             "medium": "Medium (3 acts, 15-24 scenes)",
-            "long": "Long (5 acts, 30-50 scenes)"
+            "long": "Long (5 acts, 30-50 scenes)",
         }
-        length_desc = length_descriptions.get(length, "Medium (3 acts, 15-24 scenes)")
+        if length == "custom" and custom_duration_seconds > 0:
+            mins, secs = divmod(custom_duration_seconds, 60)
+            length_desc = f"Custom ({mins}m {secs}s)"
+        else:
+            length_desc = length_descriptions.get(length, "Medium (3 acts, 15-24 scenes)")
         self.status_label.setText(f"Generating framework ({length_desc})...")
         
         # Show progress dialog
@@ -139,7 +142,9 @@ class FrameworkGenerationStepWidget(QWidget):
         
         # Create and start generation thread
         self.framework_thread = FrameworkGenerationThread(
-            self.ai_generator, premise, title, length, atmosphere, genres, story_outline, intent, brand_context
+            self.ai_generator, premise, title, length, atmosphere, genres,
+            story_outline, intent, brand_context, series_bible=series_bible,
+            custom_duration_seconds=custom_duration_seconds,
         )
         self.framework_thread.finished.connect(self.on_framework_generated)
         self.framework_thread.error.connect(self.on_framework_error)

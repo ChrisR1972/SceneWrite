@@ -1,12 +1,18 @@
 """
-Configuration management for MoviePrompterAI.
+Configuration management for SceneWrite.
 Handles API keys, model settings, and user preferences.
 """
 
 import os
 import json
+import shutil
 import sys
 from typing import Optional, Dict, Any
+
+APP_VERSION = "1.0.0"
+UPDATE_URL = "https://scenewrite.app/updates/latest.json"
+# License API — use workers.dev URL for testing, switch to api.scenewrite.app for production
+LICENSE_API_BASE = "https://api.scenewrite.app"
 
 # Try to import keyring, but make it optional
 try:
@@ -25,27 +31,72 @@ def get_app_directory():
         return os.path.dirname(os.path.abspath(__file__))
 
 
+def get_config_directory() -> str:
+    """Return the user-writable directory for config files.
+
+    Uses ``%APPDATA%/SceneWrite`` on Windows, ``~/.config/SceneWrite``
+    on Linux/macOS.  The folder is created automatically if it does
+    not already exist.  Storing config here means settings survive
+    application reinstalls and updates.
+    """
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA", os.path.expanduser("~"))
+    elif sys.platform == "darwin":
+        base = os.path.join(os.path.expanduser("~"), "Library", "Application Support")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME", os.path.join(os.path.expanduser("~"), ".config"))
+    config_dir = os.path.join(base, "SceneWrite")
+    os.makedirs(config_dir, exist_ok=True)
+    return config_dir
+
+
+def _migrate_config_to_appdata():
+    """One-time migration: copy config.json from the install directory to AppData.
+
+    If config.json exists next to the executable but NOT yet in AppData,
+    copy it over so the user's API keys, model settings, and preferences
+    are preserved after an update.  The old file is left in place (harmless)
+    so a rollback to an older version still works.
+    """
+    appdata_dir = get_config_directory()
+    new_path = os.path.join(appdata_dir, "config.json")
+    if os.path.exists(new_path):
+        return  # Already migrated or user has a config in AppData
+
+    old_path = os.path.join(get_app_directory(), "config.json")
+    if os.path.exists(old_path):
+        try:
+            shutil.copy2(old_path, new_path)
+        except Exception:
+            pass  # Non-fatal — will start with defaults
+
+
 def get_stories_directory() -> str:
     """Return the default directory for saving/opening stories.
 
-    Uses ``~/Documents/MoviePrompterAI Stories``.  The folder is created
+    Uses ``~/Documents/SceneWrite Stories``.  The folder is created
     automatically if it does not already exist.
     """
     docs = os.path.join(os.path.expanduser("~"), "Documents")
-    stories_dir = os.path.join(docs, "MoviePrompterAI Stories")
+    stories_dir = os.path.join(docs, "SceneWrite Stories")
     os.makedirs(stories_dir, exist_ok=True)
     return stories_dir
+
+
+# Run migration before Config is instantiated
+_migrate_config_to_appdata()
+
 
 class Config:
     """Configuration manager for the application."""
     
     def __init__(self):
-        self.app_name = "MoviePrompterAI"
+        self.app_name = "SceneWrite"
         self.service_name = "OpenAI"
         
-        # Get the app directory and set config file path
-        app_dir = get_app_directory()
-        self.config_file = os.path.join(app_dir, "config.json")
+        # Store config in user AppData so it survives reinstalls/updates
+        config_dir = get_config_directory()
+        self.config_file = os.path.join(config_dir, "config.json")
         
         # Load config file first
         self._config_data = self._load_config()
@@ -247,6 +298,55 @@ class Config:
         self._config_data["custom_species"] = [
             s for s in existing if s.lower() != species.strip().lower()
         ]
+        self._save_config()
+
+    # -- Platform API keys ---------------------------------------------------
+
+    PLATFORM_CONFIG_KEYS = {
+        "higgsfield": "higgsfield_api",
+        "runway": "runway_api",
+        "sora": "openai_api",
+        "kling": "kling_api",
+        "luma": "luma_api",
+        "veo": "google_api",
+        "pika": "pika_api",
+        "minimax": "minimax_api",
+    }
+
+    def get_platform_api_key(self, platform_id: str) -> str:
+        """Return the stored API key for *platform_id*."""
+        config_key = self.PLATFORM_CONFIG_KEYS.get(platform_id, platform_id)
+        data = self._config_data.get(config_key, {})
+        if isinstance(data, dict):
+            return data.get("api_key", "")
+        return ""
+
+    def set_platform_api_key(self, platform_id: str, api_key: str):
+        """Persist the API key for *platform_id*."""
+        config_key = self.PLATFORM_CONFIG_KEYS.get(platform_id, platform_id)
+        existing = self._config_data.get(config_key, {})
+        if not isinstance(existing, dict):
+            existing = {}
+        existing["api_key"] = api_key
+        self._config_data[config_key] = existing
+        self._save_config()
+
+    def get_platform_api_secret(self, platform_id: str) -> str:
+        """Return the stored API key secret (Higgsfield only)."""
+        config_key = self.PLATFORM_CONFIG_KEYS.get(platform_id, platform_id)
+        data = self._config_data.get(config_key, {})
+        if isinstance(data, dict):
+            return data.get("api_key_secret", "")
+        return ""
+
+    def set_platform_api_secret(self, platform_id: str, secret: str):
+        """Persist the API key secret for *platform_id*."""
+        config_key = self.PLATFORM_CONFIG_KEYS.get(platform_id, platform_id)
+        existing = self._config_data.get(config_key, {})
+        if not isinstance(existing, dict):
+            existing = {}
+        existing["api_key_secret"] = secret
+        self._config_data[config_key] = existing
         self._save_config()
 
     # -- Recent files --------------------------------------------------------

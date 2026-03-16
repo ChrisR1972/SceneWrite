@@ -1,5 +1,5 @@
 """
-Storyboard Validator for MoviePrompterAI.
+Storyboard Validator for SceneWrite.
 
 Deterministic, rule-based validation of storyboard items against their source
 paragraphs.  Pure functions only — no AI calls.
@@ -24,9 +24,12 @@ from core.action_rules import get_effective_action_whitelist
 # ---------------------------------------------------------------------------
 
 # FULL CAPS names — supports apostrophes (O'MALLEY) and honorifics (MRS., DR.)
+# _ARTICLE_BRIDGE allows lowercase articles (the, a, an, of, de, la, le, von, van)
+# between CAPS words so "ACORN the INVINCIBLE" is captured as one name.
 _HONORIFIC = r"(?:(?:MRS?|MS|DR|MME|PROF|SGT|CPT|LT|GEN|COL|REV|CMDR|CAPT)\.\s+)?"
 _NAME_WORD_V = r"[A-Z](?:[A-Z']+|'[A-Z]+)"
-CHARACTER_PATTERN = re.compile(rf"\b({_HONORIFIC}{_NAME_WORD_V}(?:\s+{_NAME_WORD_V})*)\b")
+_ARTICLE_BRIDGE = r"(?:(?i:the|an?|of|de|la|le|von|van)\s+)*"
+CHARACTER_PATTERN = re.compile(rf"\b({_HONORIFIC}{_NAME_WORD_V}(?:\s+{_ARTICLE_BRIDGE}{_NAME_WORD_V})*)\b")
 
 # [object]
 OBJECT_PATTERN = re.compile(r'\[([^\]]+)\]')
@@ -68,6 +71,7 @@ class EntitySet(NamedTuple):
     objects: Set[str]
     vehicles: Set[str]
     environments: Set[str]
+    groups: Set[str] = set()
 
 
 class EntityMismatch(NamedTuple):
@@ -105,10 +109,14 @@ def _normalize_name(name: str) -> str:
     - Strip leading/trailing whitespace and collapse internal whitespace.
     - Remove identity block ID tags, e.g. "(VEHICLE_41D1)", that the
       storyboard generator injects inside markup like {Smart Electric Bike (VEHICLE_41D1)}.
+    - Strip stray brackets left over from nested markup, e.g.
+      [leather [briefcase] ...] captures "leather [briefcase" — the inner
+      bracket is not part of the actual entity name.
     - Strip trailing apostrophes left over from possessives (THE RIDER's),
       where the regex captures "THE RIDER'" but not the lowercase "s".
     """
     name = _IDENTITY_ID_TAG.sub("", name)
+    name = name.replace("[", "").replace("]", "")
     name = " ".join(name.split()).strip()
     name = name.rstrip("'")
     return name
@@ -149,9 +157,12 @@ def extract_entities(text: str, screenplay=None) -> EntitySet:
     vehicles = {_normalize_name(m) for m in VEHICLE_PATTERN.findall(text)}
     environments = {_normalize_name(m) for m in ENV_PATTERN.findall(text)}
 
-    # Characters — FULL CAPS words, filtered for stopwords
-    raw_chars = {_normalize_name(m) for m in CHARACTER_PATTERN.findall(text)}
+    # Characters — FULL CAPS words, filtered for stopwords.
+    # .upper() normalises names captured with lowercase articles (e.g. "ACORN the INVINCIBLE").
+    raw_chars = {_normalize_name(m).upper() for m in CHARACTER_PATTERN.findall(text)}
     characters = _filter_caps_stopwords(raw_chars)
+
+    groups: Set[str] = set()
 
     # Cross-reference with screenplay identity blocks for better accuracy
     if screenplay and hasattr(screenplay, 'identity_block_metadata'):
@@ -159,6 +170,7 @@ def extract_entities(text: str, screenplay=None) -> EntitySet:
         known_objects = set()
         known_vehicles = set()
         known_envs = set()
+        known_groups = set()
 
         # Build lookup: entity_id -> (type, name)
         id_to_entity = {}
@@ -176,6 +188,8 @@ def extract_entities(text: str, screenplay=None) -> EntitySet:
                 known_vehicles.add(ename.lower())
             elif etype == "environment":
                 known_envs.add(ename.lower())
+            elif etype == "group":
+                known_groups.add(ename.upper())
 
         # Add characters found by known-name lookup even if regex missed them
         text_upper = text.upper()
@@ -225,9 +239,14 @@ def extract_entities(text: str, screenplay=None) -> EntitySet:
                 if re.search(r'\b' + re.escape(ke) + r'\b', text_lower):
                     environments.add(ke)
 
+        # ── GROUP ENTITIES (known names in text) ──
+        for kg in known_groups:
+            if kg in text_upper:
+                groups.add(kg)
+
         # ── IDENTITY BLOCK ID TAG RESOLUTION ──
-        # Recognise (CHARACTER_XXXX), (OBJECT_XXXX), etc. in the text and
-        # resolve them to the canonical entity names so validation can match.
+        # Recognise (CHARACTER_XXXX), (OBJECT_XXXX), (GROUP_XXXX), etc.
+        # in the text and resolve them to canonical entity names.
         id_tag_pattern = re.compile(r'\(([A-Z]+_[A-F0-9]{4,})\)')
         for m in id_tag_pattern.finditer(text):
             tag_id = m.group(1)
@@ -241,6 +260,8 @@ def extract_entities(text: str, screenplay=None) -> EntitySet:
                     vehicles.add(_normalize_name(ename))
                 elif etype == "environment":
                     environments.add(_normalize_name(ename))
+                elif etype == "group":
+                    groups.add(ename.upper())
 
         # ── FILTER CHARACTERS TO KNOWN NAMES ──
         # The CAPS regex can produce spurious matches when character names
@@ -251,11 +272,17 @@ def extract_entities(text: str, screenplay=None) -> EntitySet:
         if known_chars:
             characters = {c for c in characters if c in known_chars}
 
+        # Remove group names from characters set (groups are FULL CAPS but
+        # tracked separately from individual characters)
+        if known_groups:
+            characters = characters - known_groups
+
     return EntitySet(
         characters=characters,
         objects=objects,
         vehicles=vehicles,
         environments=environments,
+        groups=groups,
     )
 
 
@@ -319,6 +346,10 @@ def compare_entity_sets(
     item_entities: EntitySet,
     item_raw_text: str = "",
     screenplay=None,
+    scene_objects: Optional[Set[str]] = None,
+    scene_vehicles: Optional[Set[str]] = None,
+    scene_characters: Optional[Set[str]] = None,
+    paragraph_text: str = "",
 ) -> EntityMismatch:
     """Compare entities from paragraph vs storyboard item.
 
@@ -372,30 +403,132 @@ def compare_entity_sets(
             objects={o for o in p_raw.objects if _exists(o, "object")},
             vehicles={v for v in p_raw.vehicles if _exists(v, "vehicle")},
             environments={e for e in p_raw.environments if _exists(e, "environment")},
+            groups={g for g in p_raw.groups if _exists(g, "group")},
         )
+
+    # ── BUILD KNOWN IDENTITY-BLOCK ENTITY SETS ──
+    # Entities that have identity blocks are established story elements.
+    # The AI may add them to image_prompt/composition for visual context
+    # (e.g. a desk in an office, a parrot present in the scene) even when
+    # the specific paragraph doesn't mention them.  These should not be
+    # flagged as "extra".
+    known_objs_ci: Set[str] = set()
+    known_vehs_ci: Set[str] = set()
+    known_chars_upper: Set[str] = set()
+    known_all_names_ci: Set[str] = set()  # all entity names regardless of type
+    known_story_words_ci: Set[str] = set()  # significant single words from descriptions
+    if screenplay and hasattr(screenplay, 'identity_block_metadata'):
+        for _meta in screenplay.identity_block_metadata.values():
+            _etype = (_meta.get("type") or "").lower()
+            _ename = (_meta.get("name") or "").strip()
+            if not _ename:
+                continue
+            known_all_names_ci.add(_ename.lower())
+            if _etype == "object":
+                known_objs_ci.add(_ename.lower())
+            elif _etype == "vehicle":
+                known_vehs_ci.add(_ename.lower())
+            elif _etype == "character":
+                known_chars_upper.add(_ename.upper())
+            # Collect significant words from description fields so species /
+            # appearance terms (e.g. "parrot" for PEPPER) are recognised.
+            for _field in ("user_notes", "identity_block"):
+                _desc = (_meta.get(_field) or "")
+                for _w in _desc.split():
+                    _wc = re.sub(r'[^a-z]', '', _w.lower())
+                    if len(_wc) >= 4:
+                        known_story_words_ci.add(_wc)
 
     # Characters: already uppercase, direct set comparison
     # "missing" = required by paragraph but absent from storyboard (filtered)
     # "extra"   = in storyboard but not anywhere in the paragraph (unfiltered)
-    missing_chars = p_required.characters - s.characters
-    extra_chars = s.characters - p_raw.characters
+    # Scene-level characters (from any paragraph in the scene) are allowed
+    # since the AI may include them for spatial context (e.g. a dialogue
+    # shot may reference a listening character from a neighbouring beat).
+    #
+    # Dialogue paragraphs: If the paragraph is purely dialogue (CHARACTER\n"text")
+    # only the SPEAKING character is required — the storyboard will generate a
+    # close-up of the speaker and doesn't need other nearby characters.
+    _is_dialogue_para = False
+    _speaker_char = None
+    _stripped_para = (paragraph_text or "").strip()
+    _dialogue_match = re.match(
+        r'^([A-Z][A-Z\s\'\-]+)\s*\n\s*"',
+        _stripped_para,
+    )
+    if _dialogue_match:
+        _is_dialogue_para = True
+        _speaker_char = _dialogue_match.group(1).strip()
+
+    if _is_dialogue_para and _speaker_char:
+        p_required_chars = {c for c in p_required.characters if c == _speaker_char}
+    else:
+        p_required_chars = p_required.characters
+
+    scene_chars = scene_characters if scene_characters else set()
+    missing_chars = p_required_chars - s.characters
+    extra_chars = s.characters - p_raw.characters - scene_chars - known_chars_upper
 
     # Objects / vehicles / environments: case-insensitive comparison
     # Missing uses the filtered (required) set; extra uses the raw set.
+    # Scene-level objects/vehicles (from any paragraph) are allowed in
+    # image_prompt/composition_notes, so they are not flagged as "extra".
+    # Known identity-block entities are also allowed (established story props).
     p_objs_req_ci = _ci_set(p_required.objects)
     p_objs_raw_ci = _ci_set(p_raw.objects)
+    scene_objs_ci = _ci_set(scene_objects) if scene_objects else set()
     s_objs_ci = _ci_set(s.objects)
     missing_objs_ci = p_objs_req_ci - s_objs_ci
-    extra_objs_ci = s_objs_ci - p_objs_raw_ci
+    extra_objs_ci = s_objs_ci - p_objs_raw_ci - scene_objs_ci - known_objs_ci
+    # Cross-type: if the "extra" object name matches any known entity
+    # (character, vehicle, environment) the AI is referencing an established
+    # entity with bracket markup — not an invented object.
+    # Word-overlap: if the "extra" object shares a significant word (3+ chars)
+    # with a known identity-block object, treat it as a variant name
+    # (e.g. "tax files" ↔ "tax documents" share "tax").
+    # Story-word: if a single-word "extra" object matches a significant word
+    # from any identity block description (e.g. "parrot" from a character's
+    # physical appearance), it's a known story element.
+    _still_extra_objs: Set[str] = set()
+    for eo in extra_objs_ci:
+        if eo in known_all_names_ci:
+            continue  # cross-type match
+        eo_words = {w for w in eo.split() if len(w) >= 3}
+        if eo_words and any(
+            eo_words & {w for w in ko.split() if len(w) >= 3}
+            for ko in known_objs_ci
+        ):
+            continue  # word-overlap match
+        eo_clean = re.sub(r'[^a-z]', '', eo)
+        if len(eo_clean) >= 4 and eo_clean in known_story_words_ci:
+            continue  # matches a word from identity block descriptions
+        _still_extra_objs.add(eo)
+    extra_objs_ci = _still_extra_objs
     missing_objs_ci, extra_objs_ci = _fuzzy_match_sets(missing_objs_ci, extra_objs_ci)
     missing_objs = {o for o in p_required.objects if o.lower() in missing_objs_ci}
     extra_objs = {o for o in s.objects if o.lower() in extra_objs_ci}
 
     p_vehs_req_ci = _ci_set(p_required.vehicles)
     p_vehs_raw_ci = _ci_set(p_raw.vehicles)
+    scene_vehs_ci = _ci_set(scene_vehicles) if scene_vehicles else set()
     s_vehs_ci = _ci_set(s.vehicles)
     missing_vehs_ci = p_vehs_req_ci - s_vehs_ci
-    extra_vehs_ci = s_vehs_ci - p_vehs_raw_ci
+    extra_vehs_ci = s_vehs_ci - p_vehs_raw_ci - scene_vehs_ci - known_vehs_ci
+    _still_extra_vehs: Set[str] = set()
+    for ev in extra_vehs_ci:
+        if ev in known_all_names_ci:
+            continue
+        ev_words = {w for w in ev.split() if len(w) >= 3}
+        if ev_words and any(
+            ev_words & {w for w in kv.split() if len(w) >= 3}
+            for kv in known_vehs_ci
+        ):
+            continue
+        ev_clean = re.sub(r'[^a-z]', '', ev)
+        if len(ev_clean) >= 4 and ev_clean in known_story_words_ci:
+            continue
+        _still_extra_vehs.add(ev)
+    extra_vehs_ci = _still_extra_vehs
     missing_vehs_ci, extra_vehs_ci = _fuzzy_match_sets(missing_vehs_ci, extra_vehs_ci)
     missing_vehs = {v for v in p_required.vehicles if v.lower() in missing_vehs_ci}
     extra_vehs = {v for v in s.vehicles if v.lower() in extra_vehs_ci}
@@ -557,7 +690,7 @@ def suggest_camera_framing(dominant_action: str, paragraph: str) -> str:
     if not dominant_action:
         # Check if paragraph is purely environmental
         chars = _filter_caps_stopwords(
-            {_normalize_name(m) for m in CHARACTER_PATTERN.findall(paragraph)}
+            {_normalize_name(m).upper() for m in CHARACTER_PATTERN.findall(paragraph)}
         )
         if not chars:
             return "Wide establishing shot, static camera"
@@ -575,6 +708,62 @@ def suggest_camera_framing(dominant_action: str, paragraph: str) -> str:
         return "Low angle, slow push-in, building tension"
 
     return "Medium shot, eye level"
+
+
+def infer_shot_and_motion_from_beat(paragraph: str) -> tuple:
+    """Analyse a scene paragraph and return (shot_type, camera_motion) keys.
+
+    Uses the dominant action verb and paragraph structure (dialogue,
+    establishing, multi-character, etc.) to choose cinematic defaults
+    from the SHOT_TYPE_OPTIONS / CAMERA_MOTION_OPTIONS dictionaries.
+
+    Returns:
+        (shot_type_key, camera_motion_key) — e.g. ("wide", "tracking")
+    """
+    if not paragraph or not paragraph.strip():
+        return ("wide", "static")
+
+    dominant = extract_dominant_action(paragraph)
+    chars = _filter_caps_stopwords(
+        {_normalize_name(m).upper() for m in CHARACTER_PATTERN.findall(paragraph)}
+    )
+    is_dialogue = bool(re.match(r'^[A-Z][A-Z\s\'\-]+\s*\n\s*"', paragraph.strip()))
+    is_env_only = not chars
+
+    if is_env_only:
+        return ("wide", "slow_pan_right")
+
+    if is_dialogue:
+        if len(chars) >= 2:
+            return ("over_shoulder", "static")
+        return ("close_up", "static")
+
+    action = dominant.lower() if dominant else ""
+
+    if action in _SPATIAL_ACTIONS:
+        if action in ("leap", "leaps", "charge", "charges", "sprint", "sprints",
+                       "dash", "dashes", "flee", "flees"):
+            return ("medium", "tracking")
+        if action in ("enter", "enters", "exit", "exits", "approach", "approaches"):
+            return ("wide", "slow_dolly_in")
+        return ("wide", "tracking")
+
+    if action in _TENSION_ACTIONS:
+        if action in ("aim", "aims", "draw", "draws", "raise", "raises"):
+            return ("low_angle", "push_in")
+        return ("medium", "push_in")
+
+    if action in _SUBTLE_ACTIONS:
+        if action in ("whisper", "whispers", "touch", "touches", "glance", "glances"):
+            return ("extreme_close_up", "static")
+        return ("close_up", "static")
+
+    if len(chars) >= 3:
+        return ("wide", "slow_dolly_out")
+    if len(chars) == 2:
+        return ("two_shot", "static")
+
+    return ("medium", "static")
 
 
 # ---------------------------------------------------------------------------
@@ -600,6 +789,19 @@ def validate_storyboard_against_paragraphs(
     """
     results: List[ValidationResult] = []
 
+    # Build scene-level entity set: characters/objects/vehicles that appear
+    # in ANY paragraph.  image_prompt and composition_notes are allowed to
+    # reference these even if they come from a different paragraph (characters
+    # are on set and visible; props are present before anyone interacts).
+    all_scene_characters: Set[str] = set()
+    all_scene_objects: Set[str] = set()
+    all_scene_vehicles: Set[str] = set()
+    for beat in scene_beats:
+        beat_entities = extract_paragraph_entities(beat, screenplay)
+        all_scene_characters |= beat_entities.characters
+        all_scene_objects |= beat_entities.objects
+        all_scene_vehicles |= beat_entities.vehicles
+
     for idx, beat in enumerate(scene_beats):
         dominant = extract_dominant_action(beat)
         framing = suggest_camera_framing(dominant, beat)
@@ -614,7 +816,15 @@ def validate_storyboard_against_paragraphs(
                 getattr(item, "image_prompt", ""),
                 getattr(item, "prompt", ""),
             ]))
-            mismatch = compare_entity_sets(p_entities, s_entities, item_raw_text=raw_text, screenplay=screenplay)
+            mismatch = compare_entity_sets(
+                p_entities, s_entities,
+                item_raw_text=raw_text,
+                screenplay=screenplay,
+                scene_objects=all_scene_objects,
+                scene_vehicles=all_scene_vehicles,
+                scene_characters=all_scene_characters,
+                paragraph_text=beat,
+            )
 
             results.append(ValidationResult(
                 paragraph_index=idx,

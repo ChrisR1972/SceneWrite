@@ -14,17 +14,25 @@ from core.screenplay_engine import StoryScene, Screenplay
 from core.ai_generator import AIGenerator
 from core.spell_checker import enable_spell_checking
 
+def _safe_print(*args, **kwargs):
+    """Route output through debug_log instead of stdout (hidden in production)."""
+    try:
+        from debug_log import debug_log as _dl
+        _dl(" ".join(str(a) for a in args))
+    except Exception:
+        pass
+
 # Logger functions - temporarily disabled to prevent crashes
 def log_exception(msg, exc):
     try:
         import traceback
-        print(f"ERROR: {msg}: {exc}")
+        _safe_print(f"ERROR: {msg}: {exc}")
         traceback.print_exc()
     except:
         pass
 def log_error(msg):
     try:
-        print(f"ERROR: {msg}")
+        _safe_print(f"ERROR: {msg}")
     except:
         pass
 def log_info(msg):
@@ -310,7 +318,7 @@ class SceneFrameworkEditor(QDialog):
                 log_exception("Error saving scene", e)
             except:
                 import traceback
-                print(f"Error saving scene: {e}")
+                _safe_print(f"Error saving scene: {e}")
                 traceback.print_exc()
             # Show user-friendly message
             try:

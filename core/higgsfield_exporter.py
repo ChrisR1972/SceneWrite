@@ -169,8 +169,8 @@ class HiggsfieldExporter:
         """
         all_items = screenplay.get_all_storyboard_items()
         ss = getattr(screenplay, "story_settings", {}) or {}
-        video_model = ss.get("higgsfield_model", "higgsfield-ai/dop/standard")
-        image_model = ss.get("higgsfield_image_model", "higgsfield-ai/soul/standard")
+        video_model = ss.get("video_model", ss.get("higgsfield_model", "higgsfield-ai/dop/standard"))
+        image_model = ss.get("image_model", ss.get("higgsfield_image_model", "higgsfield-ai/soul/standard"))
         aspect_ratio = ss.get("aspect_ratio", "16:9")
 
         export_data = {

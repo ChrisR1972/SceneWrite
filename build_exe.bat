@@ -1,6 +1,6 @@
 @echo off
 echo ========================================
-echo MoviePrompterAI - Build Script
+echo SceneWrite - Build Script
 echo ========================================
 echo.
 
@@ -13,6 +13,16 @@ if errorlevel 1 (
         echo Failed to install PyInstaller. Please install manually: pip install PyInstaller
         pause
         exit /b 1
+    )
+)
+
+REM Check if PyArmor is installed
+python -c "import pyarmor" 2>nul
+if errorlevel 1 (
+    echo PyArmor not found. Installing...
+    pip install pyarmor
+    if errorlevel 1 (
+        echo Warning: PyArmor install failed. Build will continue WITHOUT obfuscation.
     )
 )
 
@@ -47,6 +57,12 @@ if exist dist (
     echo No dist folder found.
 )
 
+REM Clean obfuscation artifacts
+if exist _obf (
+    echo Removing obfuscation folder...
+    rmdir /s /q _obf
+)
+
 REM Clean PyInstaller cache
 if exist __pycache__ (
     echo Removing __pycache__ folders...
@@ -58,15 +74,72 @@ if exist *.spec.bak del /q *.spec.bak
 
 echo.
 echo ========================================
-echo Step 2: Building executable...
+echo Step 2: Obfuscating source code...
+echo ========================================
+echo.
+
+REM Obfuscate Python source with PyArmor before building
+python -c "import pyarmor" 2>nul
+if errorlevel 1 (
+    echo WARNING: PyArmor not available — skipping obfuscation.
+    echo The build will work, but source code will NOT be protected.
+    echo Install with: pip install pyarmor
+    echo.
+) else (
+    echo Obfuscating with PyArmor...
+    mkdir _obf 2>nul
+
+    REM Obfuscate core and ui packages plus top-level modules
+    pyarmor gen -O _obf -r core ui
+    pyarmor gen -O _obf main.py config.py debug_log.py fix_storyboard_extraction.py
+
+    if errorlevel 1 (
+        echo WARNING: PyArmor obfuscation failed — building from plain source.
+        if exist _obf rmdir /s /q _obf
+    ) else (
+        echo Obfuscation complete.
+        echo.
+
+        REM Copy obfuscated files over the originals for PyInstaller to pick up.
+        REM We work on a staging copy so the originals are never touched.
+        echo Staging obfuscated files...
+        mkdir _obf\config 2>nul
+        if exist config\ActionWhitelist.json copy /y config\ActionWhitelist.json _obf\config\ >nul
+        if exist config\SFXWhitelist.json copy /y config\SFXWhitelist.json _obf\config\ >nul
+
+        REM Copy non-Python files that PyInstaller needs
+        copy /y screenplay_tool.spec _obf\ >nul
+        copy /y SceneWrite_Logo.ico _obf\ >nul 2>nul
+        copy /y SceneWrite_Logo.icns _obf\ >nul 2>nul
+        copy /y SceneWrite_Logo.png _obf\ >nul 2>nul
+        for %%f in ("Action Rules.txt" "SFX Rules.txt" "Character Rules.txt" "Video Prompt.txt" "Wardrobe.txt") do (
+            if exist %%f copy /y %%f _obf\ >nul 2>nul
+        )
+        echo Staging complete.
+    )
+)
+
+echo.
+echo ========================================
+echo Step 3: Building executable...
 echo ========================================
 echo.
 echo This may take a few minutes...
 echo Please wait...
 echo.
 
-REM Run PyInstaller with the spec file
-pyinstaller --clean --noconfirm screenplay_tool.spec
+REM Build from obfuscated source if available, otherwise from plain source
+if exist _obf\main.py (
+    pushd _obf
+    pyinstaller --clean --noconfirm screenplay_tool.spec
+    popd
+    REM Move the dist output back
+    if exist _obf\dist (
+        xcopy /e /i /y _obf\dist dist >nul
+    )
+) else (
+    pyinstaller --clean --noconfirm screenplay_tool.spec
+)
 
 if errorlevel 1 (
     echo.
@@ -91,27 +164,27 @@ echo ========================================
 echo.
 
 REM Check if executable exists and show size
-if exist "dist\MoviePrompterAI.exe" (
-    echo Executable created: dist\MoviePrompterAI.exe
+if exist "dist\SceneWrite.exe" (
+    echo Executable created: dist\SceneWrite.exe
     echo.
     
     REM Get file size
-    for %%A in ("dist\MoviePrompterAI.exe") do (
+    for %%A in ("dist\SceneWrite.exe") do (
         set size=%%~zA
     )
     echo Checking file size...
     
     REM Check folder size
     echo.
-    echo Distribution folder location: dist\MoviePrompterAI\
+    echo Distribution folder location: dist\SceneWrite\
     echo.
     echo ========================================
     echo Distribution Instructions:
     echo ========================================
     echo.
-    echo 1. Copy the entire "MoviePrompterAI" folder from dist\
+    echo 1. Copy the entire "SceneWrite" folder from dist\
     echo 2. Zip it and share with users
-    echo 3. Users can extract and run MoviePrompterAI.exe
+    echo 3. Users can extract and run SceneWrite.exe
     echo.
     echo Expected size: 50-100 MB (optimized build)
     echo.

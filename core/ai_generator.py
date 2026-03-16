@@ -5,13 +5,20 @@ Provider adapters support OpenAI-compatible APIs and Ollama Cloud (native API, n
 """
 
 def _safe_print(*args, **kwargs):
-    """Print that catches OSError [Errno 22] on Windows when stdout can't handle Unicode."""
+    """Route diagnostic output to the debug log file instead of stdout.
+
+    In production builds the console is hidden, so print() output is lost.
+    Routing through debug_log keeps the information available for
+    troubleshooting without cluttering a visible console.
+    """
     try:
-        print(*args, **kwargs)
-    except OSError:
+        from debug_log import debug_log as _dl
+        _dl(" ".join(str(a) for a in args))
+    except Exception:
         pass
 
 
+import os
 import openai
 import requests
 from typing import Dict, List, Any, Optional, Union, Tuple
@@ -38,8 +45,31 @@ from .storyboard_validator import (
     validate_storyboard_against_paragraphs,
     extract_dominant_action,
     suggest_camera_framing,
+    infer_shot_and_motion_from_beat,
 )
 from config import config
+
+
+_CONTENT_RATING_DIRECTIVES: Dict[str, str] = {
+    "child_safe": (
+        "CONTENT RATING: G (Child Safe). You MUST NOT include: violence of any kind, "
+        "death, weapons, scary or horror imagery, bad language, insults, romantic content "
+        "beyond friendship, alcohol, drugs, or any mature themes. Keep tone bright, "
+        "positive, and suitable for young children."
+    ),
+    "family_friendly": (
+        "CONTENT RATING: PG (Family Friendly). You MUST NOT include: graphic violence, "
+        "gore, death depicted on-screen, profanity or crude language, sexual content or "
+        "innuendo, drug use. Mild cartoon peril and slapstick conflict are acceptable. "
+        "Keep content suitable for all ages."
+    ),
+    "teen": (
+        "CONTENT RATING: PG-13 (Teen). You MUST NOT include: graphic gore, torture, "
+        "explicit sexual content, or strong profanity (F-word). Moderate action violence, "
+        "emotional intensity, mild language, and romantic tension are acceptable."
+    ),
+    "unrestricted": "",
+}
 
 
 # --- Species detection / normalization ---
@@ -86,6 +116,63 @@ _SPECIES_KEYWORD_MAP = {
     "alien": "Alien", "extraterrestrial": "Alien",
     "shapeshifter": "Shapeshifter", "changeling": "Shapeshifter", "metamorph": "Shapeshifter",
 }
+
+# Title/honorific words that act as name boundaries when found mid-match
+# in a consecutive ALL-CAPS sequence (e.g. MATTHEW COOPER MAYOR SARAH COOPER).
+_TITLE_BOUNDARY_WORDS = frozenset({
+    "MAYOR", "SENATOR", "GOVERNOR", "PRESIDENT", "CHANCELLOR", "AMBASSADOR",
+    "DETECTIVE", "INSPECTOR", "SHERIFF", "OFFICER", "CONSTABLE", "MARSHAL",
+    "CHIEF", "COMMISSIONER", "WARDEN", "DIRECTOR", "ATTORNEY", "PROSECUTOR",
+    "JUDGE", "JUSTICE", "MAGISTRATE", "CHAIRMAN", "CHAIRWOMAN",
+    "KING", "QUEEN", "PRINCE", "PRINCESS", "DUKE", "DUCHESS", "BARON",
+    "BARONESS", "COUNT", "COUNTESS", "EARL", "LORD", "LADY",
+    "MASTER", "MISTRESS", "MADAM", "MADAME", "ELDER",
+    "FATHER", "MOTHER", "SISTER", "BROTHER", "UNCLE", "AUNT",
+    "COACH", "NURSE", "PILOT", "RANGER", "AGENT", "REVEREND",
+})
+
+# Government/military/law-enforcement acronyms that should never be character names.
+_ACRONYM_BLOCKLIST = frozenset({
+    "NSA", "DEA", "ATF", "DHS", "TSA", "ICE", "IRS", "SEC", "FCC", "EPA",
+    "DOJ", "DOD", "DARPA", "FEMA", "OSHA", "NYPD", "LAPD", "SWAT", "NATO",
+    "CIA", "FBI", "NSA", "MI5", "MI6", "KGB", "FSB", "GRU", "SAS",
+    "BOLO", "APB", "BOL", "AMBER", "MIA", "KIA", "WIA", "POW", "AWOL",
+    "POTUS", "FLOTUS", "SCOTUS", "DOA", "COD", "ETA", "ETD",
+    "NDA", "TBD", "ASAP", "RSVP", "SNAFU", "FUBAR",
+    "AKA", "FYI", "LOL", "OMG", "TLDR", "IMHO",
+})
+
+# Common English words that happen to be valid name parts for some cultures
+# but should NOT be used for species proximity matching.
+_COMMON_ENGLISH_WORDS_AS_NAMES = frozenset({
+    "long", "wan", "fang", "lei", "chen", "song", "king", "wing",
+    "angel", "grace", "dawn", "joy", "may", "ray", "will",
+    "mark", "grant", "hunt", "chase", "drake", "wolf", "fox",
+    "hawk", "pike", "lance", "cross", "reed", "dale", "glen",
+    "ash", "storm", "stone", "frost", "brand", "ward", "swift",
+    "true", "young", "best", "rich", "noble",
+})
+
+
+def _split_compound_caps_name(phrase: str) -> List[str]:
+    """Split a CAPS phrase at title/honorific boundaries.
+
+    E.g. "MATTHEW COOPER MAYOR SARAH COOPER" → ["MATTHEW COOPER", "MAYOR SARAH COOPER"]
+    """
+    words = phrase.split()
+    if len(words) <= 2:
+        return [phrase]
+    segments: List[str] = []
+    current: List[str] = []
+    for word in words:
+        if word in _TITLE_BOUNDARY_WORDS and current:
+            segments.append(" ".join(current))
+            current = [word]
+        else:
+            current.append(word)
+    if current:
+        segments.append(" ".join(current))
+    return segments if segments else [phrase]
 
 
 def normalize_species_label(raw: str) -> str:
@@ -156,7 +243,12 @@ def infer_species_from_text(outline: str, physical_appearance: str,
         for phrase in _NON_SPECIES_PHRASES:
             ctx_lower = ctx_lower.replace(phrase, "")
         name_lower = character_name.strip().lower()
-        name_parts = [p for p in name_lower.split() if len(p) > 1]
+        # Exclude name parts that are common English words — they cause false
+        # proximity matches (e.g. "long" near "dragon" when "Long" is a Chinese name).
+        name_parts = [
+            p for p in name_lower.split()
+            if len(p) > 1 and p not in _COMMON_ENGLISH_WORDS_AS_NAMES
+        ]
         for keyword, label in sorted(_SPECIES_KEYWORD_MAP.items(), key=lambda x: -len(x[0])):
             for np in name_parts:
                 proximity_pat = (
@@ -436,7 +528,7 @@ class AIGenerator:
             **kwargs
         )
 
-    def generate_premise(self, genres: List[str], atmosphere: str, return_raw: bool = False, workflow_profile=None, brand_context=None) -> str:
+    def generate_premise(self, genres: List[str], atmosphere: str, return_raw: bool = False, workflow_profile=None, brand_context=None, rejected_premises: Optional[List[str]] = None) -> str:
         """Generate a story premise from genre and atmosphere selections.
         
         Args:
@@ -445,6 +537,8 @@ class AIGenerator:
             return_raw: Whether to return raw AI output
             workflow_profile: WorkflowProfile enum (NARRATIVE, PROMOTIONAL, etc.)
             brand_context: BrandContext object for promotional workflows
+            rejected_premises: Previously generated premises the user rejected;
+                the AI must avoid these themes, settings, and concepts entirely
         """
         
         if not self._adapter:
@@ -584,6 +678,21 @@ GENRE MIXING - MULTIPLE GENRES SELECTED:
 - Combine elements creatively while maintaining coherence
 """
             
+            # Build rejected-premises avoidance block
+            _avoidance_block = ""
+            if rejected_premises:
+                _numbered = "\n".join(
+                    f"  {i+1}. {p}" for i, p in enumerate(rejected_premises[-10:])
+                )
+                _avoidance_block = (
+                    "\nMANDATORY — AVOID PREVIOUSLY REJECTED IDEAS:\n"
+                    "The user has ALREADY REJECTED the following premise(s). You MUST NOT reuse,\n"
+                    "rephrase, or recombine their themes, settings, character archetypes, or\n"
+                    "central concepts. Generate something COMPLETELY DIFFERENT — different\n"
+                    "world, different conflict, different tone, different imagery.\n"
+                    f"{_numbered}\n"
+                )
+
             prompt = f"""
 You are a professional screenwriter and story creator. Generate a compelling, cinematic story premise based on the following:
 
@@ -591,7 +700,7 @@ Genres: {genre_text}
 Atmosphere/Tone: {atmosphere}
 
 {genre_instruction}
-
+{_avoidance_block}
 Create a story premise that:
 - Is 1-3 sentences long
 - Is engaging and suitable for visual storytelling
@@ -599,6 +708,7 @@ Create a story premise that:
 - Is cinematic and would work well as a video storyboard
 - Captures the {atmosphere} atmosphere
 - Follows the genre adherence rules above
+- Is ORIGINAL and UNEXPECTED — avoid the most clichéd genre tropes
 
 CRITICAL FORMATTING REQUIREMENTS - YOU MUST FOLLOW THESE EXACTLY:
 
@@ -646,14 +756,20 @@ That's it. Nothing else.
                     else:
                         raise Exception(f"AI client not initialized. API key is set but client creation failed. Please check your settings. Provider: {self.model_settings.get('provider', 'Unknown')}")
             
+            # Increase temperature when regenerating to push the AI further
+            # from its most-probable outputs
+            _temp = 0.8
+            if rejected_premises:
+                _temp = min(1.2, 0.8 + 0.1 * len(rejected_premises))
+
             response = self._chat_completion(
                 model=self.model_settings["model"],
                 messages=[
-                    {"role": "system", "content": "You are a professional screenwriter specializing in creating compelling, cinematic story premises."},
+                    {"role": "system", "content": "You are a professional screenwriter specializing in creating compelling, cinematic story premises. You pride yourself on ORIGINALITY — every premise you create is fresh and surprising."},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.8,
-                max_tokens=1000  # Increased to allow for reasoning models that output longer responses
+                temperature=_temp,
+                max_tokens=1000
             )
             
             # Debug: Save raw response to file for troubleshooting
@@ -1472,14 +1588,15 @@ Format your response as a JSON object with this EXACT structure:
             if n_characters is not None:
                 if is_micro_narrative:
                     char_count_block = f"""
-MAIN CHARACTERS (UP TO {n_characters}):
-- Generate UP TO {n_characters} main characters. Only create as many as the story naturally needs — do not force characters.
+MAIN CHARACTERS (EXACTLY {n_characters}):
+- Generate EXACTLY {n_characters} main characters. This is MANDATORY — do not generate fewer.
 - This is a MICRO story (very short). Characters need ONLY a name and physical_appearance. Do NOT generate outline or growth_arc."""
                 else:
                     char_count_block = f"""
-MAIN CHARACTERS (UP TO {n_characters}):
-- Generate UP TO {n_characters} main characters. Main characters are the protagonist, their companions, and the antagonist.
-- Only create as many main characters as the story naturally needs — do not force characters to reach {n_characters}. You may generate fewer if the story works better with fewer.
+MAIN CHARACTERS (EXACTLY {n_characters}):
+- Generate EXACTLY {n_characters} main characters. This is MANDATORY — do not generate fewer.
+- Main characters are the protagonist, their companions, and the antagonist.
+- Every requested character MUST be created with a unique name, outline, growth arc, and physical appearance. The user has specifically requested {n_characters} characters and all must be delivered.
 - These main characters will be used in Character Details and must NOT be replaced by any other characters.
 - Use FULL CAPITAL LETTERS for main character names (e.g. MAYA RIVERA, ELIAS CROSS, SARAH CHEN).
 - Each main character must have a unique, human, plausible name. Use simple first and last names for most. Use First 'Nickname' Last sparingly.
@@ -1550,10 +1667,10 @@ CHARACTER NAME UNIQUENESS (MANDATORY):
 """
                 if is_micro_narrative:
                     char_json_block = f''',
-    "characters": [{{"name": "FULL CAPS NAME 1", "role": "main", "species": "Human or species/form (e.g. Demon, Dragon, Elf, Vampire, Robot, Ghost, Alien, Animal — use the EXACT species/form; default Human for ordinary people)", "physical_appearance": "Gender and height (MANDATORY), age when known (MANDATORY), face structure, hair color/style, eye color, skin tone, body build, permanent features. Do NOT include the character name. NO clothing, accessories, armor, uniforms. For non-human species describe species-appropriate anatomy (horns, scales, wings, fur, etc.)."}}, ... up to {n_characters} objects]'''
+    "characters": [{{"name": "FULL CAPS NAME 1", "role": "main", "species": "Human or species/form (e.g. Demon, Dragon, Elf, Vampire, Robot, Ghost, Alien, Animal — use the EXACT species/form; default Human for ordinary people)", "physical_appearance": "Gender and height (MANDATORY), age when known (MANDATORY), face structure, hair color/style, eye color, skin tone, body build, permanent features. Do NOT include the character name. NO clothing, accessories, armor, uniforms. For non-human species describe species-appropriate anatomy (horns, scales, wings, fur, etc.)."}}, ... EXACTLY {n_characters} objects total — no fewer]'''
                 else:
                     char_json_block = f''',
-    "characters": [{{"name": "FULL CAPS NAME 1", "role": "main", "species": "Human or species/form (e.g. Demon, Dragon, Elf, Vampire, Robot, Ghost, Alien, Animal — use the EXACT species/form; default Human for ordinary people)", "outline": "A detailed 6-10 sentence paragraph: backstory, motivation, flaws, relationships, role. NO physical appearance (height, hair, eyes, age, etc.) — that goes in physical_appearance only. Use ENTITY MARKUP (Characters FULL CAPS, locations _underlined_, objects [brackets], vehicles {{braces}}). If character owns a place/vehicle/object, state it (e.g. owns _The Warehouse_). Be specific and substantial.", "growth_arc": "A detailed 6-10 sentence paragraph: starting state, key challenges faced, how they respond and change, ending state. Use ENTITY MARKUP. Be specific and substantial.", "physical_appearance": "Gender and height (MANDATORY), age when known (MANDATORY), face structure, hair color/style, eye color, skin tone, body build, permanent features. Do NOT include the character name. NO clothing, accessories (hat, cap, earbuds), armor, uniforms. For non-human species describe species-appropriate anatomy (horns, scales, wings, fur, etc.)."}}, ... up to {n_characters} objects]'''
+    "characters": [{{"name": "FULL CAPS NAME 1", "role": "main", "species": "Human or species/form (e.g. Demon, Dragon, Elf, Vampire, Robot, Ghost, Alien, Animal — use the EXACT species/form; default Human for ordinary people)", "outline": "A detailed 6-10 sentence paragraph: backstory, motivation, flaws, relationships, role. NO physical appearance (height, hair, eyes, age, etc.) — that goes in physical_appearance only. Use ENTITY MARKUP (Characters FULL CAPS, locations _underlined_, objects [brackets], vehicles {{braces}}). If character owns a place/vehicle/object, state it (e.g. owns _The Warehouse_). Be specific and substantial.", "growth_arc": "A detailed 6-10 sentence paragraph: starting state, key challenges faced, how they respond and change, ending state. Use ENTITY MARKUP. Be specific and substantial.", "physical_appearance": "Gender and height (MANDATORY), age when known (MANDATORY), face structure, hair color/style, eye color, skin tone, body build, permanent features. Do NOT include the character name. NO clothing, accessories (hat, cap, earbuds), armor, uniforms. For non-human species describe species-appropriate anatomy (horns, scales, wings, fur, etc.)."}}, ... EXACTLY {n_characters} objects total — no fewer]'''
             
             # Build subplots section (skipped for micro narratives)
             if is_micro_narrative:
@@ -1805,14 +1922,20 @@ IMPORTANT JSON RULES:
                             chars.append({"name": name, "outline": "", "growth_arc": "", "physical_appearance": "", "species": "Human"})
                 # Final deduplication to catch any remaining duplicates (e.g. LYRA DAVIS twice)
                 chars = self.sanitize_character_list_for_registry(chars)
-                # Trim to maximum (n_characters is an upper bound, not an exact count)
                 outline_data["characters"] = chars[:n_characters]
                 final_count = len(outline_data["characters"])
                 import logging
-                logging.getLogger(__name__).info(
-                    "Wizard character validation: generated %s main characters (max was %s).",
-                    final_count, n_characters
-                )
+                logger = logging.getLogger(__name__)
+                if final_count < n_characters:
+                    logger.warning(
+                        "Wizard character shortfall: AI generated %s of %s requested characters.",
+                        final_count, n_characters
+                    )
+                else:
+                    logger.info(
+                        "Wizard character validation: generated %s main characters (requested %s).",
+                        final_count, n_characters
+                    )
                 # Tag all wizard-generated characters as main and normalize species
                 main_storyline_text_for_species = str(outline_data.get("main_storyline", "") or "")
                 for c in outline_data["characters"]:
@@ -1936,11 +2059,12 @@ IMPORTANT JSON RULES:
         potential_names = set()
         _hon = r"(?:(?:MRS?|MS|DR|MME|PROF|SGT|CPT|LT|GEN|COL|REV|CMDR|CAPT)\.\s+)?"
         _nw = r"[A-Z][A-Z0-9]*(?:'[A-Z][A-Z0-9]*)?"
+        _article = r"(?:(?i:the|an?|of|de|la|le|von|van)[ \t]+)*"
         all_caps_pattern = re.compile(
-            rf"\b({_hon}{_nw}(?:[ \t]+(?:{_nw}|\"[^\"]*\"|'[^']*'))*)\b"
+            rf"\b({_hon}{_nw}(?:[ \t]+{_article}(?:{_nw}|\"[^\"]*\"|'[^']*'))*)\b"
         )
         for match in all_caps_pattern.finditer(text):
-            phrase = match.group(1).strip()
+            phrase = match.group(1).strip().upper()
             if len(phrase) < 2:
                 continue
             # If this ALL-CAPS phrase is inside underlined region → location, not character
@@ -1967,12 +2091,16 @@ IMPORTANT JSON RULES:
             org_following = (", led by", ", led by the", ", a franchise", ", a corporate", ", the franchise")
             if any(following.startswith(s) for s in org_following):
                 continue
-            words = re.split(r'\s+', phrase)
-            words_clean = [w.strip('"') for w in words if w and (not w.startswith('"') or w.endswith('"'))]
-            if not words_clean:
-                continue
-            if all(len(w) >= 2 and w.isalpha() for w in words_clean if w.isalpha()):
-                potential_names.add(phrase)
+            # Split compound names at title/honorific boundaries
+            # e.g. "MATTHEW COOPER MAYOR SARAH COOPER" → ["MATTHEW COOPER", "MAYOR SARAH COOPER"]
+            segments = _split_compound_caps_name(phrase)
+            for seg in segments:
+                words = re.split(r'\s+', seg)
+                words_clean = [w.strip('"') for w in words if w and (not w.startswith('"') or w.endswith('"'))]
+                if not words_clean:
+                    continue
+                if all(len(w) >= 2 and w.isalpha() for w in words_clean if w.isalpha()):
+                    potential_names.add(seg)
         
         # Blocklist: narrative transitions, acronyms, and non-character ALL-CAPS (never treat as characters)
         non_character_all_caps = {
@@ -1983,15 +2111,15 @@ IMPORTANT JSON RULES:
             "TV", "DVD", "CD", "PC", "FBI", "CIA", "NASA", "USA", "UK", "GPS", "CEO",
             "MVP", "API", "UFO", "HIV", "ATM", "DNA", "RNA", "HQ", "VIP", "DIY", "FAQ",
             "PR", "HR", "VP", "PM", "AM", "FM", "DC", "AC", "AD", "BC",
-        }
-        # AI/synthetic entity names (systems, not human characters) — do not extract as characters
-        ai_entity_names = {"AEON", "NEXUS", "ORACLE", "SYNAPSE", "CORTEX", "PRIME", "OMNI"}
+        } | _ACRONYM_BLOCKLIST
         filtered_names = []
         for name in potential_names:
             name_upper = name.upper()
             if name_upper in non_character_all_caps:
                 continue
-            if name_upper in ai_entity_names:
+            # Single-word tokens ≤ 4 chars are likely acronyms (e.g. BOLO, NSA)
+            name_words = name.split()
+            if len(name_words) == 1 and len(name) <= 4:
                 continue
             # Drop locations, events, companies, roles (use existing heuristics; pass title-case for consistency)
             name_for_check = name.title() if name.isupper() else name
@@ -2047,18 +2175,18 @@ IMPORTANT JSON RULES:
             "PR", "HR", "VP", "PM", "AM", "FM", "DC", "AC", "AD", "BC",
             "AI", "AR", "VR", "EMF", "LED", "LCD", "USB", "PDF", "URL", "ID", "OK",
             "SFX", "FX", "CGI", "HD", "UHD",
-        }
-        ai_entity_names = {"AEON", "NEXUS", "ORACLE", "SYNAPSE", "CORTEX", "PRIME", "OMNI"}
+        } | _ACRONYM_BLOCKLIST
         _hon = r"(?:(?:MRS?|MS|DR|MME|PROF|SGT|CPT|LT|GEN|COL|REV|CMDR|CAPT)\.\s+)?"
         _nw = r"[A-Z][A-Z0-9]*(?:'[A-Z][A-Z0-9]*)?"
+        _article = r"(?:(?i:the|an?|of|de|la|le|von|van)[ \t]+)*"
         all_caps_pattern = re.compile(
-            rf"\b({_hon}{_nw}(?:[ \t]+(?:{_nw}|\"[^\"]*\"|'[^']*'))*)\b"
+            rf"\b({_hon}{_nw}(?:[ \t]+{_article}(?:{_nw}|\"[^\"]*\"|'[^']*'))*)\b"
         )
         seen_lower = set()
         unique_ordered = []
         for match in all_caps_pattern.finditer(main_storyline):
-            phrase = match.group(1).strip()
-            if len(phrase) < 2:
+            raw_phrase = match.group(1).strip().upper()
+            if len(raw_phrase) < 2:
                 continue
             if inside_markup(match.start()):
                 continue
@@ -2066,113 +2194,114 @@ IMPORTANT JSON RULES:
             preceding = main_storyline[max(0, start - 80):start].lower().rstrip()
             if any(preceding.endswith(ind) for ind in location_indicators):
                 continue
-            words = re.split(r'\s+', phrase)
-            words_clean = [w.strip('"') for w in words if w and (not w.startswith('"') or w.endswith('"'))]
-            if not words_clean or not all(len(w) >= 2 and w.isalpha() for w in words_clean if w.isalpha()):
-                continue
-            if phrase.upper() in non_character_all_caps:
-                continue
-            if phrase.upper() in ai_entity_names:
-                continue
-            # If preceded by "the AI " or "AI " → AI/synthetic entity, not a human character
-            start = match.start()
-            preceding = main_storyline[max(0, start - 80):start].lower().rstrip()
-            if preceding.endswith("the ai ") or preceding.endswith("ai "):
-                continue
-            # If preceded by "corporation", "company", "franchise", "brand", etc. → org name, not a character
-            org_indicators = (
-                "corporation ", "company ", "the corporation ", "the company ",
-                "franchise ", "the franchise ", "brand ", "the brand ",
-                "chain ", "the chain ", "restaurant ", "the restaurant ",
-            )
-            if any(preceding.endswith(ind) for ind in org_indicators):
-                continue
-            # If followed by ", led by" or ", a franchise" etc. → org name (e.g. "BIG BITE, led by CEO X")
-            following = main_storyline[match.end():min(match.end() + 60, len(main_storyline))].lower()
-            org_following = (", led by", ", led by the", ", a franchise", ", a corporate", ", the franchise")
-            if any(following.startswith(s) for s in org_following):
-                continue
-            # If followed by "show", "series", "program", "network" → acronym (e.g. TV show), not a character
-            following = main_storyline[match.end():min(match.end() + 30, len(main_storyline))].lower()
-            if re.match(r'^\s*(show|series|program|network|station|movie|film)\b', following):
-                if len(phrase) <= 4 and phrase.isupper():
+            # Split compound names at title boundaries
+            segments = _split_compound_caps_name(raw_phrase)
+            for phrase in segments:
+                words = re.split(r'\s+', phrase)
+                words_clean = [w.strip('"') for w in words if w and (not w.startswith('"') or w.endswith('"'))]
+                if not words_clean or not all(len(w) >= 2 and w.isalpha() for w in words_clean if w.isalpha()):
                     continue
-            name_for_check = phrase.title() if phrase.isupper() else phrase
-            if self._is_place_or_region_entity(name_for_check) or self._is_event_entity(name_for_check):
-                continue
-            if self._is_company_or_concept_entity(name_for_check) or self._is_role_or_title_only(name_for_check):
-                continue
-            if self._is_group_or_team(name_for_check) or self._is_building_or_location(name_for_check):
-                continue
-            if self._is_narrative_transition(name_for_check):
-                continue
-            key = phrase.lower().strip()
-            if key in ("narrator", "story", "character"):
-                continue
-            if key in seen_lower:
-                continue
+                if phrase.upper() in non_character_all_caps:
+                    continue
+                # Single-word tokens ≤ 4 chars are likely acronyms
+                if len(words) == 1 and len(phrase) <= 4:
+                    continue
+                # If preceded by "the AI " or "AI " → AI/synthetic entity, not a human character
+                if preceding.endswith("the ai ") or preceding.endswith("ai "):
+                    continue
+                # If preceded by "corporation", "company", "franchise", "brand", etc. → org name, not a character
+                org_indicators = (
+                    "corporation ", "company ", "the corporation ", "the company ",
+                    "franchise ", "the franchise ", "brand ", "the brand ",
+                    "chain ", "the chain ", "restaurant ", "the restaurant ",
+                )
+                if any(preceding.endswith(ind) for ind in org_indicators):
+                    continue
+                # If followed by ", led by" or ", a franchise" etc. → org name (e.g. "BIG BITE, led by CEO X")
+                following = main_storyline[match.end():min(match.end() + 60, len(main_storyline))].lower()
+                org_following = (", led by", ", led by the", ", a franchise", ", a corporate", ", the franchise")
+                if any(following.startswith(s) for s in org_following):
+                    continue
+                # If followed by "show", "series", "program", "network" → acronym (e.g. TV show), not a character
+                following = main_storyline[match.end():min(match.end() + 30, len(main_storyline))].lower()
+                if re.match(r'^\s*(show|series|program|network|station|movie|film)\b', following):
+                    if len(phrase) <= 4 and phrase.isupper():
+                        continue
+                name_for_check = phrase.title() if phrase.isupper() else phrase
+                if self._is_place_or_region_entity(name_for_check) or self._is_event_entity(name_for_check):
+                    continue
+                if self._is_company_or_concept_entity(name_for_check) or self._is_role_or_title_only(name_for_check):
+                    continue
+                if self._is_group_or_team(name_for_check) or self._is_building_or_location(name_for_check):
+                    continue
+                if self._is_narrative_transition(name_for_check):
+                    continue
+                key = phrase.lower().strip()
+                if key in ("narrator", "story", "character"):
+                    continue
+                if key in seen_lower:
+                    continue
 
-            # --- Partial-name deduplication (any word count) ---
-            # Skip if this phrase is a subset of an already-extracted name
-            # e.g. "SIR REGINALD" or "SIR REG" when we already have
-            # "SIR REGINALD 'REG' BARTLETT"
-            phrase_words_lower = {w.lower().strip("'\"") for w in words if len(w) >= 2}
-            is_partial_of_existing = False
-            for existing in unique_ordered:
-                existing_words_lower = {
-                    w.lower().strip("'\"") for w in existing.split() if len(w) >= 2
-                }
-                existing_nick = self._extract_nickname_from_full_name(existing)
-                if existing_nick:
-                    existing_words_lower.add(existing_nick.lower())
-                if phrase_words_lower and phrase_words_lower <= existing_words_lower:
-                    is_partial_of_existing = True
+                # --- Partial-name deduplication (any word count) ---
+                phrase_words_lower = {w.lower().strip("'\"") for w in words if len(w) >= 2}
+                is_partial_of_existing = False
+                for existing in unique_ordered:
+                    existing_words_lower = {
+                        w.lower().strip("'\"") for w in existing.split() if len(w) >= 2
+                    }
+                    existing_nick = self._extract_nickname_from_full_name(existing)
+                    if existing_nick:
+                        existing_words_lower.add(existing_nick.lower())
+                    if phrase_words_lower and phrase_words_lower <= existing_words_lower:
+                        is_partial_of_existing = True
+                        break
+                if is_partial_of_existing:
+                    continue
+
+                # Skip single-word forms: first name, last name, or nickname of an existing entry
+                if len(words) == 1:
+                    is_nickname_dup = any(
+                        self._extract_nickname_from_full_name(existing) and
+                        self._extract_nickname_from_full_name(existing).lower() == key
+                        for existing in unique_ordered
+                    )
+                    if is_nickname_dup:
+                        continue
+                    is_lastname_dup = any(
+                        (e.split()[-1] if " " in e else "").lower() == key
+                        for e in unique_ordered
+                    )
+                    if is_lastname_dup:
+                        continue
+                    is_nickname_for_first = any(
+                        self._is_nickname_of_first_name(phrase, existing)
+                        for existing in unique_ordered
+                    )
+                    if is_nickname_for_first:
+                        continue
+
+                # Replace existing if this is a longer form containing all words of a shorter entry
+                existing_idx = None
+                for i, existing in enumerate(unique_ordered):
+                    ex_words_lower = {
+                        w.lower().strip("'\"") for w in existing.split() if len(w) >= 2
+                    }
+                    ex_nick = self._extract_nickname_from_full_name(existing)
+                    if ex_nick:
+                        ex_words_lower.add(ex_nick.lower())
+                    if ex_words_lower and ex_words_lower < phrase_words_lower:
+                        existing_idx = i
+                        break
+                if existing_idx is not None:
+                    old = unique_ordered[existing_idx]
+                    unique_ordered[existing_idx] = phrase
+                    seen_lower.discard(old.lower())
+                    seen_lower.add(key)
+                elif key not in seen_lower:
+                    seen_lower.add(key)
+                    unique_ordered.append(phrase)
+                if len(unique_ordered) >= n:
                     break
-            if is_partial_of_existing:
-                continue
-
-            # Skip single-word forms: first name, last name, or nickname of an existing entry
-            if len(words) == 1:
-                is_nickname_dup = any(
-                    self._extract_nickname_from_full_name(existing) and
-                    self._extract_nickname_from_full_name(existing).lower() == key
-                    for existing in unique_ordered
-                )
-                if is_nickname_dup:
-                    continue
-                is_lastname_dup = any(
-                    (e.split()[-1] if " " in e else "").lower() == key
-                    for e in unique_ordered
-                )
-                if is_lastname_dup:
-                    continue
-                is_nickname_for_first = any(
-                    self._is_nickname_of_first_name(phrase, existing)
-                    for existing in unique_ordered
-                )
-                if is_nickname_for_first:
-                    continue
-
-            # Replace existing if this is a longer form containing all words of a shorter entry
-            existing_idx = None
-            for i, existing in enumerate(unique_ordered):
-                ex_words_lower = {
-                    w.lower().strip("'\"") for w in existing.split() if len(w) >= 2
-                }
-                ex_nick = self._extract_nickname_from_full_name(existing)
-                if ex_nick:
-                    ex_words_lower.add(ex_nick.lower())
-                if ex_words_lower and ex_words_lower < phrase_words_lower:
-                    existing_idx = i
-                    break
-            if existing_idx is not None:
-                old = unique_ordered[existing_idx]
-                unique_ordered[existing_idx] = phrase
-                seen_lower.discard(old.lower())
-                seen_lower.add(key)
-            elif key not in seen_lower:
-                seen_lower.add(key)
-                unique_ordered.append(phrase)
             if len(unique_ordered) >= n:
                 break
         return unique_ordered[:n]
@@ -2223,6 +2352,38 @@ IMPORTANT JSON RULES:
             "bridge", "cockpit", "hold", "cabin", "quarters",
         })
 
+        # Leading qualifier phrases: "<qualifier> of (the) _Name_" → "Name Qualifier"
+        _LEADING_QUALIFIER_RE = re.compile(
+            r'(\b(?:stage|back|front|entrance|exit|roof|rooftop|top|bottom|side|corner'
+            r'|center|centre|middle|edge|steps|lobby|foyer|courtyard|patio|terrace'
+            r'|balcony|doorway|doorstep|parking lot|alley|alleyway)\b)'
+            r'\s+of\s+(?:the\s+)?$',
+            re.IGNORECASE
+        )
+
+        # Words indicating a group of people rather than a place — reject
+        # underscored phrases whose last word is one of these (e.g. _Temple Elders_).
+        _PEOPLE_GROUP_TAIL_WORDS = frozenset({
+            "elders", "elder", "monks", "monk", "priests", "priest", "priestess",
+            "priestesses", "nuns", "nun", "warriors", "warrior", "soldiers", "soldier",
+            "villagers", "villager", "townsfolk", "townspeople", "citizens", "citizen",
+            "residents", "resident", "settlers", "settler", "refugees", "refugee",
+            "pilgrims", "pilgrim", "travelers", "traveler", "travellers", "traveller",
+            "merchants", "merchant", "traders", "trader", "guards", "guard",
+            "sentinels", "sentinel", "watchers", "watcher", "servants", "servant",
+            "slaves", "slave", "captives", "captive", "prisoners", "prisoner",
+            "disciples", "disciple", "acolytes", "acolyte", "apprentices", "apprentice",
+            "students", "student", "scholars", "scholar", "sages", "sage",
+            "healers", "healer", "shamans", "shaman", "druids", "druid",
+            "knights", "knight", "paladins", "paladin", "rangers", "ranger",
+            "assassins", "assassin", "thieves", "thief", "rogues", "rogue",
+            "hunters", "hunter", "gatherers", "gatherer", "farmers", "farmer",
+            "fishermen", "fisherman", "miners", "miner", "workers", "worker",
+            "nobles", "noble", "lords", "ladies", "chiefs", "chieftains", "chieftain",
+            "advisors", "advisor", "advisers", "adviser", "councilors", "councilor",
+            "members", "people", "folk", "folks", "inhabitants",
+        })
+
         seen = set()
         unique = []
         for m in re.finditer(r'_([^_]+)_', cleaned_text):
@@ -2232,6 +2393,16 @@ IMPORTANT JSON RULES:
             # Reject matches that span prose (sentence fragments, punctuation runs)
             if any(ch in name for ch in '()[]{}*"'):
                 continue
+            # Reject underscored phrases that refer to groups of people, not places
+            name_words_lower = name.lower().split()
+            if name_words_lower and name_words_lower[-1] in _PEOPLE_GROUP_TAIL_WORDS:
+                continue
+            # Absorb leading qualifier phrase (e.g. "stage of the _Club_" → "Club Stage")
+            preceding = cleaned_text[:m.start()]
+            lead_match = _LEADING_QUALIFIER_RE.search(preceding)
+            if lead_match:
+                qualifier = lead_match.group(1).strip().title()
+                name = name + " " + qualifier
             # Absorb trailing qualifier words that sit outside the underscores
             rest = cleaned_text[m.end():]
             trail_match = re.match(r'^(\s+[A-Za-z]+(?:\s+[A-Za-z]+)?)', rest)
@@ -2359,20 +2530,37 @@ IMPORTANT JSON RULES:
             key = name.lower()
             if key in seen:
                 continue
+            # Skip markup found inside dialogue (odd quote count = inside quotes)
+            if text[:m.start()].count('"') % 2 == 1:
+                continue
             if require_interaction and not self._scene_markup_has_interaction(text, name, "object"):
                 continue
             seen.add(key)
             unique.append(name)
         return unique
     
+    _BUILDING_VENUE_WORDS = frozenset({
+        "club", "bar", "pub", "tavern", "inn", "restaurant", "cafe", "diner",
+        "shop", "store", "market", "mall", "theater", "theatre", "cinema",
+        "church", "temple", "mosque", "cathedral", "chapel", "shrine",
+        "school", "university", "college", "academy", "library", "museum",
+        "hospital", "clinic", "office", "building", "tower", "house", "home",
+        "apartment", "flat", "mansion", "palace", "castle", "fortress", "fort",
+        "hotel", "motel", "hostel", "lodge", "resort", "gym", "arena", "stadium",
+        "park", "garden", "zoo", "gallery", "salon", "studio", "warehouse",
+        "factory", "plant", "station", "garage", "barn", "shed", "bunker",
+        "basement", "attic", "cellar", "lab", "laboratory", "morgue", "prison",
+        "jail", "precinct", "headquarters", "hq", "base", "compound",
+    })
+
     def _extract_vehicles_from_scene_markup(self, text: str, require_interaction: bool = True) -> List[str]:
         """Extract vehicle names from {brace} markup. Only return if interaction present when require_interaction=True."""
         if not text or not text.strip():
             return []
         seen = set()
         unique = []
-        # Reject common words mistakenly in braces (e.g. {the})
         INVALID_ENTITY_WORDS = frozenset({"the", "a", "an", "this", "that", "it", "his", "her", "their"})
+        _strip_art = re.compile(r'^(?:the|a|an)\s+', re.IGNORECASE)
         for m in re.finditer(r'\{([^{}]+)\}', text):
             name = m.group(1).strip()
             if not name or len(name) < 2:
@@ -2381,6 +2569,13 @@ IMPORTANT JSON RULES:
             if key in INVALID_ENTITY_WORDS:
                 continue
             if key in seen:
+                continue
+            # Skip markup found inside dialogue (odd quote count = inside quotes)
+            if text[:m.start()].count('"') % 2 == 1:
+                continue
+            # Reject building/venue words that are never vehicles
+            core = _strip_art.sub('', key).strip()
+            if core in self._BUILDING_VENUE_WORDS:
                 continue
             if require_interaction and not self._scene_markup_has_interaction(text, name, "vehicle"):
                 continue
@@ -2412,13 +2607,22 @@ IMPORTANT JSON RULES:
                             "galley", "engine room", "medbay", "bay", "interior", "corridor",
                             "hallway", "lounge", "bridge"
                         )
-                        if any(kw in space_part for kw in interior_keywords) or len(space_part) <= 30:
+                        if any(kw in space_part for kw in interior_keywords):
                             return vehicle_part
         # Pattern: "Space of Vehicle" (e.g. "Bridge of Starfall Cruiser")
-        of_match = re.search(r"\s+of\s+(.+)$", name, re.IGNORECASE)
+        # Only match when the word before "of" is a known interior keyword —
+        # otherwise "Temple of Dying Light" would falsely extract "Dying Light"
+        # as a vehicle.
+        interior_of_keywords = (
+            "bridge", "cockpit", "cabin", "cargo", "hold", "deck", "quarters",
+            "galley", "engine room", "medbay", "bay", "interior", "corridor",
+            "hallway", "lounge", "helm", "turret", "brig", "armory", "armoury",
+        )
+        of_match = re.search(r"(\S+)\s+of\s+(.+)$", name, re.IGNORECASE)
         if of_match:
-            vehicle_part = of_match.group(1).strip()
-            if vehicle_part and len(vehicle_part) >= 2:
+            space_word = of_match.group(1).strip().lower()
+            vehicle_part = of_match.group(2).strip()
+            if vehicle_part and len(vehicle_part) >= 2 and space_word in interior_of_keywords:
                 return vehicle_part
         return None
     
@@ -2432,8 +2636,9 @@ IMPORTANT JSON RULES:
         underlined_spans = [(m.start(), m.end()) for m in re.finditer(r'_[^_]+_', text)]
         _hon = r"(?:(?:MRS?|MS|DR|MME|PROF|SGT|CPT|LT|GEN|COL|REV|CMDR|CAPT)\.\s+)?"
         _nw = r"[A-Z][A-Z0-9]*(?:'[A-Z][A-Z0-9]*)?"
+        _article = r"(?:(?i:the|an?|of|de|la|le|von|van)[ \t]+)*"
         all_caps_pattern = re.compile(
-            rf"\b({_hon}{_nw}(?:[ \t]+(?:{_nw}|\"[^\"]*\"|'[^']*'))*)\b"
+            rf"\b({_hon}{_nw}(?:[ \t]+{_article}(?:{_nw}|\"[^\"]*\"|'[^']*'))*)\b"
         )
         for match in all_caps_pattern.finditer(text):
             if len(match.group(1).strip()) < 2:
@@ -2467,6 +2672,144 @@ IMPORTANT JSON RULES:
                     break
         return (len(issues) == 0, issues)
     
+    @staticmethod
+    def _fix_duplicate_word_before_bracket(content: str) -> str:
+        """Remove duplicate leading word that appears both before and inside brackets.
+
+        The AI sometimes writes ``a brass [brass telescope]`` when the object's
+        registered name already includes the adjective.  This collapses it to
+        ``a [brass telescope]``.  Works for ``[...]``, ``{...}``, and ``_..._``.
+        """
+        if not content:
+            return content
+        # [square brackets] — objects
+        content = re.sub(
+            r'\b(\w+)\s+\[\1\s+',
+            lambda m: f'[{m.group(1)} ',
+            content,
+            flags=re.IGNORECASE,
+        )
+        # {curly braces} — vehicles
+        content = re.sub(
+            r'\b(\w+)\s+\{\1\s+',
+            lambda m: f'{{{m.group(1)} ',
+            content,
+            flags=re.IGNORECASE,
+        )
+        return content
+
+    @staticmethod
+    def _strip_ai_preamble(text: str) -> str:
+        """Remove conversational preamble the AI sometimes prepends to rewritten scenes.
+
+        Handles contractions (Here's), full forms (Here is), and various phrasings
+        like "Below is the …", "The following is the …", etc.  Also strips any
+        leading text before the first numbered paragraph tag ``[1]`` and collapses
+        doubled paragraph tags like ``[1] [1]``.
+        """
+        if not text:
+            return text
+        _patterns = [
+            # "Here's the complete scene …:" / "Here is the corrected scene …:"
+            r"^Here(?:'s|\s+is)\s+the\s+[^:\n]{0,120}:\s*\n+",
+            # "Below is the …:"
+            r"^Below\s+is\s+the\s+[^:\n]{0,120}:\s*\n+",
+            # "The following is the …:"
+            r"^The\s+following\s+is\s+the\s+[^:\n]{0,120}:\s*\n+",
+            # "I've rewritten / fixed / corrected …:" (first-person)
+            r"^I(?:'ve|\s+have)\s+(?:rewritten|fixed|corrected|updated|revised)[^:\n]{0,120}:\s*\n+",
+            # "Sure! Here's …:" / "Certainly, here's …:" / "Of course …:"
+            r"^(?:Sure|Certainly|Of\s+course)[!,.]?\s*(?:Here(?:'s|\s+is))[^:\n]{0,120}:\s*\n+",
+        ]
+        for pat in _patterns:
+            text = re.sub(pat, "", text, count=1, flags=re.IGNORECASE)
+
+        # If the text still doesn't start with a paragraph tag but contains one,
+        # strip everything before the first [N] (catches unexpected preamble forms).
+        m = re.match(r'^(?!\s*\[\d+\]).+?(?=\[\d+\])', text, re.DOTALL)
+        if m and len(m.group(0).strip()) < 300:
+            text = text[m.end():]
+
+        # Collapse doubled paragraph tags: "[1] [1]" → "[1]"
+        text = re.sub(r'\[(\d+)\]\s*\[\1\]', r'[\1]', text)
+
+        return text.strip()
+
+    @staticmethod
+    def _sanitize_paragraph_tags(content: str) -> str:
+        """Final cleanup pass for paragraph numbering issues.
+
+        Fixes:
+        - Doubled tags: ``[1] [1] Text`` → ``[1] Text``
+        - Mismatched duplicates: ``[2] [1] Text`` → ``[1] Text`` (keep the second)
+        - Sequential renumbering if tags are out of order after validator rewrites
+        """
+        if not content:
+            return content
+
+        paragraphs = content.split("\n\n")
+        cleaned = []
+        for para in paragraphs:
+            # Collapse doubled/tripled tags: "[N] [N]" or "[N] [M]" at the start
+            para = re.sub(
+                r'^(\[\d+\]\s*)+(\[\d+\])',
+                r'\2',
+                para,
+            )
+            cleaned.append(para)
+
+        # Renumber sequentially: [1], [2], [3], …
+        result = []
+        idx = 1
+        for para in cleaned:
+            para = re.sub(r'^\[(\d+)\]', f'[{idx}]', para)
+            result.append(para)
+            idx += 1
+
+        return "\n\n".join(result)
+
+    @staticmethod
+    def _deduplicate_dialogue(content: str) -> str:
+        """Remove duplicated dialogue within the same paragraph.
+
+        Catches patterns like:
+            "You think your sacrifice changes anything, You think your sacrifice changes anything?"
+            "Take it all, Eliana! Every regret, every face from Take it all, Eliana! Every regret..."
+        """
+        if not content:
+            return content
+        import re
+
+        def _dedup_line(line: str) -> str:
+            match = re.search(r'"([^"]+)"', line)
+            if not match:
+                return line
+            full_dialogue = match.group(1)
+            half_len = len(full_dialogue) // 2
+            if half_len < 10:
+                return line
+            for split_pos in range(half_len - 5, half_len + 6):
+                if split_pos >= len(full_dialogue):
+                    continue
+                first_half = full_dialogue[:split_pos].rstrip(" ,!?.;:")
+                second_half = full_dialogue[split_pos:].lstrip(" ,!?.;:")
+                if not first_half or not second_half:
+                    continue
+                if first_half.lower().rstrip("!?.") == second_half.lower().rstrip("!?."):
+                    cleaned = second_half
+                    return line.replace(f'"{full_dialogue}"', f'"{cleaned}"')
+                if second_half.lower().startswith(first_half.lower()[:20]):
+                    return line.replace(f'"{full_dialogue}"', f'"{second_half}"')
+            return line
+
+        paragraphs = content.split("\n\n")
+        result = []
+        for para in paragraphs:
+            if '"' in para:
+                para = _dedup_line(para)
+            result.append(para)
+        return "\n\n".join(result)
+
     def _repair_sentence_integrity(self, content: str) -> Tuple[str, List[str]]:
         """
         Detect and repair incomplete/broken sentences caused by AI word-dropping.
@@ -2484,7 +2827,7 @@ IMPORTANT JSON RULES:
             return content, []
         
         warnings = [f"Sentence integrity: {len(issues)} broken sentence(s) detected"]
-        print(f"SENTENCE INTEGRITY: {format_issues_summary(issues)}")
+        _safe_print(f"SENTENCE INTEGRITY: {format_issues_summary(issues)}")
         
         # If no AI adapter, return with warnings only (can't repair)
         if not self._adapter:
@@ -2539,17 +2882,17 @@ IMPORTANT JSON RULES:
                         warnings.append(f"Sentence integrity: repaired {fixed_count}/{len(issues)} issues")
                         if remaining:
                             warnings.append(f"Sentence integrity: {len(remaining)} issue(s) could not be auto-repaired")
-                        print(f"SENTENCE INTEGRITY: Repaired {fixed_count}/{len(issues)} issues")
+                        _safe_print(f"SENTENCE INTEGRITY: Repaired {fixed_count}/{len(issues)} issues")
                         return repaired, warnings
                     else:
                         warnings.append("Sentence integrity: AI repair did not resolve issues")
-                        print("SENTENCE INTEGRITY: AI repair did not resolve issues")
+                        _safe_print("SENTENCE INTEGRITY: AI repair did not resolve issues")
                 else:
                     warnings.append("Sentence integrity: AI repair rejected (too much content lost)")
-                    print(f"SENTENCE INTEGRITY: Repair rejected — original {len(orig_lines)} lines, repair {len(repair_lines)} lines")
+                    _safe_print(f"SENTENCE INTEGRITY: Repair rejected — original {len(orig_lines)} lines, repair {len(repair_lines)} lines")
         except Exception as e:
             warnings.append(f"Sentence integrity: repair failed — {str(e)}")
-            print(f"SENTENCE INTEGRITY: Repair failed — {e}")
+            _safe_print(f"SENTENCE INTEGRITY: Repair failed — {e}")
         
         return content, warnings
     
@@ -2942,13 +3285,15 @@ IMPORTANT JSON RULES:
         
         # METHOD 1: Find ALL FULL CAPS phrases in scene text (Wizard markup)
         # Supports honorifics (MRS., DR., MME.) and apostrophe names (O'MALLEY)
+        # _article bridges lowercase articles between CAPS words (e.g. "ACORN the INVINCIBLE")
         _hon = r"(?:(?:MRS?|MS|DR|MME|PROF|SGT|CPT|LT|GEN|COL|REV|CMDR|CAPT)\.\s+)?"
         _nw = r"[A-Z][A-Z0-9]*(?:'[A-Z][A-Z0-9]*)?"
+        _article = r"(?:(?i:the|an?|of|de|la|le|von|van)[ \t]+)*"
         all_caps_pattern = re.compile(
-            rf"\b({_hon}{_nw}(?:[ \t]+(?:{_nw}|\"[^\"]*\"|'[^']*'))*)\b"
+            rf"\b({_hon}{_nw}(?:[ \t]+{_article}(?:{_nw}|\"[^\"]*\"|'[^']*'))*)\b"
         )
         for match in all_caps_pattern.finditer(scene_text):
-            phrase = match.group(1).strip()
+            phrase = match.group(1).strip().upper()
             if len(phrase) < 2:
                 continue
             if inside_underlined(match.start()):
@@ -3031,7 +3376,8 @@ IMPORTANT JSON RULES:
         
         Returns:
             List of character names (canonical when in registry, as-written otherwise).
-            Deduplicated.
+            Deduplicated. Group entities (e.g. IMPERIAL SOLDIERS) are excluded — use
+            extract_groups_named_in_scene() for those.
         """
         if not scene_text or not scene_text.strip():
             return []
@@ -3073,6 +3419,20 @@ IMPORTANT JSON RULES:
             "initiate", "activate", "deactivate", "engage", "disengage",
             "commence", "abort", "complete", "confirmed", "negative",
             "affirmative", "copy", "roger", "over", "out",
+            # Major cities / countries that the AI may write in ALL-CAPS
+            "london", "paris", "berlin", "madrid", "rome", "tokyo", "beijing",
+            "shanghai", "moscow", "cairo", "lagos", "mumbai", "delhi", "sydney",
+            "melbourne", "toronto", "vancouver", "montreal", "chicago", "houston",
+            "boston", "miami", "seattle", "dallas", "atlanta", "denver", "detroit",
+            "phoenix", "portland", "nashville", "austin", "philadelphia",
+            "manhattan", "brooklyn", "queens", "bronx", "harlem", "hollywood",
+            "geneva", "zurich", "vienna", "prague", "warsaw", "budapest",
+            "amsterdam", "brussels", "lisbon", "oslo", "stockholm", "copenhagen",
+            "helsinki", "dublin", "edinburgh", "glasgow", "athens", "istanbul",
+            "nairobi", "johannesburg", "bogota", "lima", "santiago", "havana",
+            "england", "france", "germany", "spain", "italy", "japan", "china",
+            "russia", "india", "brazil", "canada", "australia", "mexico",
+            "america", "europe", "africa", "asia",
         })
         
         # Body-part words that should never be character names on their own
@@ -3103,96 +3463,102 @@ IMPORTANT JSON RULES:
         
         # Find ALL FULL CAPS phrases (screenplay character markup)
         # Supports honorifics (MRS., DR., MME.) and apostrophe names (O'MALLEY)
+        # _article bridges lowercase articles between CAPS words (e.g. "ACORN the INVINCIBLE")
         _hon = r"(?:(?:MRS?|MS|DR|MME|PROF|SGT|CPT|LT|GEN|COL|REV|CMDR|CAPT)\.\s+)?"
         _nw = r"[A-Z][A-Z0-9]*(?:'[A-Z][A-Z0-9]*)?"
+        _article = r"(?:(?i:the|an?|of|de|la|le|von|van)[ \t]+)*"
         all_caps_pattern = re.compile(
-            rf"\b({_hon}{_nw}(?:[ \t]+(?:{_nw}|\"[^\"]*\"|'[^']*'))*)\b"
+            rf"\b({_hon}{_nw}(?:[ \t]+{_article}(?:{_nw}|\"[^\"]*\"|'[^']*'))*)\b"
         )
         for match in all_caps_pattern.finditer(scene_text):
-            phrase = match.group(1).strip()
-            if len(phrase) < 2:
+            raw_phrase = match.group(1).strip().upper()
+            if len(raw_phrase) < 2:
                 continue
             # Skip possessive fragments: if the character immediately before
             # the match is an apostrophe, this is a leftover from "NAME'S BODY"
-            # e.g. FILMMAKER'S HANDS → regex captures "S HANDS" after the apostrophe
             match_start = match.start()
             if match_start > 0 and scene_text[match_start - 1] in "'\u2019\u2018":
                 continue
             # Skip ALL-CAPS inside _underlined_ regions (environments/locations, not characters)
             if inside_underlined(match_start):
                 continue
-            # Skip obvious non-character words (acronyms, camera directions, sounds)
-            phrase_lower = phrase.lower()
-            if phrase_lower in NON_CHARACTER_CAPS:
-                continue
-            # Skip phrases where ALL words are non-character terms or body parts
-            words = phrase.split()
-            all_words_non_char = all(
-                w.lower() in NON_CHARACTER_CAPS or w.lower() in _BODY_PART_CAPS
-                for w in words
-            )
-            if all_words_non_char:
-                continue
-            # Reject phrases that are stage directions (e.g. "JERMY SITTING ALONE") not character names
-            ACTION_DESCRIPTOR_WORDS = frozenset({
-                "sitting", "standing", "walking", "alone", "quietly", "slowly", "quickly",
-                "silently", "still", "motionless", "waiting", "watching", "looking", "leaning",
-                "lying", "kneeling", "crouching", "running", "entering", "exiting"
-            })
-            if len(words) >= 2:
-                # If 2nd+ word is an action/descriptor, this is likely "NAME SITTING ALONE" - not a name
-                if any(w.lower() in ACTION_DESCRIPTOR_WORDS for w in words[1:]):
+            # Split compound names at title/honorific boundaries
+            segments = _split_compound_caps_name(raw_phrase)
+            for phrase in segments:
+                phrase_lower = phrase.lower()
+                if phrase_lower in NON_CHARACTER_CAPS:
                     continue
-            # Single short tokens that are likely acronyms
-            if len(words) == 1 and len(phrase) <= 3:
-                continue
-            # --- Contextual filter: skip CAPS phrases preceded by label indicators ---
-            # Phrases like "protocol: TERMINAL SANCTION" or "codename PHOENIX" are labels, not characters
-            _LABEL_INDICATORS = re.compile(
-                r'(?:protocol|codename|code\s*name|operation|project|program|initiative|'
-                r'directive|order|mission|designation|classification|file|alert|warning|'
-                r'signal|plan|phase|stage|level|status|mode|procedure|system|'
-                r'clearance|authorization|condition|report|dossier|case)\s*[:\-—–]\s*$',
-                re.IGNORECASE
-            )
-            pre_text = scene_text[max(0, match_start - 80):match_start]
-            if _LABEL_INDICATORS.search(pre_text):
-                continue
-            # --- Common-word filter: reject multi-word CAPS phrases where every word is
-            # a common English word (not a plausible proper name) ---
-            _COMMON_NON_NAME_WORDS = frozenset({
-                "terminal", "sanction", "human", "population", "control", "access",
-                "denied", "granted", "approved", "rejected", "classified", "restricted",
-                "authorized", "emergency", "critical", "maximum", "minimum", "total",
-                "final", "primary", "secondary", "active", "inactive", "standard",
-                "special", "advanced", "basic", "global", "local", "central",
-                "national", "federal", "general", "public", "private", "internal",
-                "external", "upper", "lower", "high", "low", "top", "bottom",
-                "level", "phase", "stage", "code", "data", "file", "system",
-                "network", "protocol", "program", "project", "operation", "mission",
-                "target", "status", "report", "signal", "alert", "warning",
-                "breach", "lockdown", "shutdown", "override", "sequence", "procedure",
-                "response", "defense", "attack", "strike", "force", "power",
-                "energy", "sector", "zone", "unit", "division", "command",
-                "council", "order", "directive", "initiative", "contingency",
-                "elimination", "termination", "extermination", "extraction",
-                "containment", "quarantine", "purge", "cleanse", "reset",
-                "absolute", "ultimate", "supreme", "omega", "alpha", "delta",
-                "gamma", "sigma", "echo", "bravo", "tango", "foxtrot",
-            })
-            if len(words) >= 2:
-                if all(w.lower() in _COMMON_NON_NAME_WORDS for w in words):
+                # Check expanded acronym blocklist
+                if phrase.upper() in _ACRONYM_BLOCKLIST:
                     continue
-            # Use canonical name if in registry; otherwise use as-written
-            if screenplay and getattr(screenplay, "character_registry_frozen", False):
-                canonical = screenplay.resolve_character_to_canonical(phrase)
-                add_name(canonical if canonical is not None else phrase)
-            else:
-                add_name(phrase)
+                words = phrase.split()
+                all_words_non_char = all(
+                    w.lower() in NON_CHARACTER_CAPS or w.lower() in _BODY_PART_CAPS
+                    for w in words
+                )
+                if all_words_non_char:
+                    continue
+                ACTION_DESCRIPTOR_WORDS = frozenset({
+                    "sitting", "standing", "walking", "alone", "quietly", "slowly", "quickly",
+                    "silently", "still", "motionless", "waiting", "watching", "looking", "leaning",
+                    "lying", "kneeling", "crouching", "running", "entering", "exiting"
+                })
+                if len(words) >= 2:
+                    if any(w.lower() in ACTION_DESCRIPTOR_WORDS for w in words[1:]):
+                        continue
+                # Resolve to canonical registry name early so that short
+                # aliases (e.g. "AEON" → "AI AEON") are recognised before
+                # heuristic filters discard them.
+                resolved_phrase = phrase
+                if screenplay and getattr(screenplay, "character_registry_frozen", False):
+                    canonical = screenplay.resolve_character_to_canonical(phrase)
+                    if canonical is not None:
+                        resolved_phrase = canonical
+                # Single short tokens (≤4 chars) are likely acronyms (BOLO, NSA, etc.)
+                # Skip this filter when the phrase resolved to a known registry character.
+                if len(words) == 1 and len(phrase) <= 4 and resolved_phrase == phrase:
+                    continue
+                _LABEL_INDICATORS = re.compile(
+                    r'(?:protocol|codename|code\s*name|operation|project|program|initiative|'
+                    r'directive|order|mission|designation|classification|file|alert|warning|'
+                    r'signal|plan|phase|stage|level|status|mode|procedure|system|'
+                    r'clearance|authorization|condition|report|dossier|case)\s*[:\-—–]\s*$',
+                    re.IGNORECASE
+                )
+                pre_text = scene_text[max(0, match_start - 80):match_start]
+                if _LABEL_INDICATORS.search(pre_text):
+                    continue
+                _COMMON_NON_NAME_WORDS = frozenset({
+                    "terminal", "sanction", "human", "population", "control", "access",
+                    "denied", "granted", "approved", "rejected", "classified", "restricted",
+                    "authorized", "emergency", "critical", "maximum", "minimum", "total",
+                    "final", "primary", "secondary", "active", "inactive", "standard",
+                    "special", "advanced", "basic", "global", "local", "central",
+                    "national", "federal", "general", "public", "private", "internal",
+                    "external", "upper", "lower", "high", "low", "top", "bottom",
+                    "level", "phase", "stage", "code", "data", "file", "system",
+                    "network", "protocol", "program", "project", "operation", "mission",
+                    "target", "status", "report", "signal", "alert", "warning",
+                    "breach", "lockdown", "shutdown", "override", "sequence", "procedure",
+                    "response", "defense", "attack", "strike", "force", "power",
+                    "energy", "sector", "zone", "unit", "division", "command",
+                    "council", "order", "directive", "initiative", "contingency",
+                    "elimination", "termination", "extermination", "extraction",
+                    "containment", "quarantine", "purge", "cleanse", "reset",
+                    "absolute", "ultimate", "supreme", "omega", "alpha", "delta",
+                    "gamma", "sigma", "echo", "bravo", "tango", "foxtrot",
+                })
+                if len(words) >= 2:
+                    if all(w.lower() in _COMMON_NON_NAME_WORDS for w in words):
+                        continue
+                add_name(resolved_phrase)
         
         # --- Post-processing: clean the character list ---
+        # 0. Remove group/team entities (e.g. IMPERIAL SOLDIERS) — they get separate group identity blocks
+        found = [n for n in found if not self._is_group_or_team(n.title() if n.isupper() else n)]
         # 1. Filter non-person entities (software UI, abstract visuals, etc.)
-        found = [n for n in found if not self._is_company_or_concept_entity(n)]
+        #    Pass screenplay so registry characters are never rejected.
+        found = [n for n in found if not self._is_company_or_concept_entity(n, screenplay)]
         
         # 2. Fold body-part possessives ("filmmaker's hands" → "filmmaker")
         cleaned = []
@@ -3213,7 +3579,106 @@ IMPORTANT JSON RULES:
                 cleaned_lower.add(name.lower())
         
         return cleaned
-    
+
+    def extract_groups_named_in_scene(
+        self,
+        scene_text: str,
+        screenplay: Optional[Screenplay] = None,
+        scene_description: str = "",
+        character_focus: Optional[List[str]] = None,
+    ) -> List[str]:
+        """Extract group/team entities from scene content and description.
+
+        Uses multiple strategies:
+        1. ALL-CAPS regex scan of scene_text (generated content)
+        2. ALL-CAPS regex scan of scene_description (user-written, canonical names)
+        3. character_focus list check (groups may be listed alongside characters)
+        4. Case-insensitive scan of scene_text for groups found in description
+
+        Returns:
+            Deduplicated list of group names in canonical UPPER CASE form.
+        """
+        import re
+
+        NON_CHARACTER_CAPS = frozenset({
+            "a", "i", "the", "usa", "fbi", "cia", "fda", "tv", "fm", "am", "dc", "ac",
+            "int", "ext", "cut", "fade", "dissolve", "close", "open", "end",
+            "pan", "zoom", "dolly", "camera", "scene", "act", "flashback",
+        })
+
+        _hon = r"(?:(?:MRS?|MS|DR|MME|PROF|SGT|CPT|LT|GEN|COL|REV|CMDR|CAPT)\.\s+)?"
+        _nw = r"[A-Z][A-Z0-9]*(?:'[A-Z][A-Z0-9]*)?"
+        _article = r"(?:(?i:the|an?|of|de|la|le|von|van)[ \t]+)*"
+        all_caps_pattern = re.compile(
+            rf"\b({_hon}{_nw}(?:[ \t]+{_article}(?:{_nw}|\"[^\"]*\"|'[^']*'))*)\b"
+        )
+
+        groups: List[str] = []
+        seen_lower: set = set()
+
+        def _scan_text_for_groups(text: str) -> None:
+            if not text or not text.strip():
+                return
+            underlined_spans = []
+            for um in re.finditer(r'_[^_]+_', text):
+                underlined_spans.append((um.start(), um.end()))
+
+            def inside_underlined(pos: int) -> bool:
+                return any(s <= pos < e for s, e in underlined_spans)
+
+            for match in all_caps_pattern.finditer(text):
+                raw_phrase = match.group(1).strip().upper()
+                if len(raw_phrase) < 2:
+                    continue
+                if inside_underlined(match.start()):
+                    continue
+                phrase_lower = raw_phrase.lower()
+                if phrase_lower in NON_CHARACTER_CAPS:
+                    continue
+                name_for_check = raw_phrase.title() if raw_phrase.isupper() else raw_phrase
+                if self._is_group_or_team(name_for_check):
+                    if phrase_lower not in seen_lower:
+                        seen_lower.add(phrase_lower)
+                        groups.append(raw_phrase)
+
+        # Strategy 1 & 2: regex scan of content and description
+        _scan_text_for_groups(scene_text)
+        _scan_text_for_groups(scene_description)
+
+        # Strategy 3: check character_focus for group names
+        if character_focus:
+            for cf in character_focus:
+                cf_stripped = (cf or "").strip()
+                if not cf_stripped:
+                    continue
+                cf_check = cf_stripped.title() if cf_stripped.isupper() else cf_stripped
+                if self._is_group_or_team(cf_check):
+                    key = cf_stripped.lower()
+                    if key not in seen_lower:
+                        seen_lower.add(key)
+                        groups.append(cf_stripped.upper())
+
+        # Strategy 4: for groups found in description, verify they also appear
+        # in the content (case-insensitive) — this catches "Imperial Soldiers"
+        # in AI-generated text when the description has "IMPERIAL SOLDIERS"
+        if scene_text and scene_description:
+            content_lower = scene_text.lower()
+            for g in list(groups):
+                if g.lower() not in content_lower:
+                    # Check if individual words all appear near each other
+                    words = g.split()
+                    if len(words) >= 2:
+                        found_near = False
+                        for wm in re.finditer(re.escape(words[0].lower()), content_lower):
+                            chunk = content_lower[wm.start():wm.start() + len(g) + 10]
+                            if all(w.lower() in chunk for w in words):
+                                found_near = True
+                                break
+                        if not found_near:
+                            _safe_print(f"  [group extraction] '{g}' found in description but not in content — keeping (may appear in later scenes)")
+
+        return groups
+
     def _validate_scene_character_identity_blocks(
         self, scene_text: str, screenplay: Screenplay, identity_blocks: List[str]
     ) -> Tuple[bool, List[str]]:
@@ -3279,8 +3744,9 @@ IMPORTANT JSON RULES:
         underlined_spans = [(m.start(), m.end()) for m in re.finditer(r'_[^_]+_', text)]
         _hon_v = r"(?:(?:MRS?|MS|DR|MME|PROF|SGT|CPT|LT|GEN|COL|REV|CMDR|CAPT)\.\s+)?"
         _nw_v = r"[A-Z][A-Z0-9]*(?:'[A-Z][A-Z0-9]*)?"
+        _article_v = r"(?:(?i:the|an?|of|de|la|le|von|van)[ \t]+)*"
         all_caps_pattern = re.compile(
-            rf"\b({_hon_v}{_nw_v}(?:[ \t]+(?:{_nw_v}|\"[^\"]*\"|'[^']*'))*)\b"
+            rf"\b({_hon_v}{_nw_v}(?:[ \t]+{_article_v}(?:{_nw_v}|\"[^\"]*\"|'[^']*'))*)\b"
         )
         for match in all_caps_pattern.finditer(text):
             if len(match.group(1).strip()) < 2:
@@ -3917,6 +4383,36 @@ Return ONLY a JSON object with one field "name" set to a proper person's name (f
             error_message = str(e)
             raise Exception(f"Failed to regenerate character details: {error_message}")
     
+    def _build_series_context_for_prompt(self, screenplay) -> str:
+        """Build series bible context string for injection into AI prompts.
+
+        Reads series_metadata from the screenplay, loads the bible, and
+        returns a condensed context block. Returns empty string for
+        standalone stories.
+        """
+        meta = getattr(screenplay, "series_metadata", None)
+        if not meta:
+            return ""
+        folder = meta.get("series_folder", "")
+        if not folder:
+            return ""
+        try:
+            from core.series_manager import SeriesManager
+            if not SeriesManager.is_series_folder(folder):
+                return ""
+            bible = SeriesManager.load_series(folder)
+            context = "\n\nEPISODIC SERIES CONTEXT (MAINTAIN CONTINUITY):\n"
+            context += bible.get_series_summary_for_ai()
+            context += (
+                "\n\nSERIES RULES:"
+                "\n- Maintain all persistent characters with consistent identity."
+                "\n- Acknowledge events from previous episodes where relevant."
+                "\n- Do not contradict established world context or timeline."
+            )
+            return context
+        except Exception:
+            return ""
+
     def _get_intent_guidance(self, intent: str) -> str:
         """Get intent-specific guidance for story generation."""
         intent_guidance_map = {
@@ -3984,7 +4480,7 @@ INTENT-SPECIFIC GUIDANCE:
 - Traditional structure: Follow standard narrative conventions
 - Character development: Focus on character arcs and growth
 - Plot progression: Clear beginning, middle, and end
-- Varied pacing: Appropriate pacing for each scene type
+- Pacing rhythm: Follow the PACING RHYTHM rules — alternate Fast with Medium/Slow breathers, never 3+ consecutive same-pacing scenes
 - Balanced dialogue: Mix of dialogue and action scenes
 """
         }
@@ -4281,7 +4777,7 @@ INTENT-SPECIFIC GUIDANCE:
             
             # Item needs splitting
             any_split = True
-            print(f"BEAT DENSITY VIOLATION in item {item.sequence_number}: {violations['split_reason']}")
+            _safe_print(f"BEAT DENSITY VIOLATION in item {item.sequence_number}: {violations['split_reason']}")
             
             beat_texts = self._split_storyline_into_beats(item.storyline, violations)
             
@@ -4311,13 +4807,47 @@ INTENT-SPECIFIC GUIDANCE:
                 new_item.identity_drift_warnings = item.identity_drift_warnings or []
                 result_items.append(new_item)
             
-            print(f"  → Split into {len(beat_texts)} items: {[bt[:50] + '...' for bt in beat_texts]}")
+            _safe_print(f"  → Split into {len(beat_texts)} items: {[bt[:50] + '...' for bt in beat_texts]}")
         
         if not any_split:
             return None
         
         return result_items
-    
+
+    @staticmethod
+    def _extract_composition_from_storyline(storyline: str) -> str:
+        """Extract spatial/positional phrases from a storyline as a composition fallback.
+
+        Looks for phrases describing facing direction, relative position, or
+        frame placement and assembles them into a compact composition note.
+        Returns empty string if nothing meaningful is found.
+        """
+        if not storyline:
+            return ""
+
+        import re
+        patterns = [
+            r'(?:facing|turned?\s+(?:toward|away|to))\s+[^,.\n]+',
+            r'(?:opposite|behind|beside|next\s+to|in\s+front\s+of|across\s+from)\s+[^,.\n]+',
+            r'(?:camera[- ]?left|camera[- ]?right|centre|center|foreground|background|mid[- ]?ground)',
+            r'(?:back\s+(?:to|turned))\s+[^,.\n]+',
+            r'(?:stands?\s+at|positioned|standing\s+(?:at|in|near|by))\s+[^,.\n]+',
+            r'(?:profile\s+view|three[- ]quarter|3/4\s+angle)',
+            r'(?:side[- ]by[- ]side|shoulder[- ]to[- ]shoulder|face[- ]to[- ]face|squared\s+off)',
+            r'(?:looking\s+(?:directly\s+)?at|gazing?\s+(?:at|toward))\s+[^,.\n]+',
+            r'(?:\d+\s*(?:metres?|meters?|m|feet|ft)\s+apart)',
+        ]
+        found: list[str] = []
+        for pat in patterns:
+            for m in re.finditer(pat, storyline, re.IGNORECASE):
+                phrase = m.group(0).strip().rstrip(".,;:")
+                if phrase and phrase not in found:
+                    found.append(phrase)
+
+        if not found:
+            return ""
+        return "; ".join(found)
+
     def _detect_identity_drift(self, item: 'StoryboardItem', screenplay: 'Screenplay') -> List[str]:
         """Detect identity inconsistencies by comparing prompts against identity blocks.
         
@@ -4350,19 +4880,54 @@ INTENT-SPECIFIC GUIDANCE:
             # Extract key attributes from identity block
             identity_lower = identity_block.lower()
             
-            # Check for hair color
-            hair_colors = ['blonde', 'blond', 'brown', 'black', 'red', 'auburn', 'gray', 'grey', 'white', 'silver']
-            identity_hair = None
-            for color in hair_colors:
-                if color in identity_lower:
-                    identity_hair = color
-                    break
-            
+            # Check for hair color — use synonym groups so auburn/red,
+            # grey/silver/white, blond/blonde don't create false positives.
+            _HAIR_SYNONYM_GROUPS = [
+                frozenset({"blonde", "blond"}),
+                frozenset({"red", "auburn", "ginger", "copper"}),
+                frozenset({"gray", "grey", "silver", "white"}),
+                frozenset({"brown", "brunette"}),
+                frozenset({"black"}),
+            ]
+            _ALL_HAIR_COLORS = [c for g in _HAIR_SYNONYM_GROUPS for c in g]
+
+            def _hair_group(color: str):
+                for g in _HAIR_SYNONYM_GROUPS:
+                    if color in g:
+                        return g
+                return frozenset({color})
+
+            # Only match colours near hair-related words to avoid
+            # false positives from "red light" or "black armor".
+            import re as _re_hd
+            _HAIR_CONTEXT = _re_hd.compile(
+                r'\b(?:hair|haired|locks|strands|tresses|mane|curls|braid|braids|ponytail|bun)\b',
+                _re_hd.IGNORECASE,
+            )
+            def _find_hair_color_in_text(txt: str):
+                for sent in _re_hd.split(r'[.!?,;]+', txt):
+                    sent_low = sent.lower()
+                    if not _HAIR_CONTEXT.search(sent_low):
+                        continue
+                    for c in _ALL_HAIR_COLORS:
+                        if c in sent_low:
+                            return c
+                return None
+
+            identity_hair = _find_hair_color_in_text(identity_lower)
+            if not identity_hair:
+                for c in _ALL_HAIR_COLORS:
+                    if c in identity_lower:
+                        identity_hair = c
+                        break
+
             if identity_hair:
-                # Check if prompt mentions different hair color
-                text_hair_colors = [c for c in hair_colors if c in text and c != identity_hair]
-                if text_hair_colors:
-                    warnings.append(f"Possible hair color change for {entity_name}: identity block says '{identity_hair}', but prompt mentions '{text_hair_colors[0]}'")
+                text_hair = _find_hair_color_in_text(text)
+                if text_hair and _hair_group(text_hair) != _hair_group(identity_hair):
+                    warnings.append(
+                        f"Possible hair color change for {entity_name}: "
+                        f"identity block says '{identity_hair}', but prompt mentions '{text_hair}'"
+                    )
             
             # Check for clothing inconsistencies (basic check)
             # Look for clothing descriptions in identity block
@@ -4669,16 +5234,47 @@ INTENT-SPECIFIC GUIDANCE:
         ]
         return any(kw in text for kw in location_keywords)
     
+    # Major world cities / countries that the AI may write in ALL-CAPS,
+    # causing them to be mis-extracted as character names.
+    _KNOWN_PLACE_NAMES: frozenset = frozenset({
+        "london", "paris", "berlin", "madrid", "rome", "tokyo", "beijing",
+        "shanghai", "moscow", "cairo", "lagos", "mumbai", "delhi", "sydney",
+        "melbourne", "toronto", "vancouver", "montreal", "chicago", "houston",
+        "boston", "miami", "seattle", "dallas", "atlanta", "denver", "detroit",
+        "phoenix", "portland", "nashville", "austin", "philadelphia",
+        "manhattan", "brooklyn", "queens", "bronx", "harlem", "hollywood",
+        "geneva", "zurich", "vienna", "prague", "warsaw", "budapest",
+        "amsterdam", "brussels", "lisbon", "oslo", "stockholm", "copenhagen",
+        "helsinki", "dublin", "edinburgh", "glasgow", "athens", "istanbul",
+        "tehran", "riyadh", "dubai", "doha", "kabul", "karachi", "lahore",
+        "bangkok", "singapore", "jakarta", "manila", "hanoi", "seoul",
+        "taipei", "osaka", "kyoto", "nairobi", "johannesburg", "cape town",
+        "kinshasa", "addis ababa", "bogota", "lima", "santiago", "buenos aires",
+        "rio", "sao paulo", "havana", "mexico city",
+        "new york", "new shanghai", "new tokyo", "new london", "new delhi",
+        "los angeles", "san francisco", "san diego", "las vegas", "el paso",
+        "hong kong", "tel aviv", "kuala lumpur",
+        # Countries
+        "england", "france", "germany", "spain", "italy", "japan", "china",
+        "russia", "india", "brazil", "canada", "australia", "mexico",
+        "america", "europe", "africa", "asia",
+    })
+
     def _is_place_or_region_entity(self, name: str) -> bool:
         """Detect if a name suggests a place or region (not a character).
         
-        Used to filter out region/place names (e.g. Wild West, Downtown) from character extraction.
+        Used to filter out region/place names (e.g. Wild West, Downtown, London) from character extraction.
         """
-        text = (name or "").lower()
+        text = (name or "").strip().lower()
+        if text in self._KNOWN_PLACE_NAMES:
+            return True
         place_region_keywords = [
             "west", "east", "north", "south", "region", "district", "downtown",
             "country", "valley", "desert", "frontier", "territory", "town",
-            "county", "province", "state", "land", "realm"
+            "county", "province", "state", "land", "realm", "city", "island",
+            "village", "borough", "harbour", "harbor", "port", "bay", "creek",
+            "heights", "hills", "springs", "falls", "ridge", "grove", "park",
+            "beach", "lake", "river", "mountain", "forest", "canyon",
         ]
         return any(kw in text for kw in place_region_keywords)
     
@@ -4695,15 +5291,23 @@ INTENT-SPECIFIC GUIDANCE:
         ]
         return any(kw in text for kw in event_keywords)
 
-    def _is_company_or_concept_entity(self, name: str) -> bool:
+    def _is_company_or_concept_entity(self, name: str, screenplay=None) -> bool:
         """Detect if a name is a company, department, concept, brand, or AI/system (NOT a human character).
         
         Characters must be people. Company names, departments, concepts, brands, and AI/synthetic
         entities (e.g. AEON) must NOT be extracted as CHARACTERS. Used to reject e.g. 'Solutions'
         or 'AEON' as a character.
+        
+        If *screenplay* is provided and the name (or its canonical form) is in the
+        character registry, return False immediately — the registry is authoritative.
         """
         if not name or not isinstance(name, str):
             return True
+        # Registry override: a registered character is never a concept entity
+        if screenplay and getattr(screenplay, "character_registry_frozen", False):
+            canonical = screenplay.resolve_character_to_canonical(name.strip())
+            if canonical is not None:
+                return False
         text = (name or "").strip().lower()
         # AI/synthetic entity names (systems, not human characters)
         ai_entity_names = {"aeon", "nexus", "oracle", "synapse", "cortex", "prime", "omni"}
@@ -4798,6 +5402,10 @@ INTENT-SPECIFIC GUIDANCE:
             "sisterhood", "fraternity", "sorority", "coalition", "union",
             "patrol", "militia", "regiment", "division", "corps", "department",
             "bureau", "commission", "committee", "board", "authority",
+            "soldiers", "warriors", "officers", "knights", "pirates",
+            "rebels", "villagers", "prisoners", "servants", "mercenaries",
+            "assassins", "monks", "priests", "riders", "raiders",
+            "bandits", "hunters", "scouts", "sentries", "marines",
         ]
         # Check with "the " prefix
         if text.startswith("the "):
@@ -5274,7 +5882,7 @@ INTENT-SPECIFIC GUIDANCE:
             for kept in result:
                 kept_name = str(kept.get("name", "")).strip()
                 if self._names_share_word(name, kept_name):
-                    print(f"  [name collision] '{name}' shares a name part with '{kept_name}' — skipping '{name}'")
+                    _safe_print(f"  [name collision] '{name}' shares a name part with '{kept_name}' — skipping '{name}'")
                     is_dup = True
                     break
             if not is_dup:
@@ -5321,7 +5929,7 @@ INTENT-SPECIFIC GUIDANCE:
                 # Shared significant word (3+ chars) means name collision
                 significant_shared = {w for w in (n_tokens & k_tokens) if len(w) >= 3}
                 if significant_shared:
-                    print(f"  [name collision] '{name}' shares word(s) {significant_shared} with '{kept}' — skipping '{name}'")
+                    _safe_print(f"  [name collision] '{name}' shares word(s) {significant_shared} with '{kept}' — skipping '{name}'")
                     is_dup = True
                     break
                 # Single-word name: check first-name, last-name, nickname match
@@ -5434,7 +6042,7 @@ INTENT-SPECIFIC GUIDANCE:
                     reconstructed.append(item.storyline.strip())
             if reconstructed:
                 content = "\n\n".join(reconstructed)
-                print(f"DEBUG: Reconstructed content from {len(reconstructed)} existing storyboard items")
+                _safe_print(f"DEBUG: Reconstructed content from {len(reconstructed)} existing storyboard items")
         
         # Fallback to description if no generated_content (or reconstruction failed)
         if not content or not content.strip():
@@ -5454,7 +6062,7 @@ INTENT-SPECIFIC GUIDANCE:
             # Filter out very short beats (likely formatting artifacts), but be lenient
             beats = [b for b in beats if len(b) > 5]
             if len(beats) > 0:
-                print(f"Extracted {len(beats)} beats from scene using double newline separation")
+                _safe_print(f"Extracted {len(beats)} beats from scene using double newline separation")
                 return beats
         
         # If no double newlines or only one beat, try single newlines
@@ -5486,7 +6094,7 @@ INTENT-SPECIFIC GUIDANCE:
             # Filter out very short beats
             numbered_beats = [b for b in numbered_beats if len(b) > 5]
             if len(numbered_beats) > 0:
-                print(f"Extracted {len(numbered_beats)} beats from scene using numbered/bullet pattern")
+                _safe_print(f"Extracted {len(numbered_beats)} beats from scene using numbered/bullet pattern")
                 return numbered_beats
         
         # Fallback: use single newline splits, but filter more aggressively
@@ -5514,12 +6122,12 @@ INTENT-SPECIFIC GUIDANCE:
         final_beats = [b for b in final_beats if len(b) > 10]
         
         if len(final_beats) > 0:
-            print(f"Extracted {len(final_beats)} beats from scene using line grouping")
+            _safe_print(f"Extracted {len(final_beats)} beats from scene using line grouping")
             return final_beats
         
         # Last resort: return the entire content as a single beat
         if content.strip():
-            print(f"Scene content treated as single beat (could not split into multiple beats)")
+            _safe_print(f"Scene content treated as single beat (could not split into multiple beats)")
             return [content.strip()]
         
         return []
@@ -5739,8 +6347,190 @@ TEXT SECTION {i + 1}/{len(chunks)}:
 
         return result
 
-    def generate_story_framework(self, premise: str, title: str = "", length: str = "medium", atmosphere: str = "", genres: List[str] = None, story_outline: Dict[str, Any] = None, intent: str = "General Story", brand_context=None) -> Screenplay:
-        """Generate a complete story framework with acts and scenes (Phase 1)."""
+    @staticmethod
+    def _build_duration_budget_instruction(custom_duration_seconds: int, total_scenes_str: str) -> str:
+        """Build the prompt section instructing the AI to hit a total duration budget."""
+        if custom_duration_seconds <= 0:
+            return ""
+        try:
+            parts = total_scenes_str.split("-")
+            mid_scenes = (int(parts[0]) + int(parts[-1])) // 2
+        except (ValueError, IndexError):
+            mid_scenes = 10
+        avg_per_scene = max(15, custom_duration_seconds // max(mid_scenes, 1))
+        return (
+            f"\nTOTAL DURATION BUDGET: {custom_duration_seconds} seconds."
+            f"\nThe sum of all scene estimated_duration values MUST be approximately {custom_duration_seconds} seconds."
+            f"\nBudget roughly {avg_per_scene} seconds per scene, adjusting for scene complexity."
+            "\nSimple scenes can be shorter (15-30s), complex dramatic scenes longer (up to 180s)."
+            f"\nEnsure the total across all scenes is as close to {custom_duration_seconds}s as possible.\n"
+        )
+
+    @staticmethod
+    def _validate_and_fix_pacing(all_scenes) -> int:
+        """Check scene pacing for consecutive-run violations and fix them.
+
+        Rules applied:
+        - Max 2 consecutive Fast scenes → 3rd becomes Medium.
+        - Max 2 consecutive Slow scenes → 3rd becomes Medium.
+        - First scene should not be Fast (setup should be Medium/Slow).
+        - Last scene should not be Fast (resolution should be Medium/Slow).
+
+        Returns the number of scenes whose pacing was corrected.
+        """
+        if not all_scenes or len(all_scenes) < 2:
+            return 0
+
+        fixes = 0
+
+        # Rule: first scene should be Medium or Slow (not Fast)
+        if getattr(all_scenes[0], "pacing", "Medium") == "Fast":
+            all_scenes[0].pacing = "Medium"
+            fixes += 1
+
+        # Rule: last scene should be Medium or Slow (resolution)
+        if getattr(all_scenes[-1], "pacing", "Medium") == "Fast":
+            all_scenes[-1].pacing = "Medium"
+            fixes += 1
+
+        # Rule: no more than 2 consecutive scenes with the same pacing
+        i = 0
+        while i < len(all_scenes):
+            cur = getattr(all_scenes[i], "pacing", "Medium") or "Medium"
+            run_end = i + 1
+            while run_end < len(all_scenes) and (getattr(all_scenes[run_end], "pacing", "Medium") or "Medium") == cur:
+                run_end += 1
+            run_len = run_end - i
+            if run_len > 2:
+                if cur == "Fast":
+                    replacement = "Medium"
+                elif cur == "Slow":
+                    replacement = "Medium"
+                else:
+                    # 3+ Medium in a row — alternate the 3rd onward
+                    replacement = None
+                if replacement:
+                    for j in range(i + 2, run_end):
+                        all_scenes[j].pacing = replacement
+                        fixes += 1
+            i = run_end
+
+        return fixes
+
+    @staticmethod
+    def _normalize_scene_durations(all_scenes, target_seconds: int, min_per_scene: int = 15, max_per_scene: int = 180):
+        """Proportionally scale estimated_duration on each scene so totals hit target_seconds."""
+        if not all_scenes or target_seconds <= 0:
+            return
+        current_total = sum(getattr(s, "estimated_duration", 0) or 60 for s in all_scenes)
+        if current_total <= 0:
+            equal_share = max(min_per_scene, target_seconds // len(all_scenes))
+            for s in all_scenes:
+                s.estimated_duration = min(equal_share, max_per_scene)
+            current_total = sum(s.estimated_duration for s in all_scenes)
+        ratio = target_seconds / current_total
+        for s in all_scenes:
+            raw = (getattr(s, "estimated_duration", 0) or 60) * ratio
+            s.estimated_duration = int(max(min_per_scene, min(max_per_scene, round(raw))))
+        # Correction pass: distribute remaining delta across scenes
+        delta = target_seconds - sum(s.estimated_duration for s in all_scenes)
+        sorted_scenes = sorted(all_scenes, key=lambda s: s.estimated_duration, reverse=(delta > 0))
+        for s in sorted_scenes:
+            if delta == 0:
+                break
+            step = 1 if delta > 0 else -1
+            new_val = s.estimated_duration + step
+            if min_per_scene <= new_val <= max_per_scene:
+                s.estimated_duration = new_val
+                delta -= step
+
+    @staticmethod
+    def _ensure_character_coverage(all_scenes, story_outline: dict) -> int:
+        """Guarantee every main character with an outline or growth arc appears in
+        at least one scene's character_focus.
+
+        Characters with both an outline AND a growth arc have the highest priority
+        and are placed first.  Characters with only one of those fields are placed
+        next.  Placement prefers scenes that already mention the character by name
+        in their description; otherwise the longest scene without the character is
+        chosen so as to spread the cast across the story.
+
+        Returns the number of character-scene insertions made.
+        """
+        characters = story_outline.get("characters", []) or []
+        if not characters or not all_scenes:
+            return 0
+
+        # Build sets of existing coverage (lowered for comparison)
+        focus_by_scene: list[set] = []
+        for scene in all_scenes:
+            names = {n.strip().lower() for n in (getattr(scene, "character_focus", []) or []) if n}
+            focus_by_scene.append(names)
+
+        all_covered_lower = set()
+        for s in focus_by_scene:
+            all_covered_lower.update(s)
+
+        # Categorise uncovered characters by priority
+        uncovered_high = []   # has outline AND growth_arc
+        uncovered_normal = [] # has outline OR growth_arc (but not both)
+        for ch in characters:
+            if not isinstance(ch, dict):
+                continue
+            name = (ch.get("name") or "").strip()
+            if not name:
+                continue
+            role = ch.get("role", "main")
+            if role == "minor":
+                continue
+            if name.lower() in all_covered_lower:
+                continue
+            has_outline = bool((ch.get("outline") or "").strip())
+            has_growth = bool((ch.get("growth_arc") or "").strip())
+            if has_outline and has_growth:
+                uncovered_high.append(name)
+            elif has_outline or has_growth:
+                uncovered_normal.append(name)
+
+        insertions = 0
+
+        for name in uncovered_high + uncovered_normal:
+            name_upper = name.upper()
+            # Prefer a scene whose description already mentions the character
+            best_scene = None
+            for i, scene in enumerate(all_scenes):
+                desc_upper = (getattr(scene, "description", "") or "").upper()
+                if name_upper in desc_upper and name.lower() not in focus_by_scene[i]:
+                    best_scene = i
+                    break
+
+            if best_scene is None:
+                # Pick the longest scene that doesn't already have this character
+                candidates = [
+                    (i, getattr(s, "estimated_duration", 0) or 0)
+                    for i, s in enumerate(all_scenes)
+                    if name.lower() not in focus_by_scene[i]
+                ]
+                if candidates:
+                    best_scene = max(candidates, key=lambda t: t[1])[0]
+
+            if best_scene is not None:
+                all_scenes[best_scene].character_focus.append(name)
+                focus_by_scene[best_scene].add(name.lower())
+                insertions += 1
+                _safe_print(f"Character coverage fix: added {name} to scene '{all_scenes[best_scene].title}'")
+
+        if insertions:
+            _safe_print(f"Character coverage: inserted {insertions} missing character(s) into scene focus lists")
+        return insertions
+
+    def generate_story_framework(self, premise: str, title: str = "", length: str = "medium", atmosphere: str = "", genres: List[str] = None, story_outline: Dict[str, Any] = None, intent: str = "General Story", brand_context=None, series_bible=None, custom_duration_seconds: int = 0) -> Screenplay:
+        """Generate a complete story framework with acts and scenes (Phase 1).
+
+        When *series_bible* is provided, persistent characters, world context,
+        locations, and previous episode summaries are injected into the prompt
+        so the AI maintains continuity across episodes.
+        """
         
         if not self._adapter:
             raise Exception("AI client not initialized. Please configure your API key or local AI server in settings.")
@@ -5750,11 +6540,30 @@ TEXT SECTION {i + 1}/{len(chunks)}:
         
         # Get workflow profile
         workflow_profile = WorkflowProfileManager.get_profile(length, intent)
-        framework_structure = WorkflowProfileManager.get_framework_structure(workflow_profile, length)
+        framework_structure = WorkflowProfileManager.get_framework_structure(
+            workflow_profile, length, custom_duration_seconds=custom_duration_seconds
+        )
         
         genres = genres or []
         genre_text = ", ".join(genres) if genres else "General"
         atmosphere_text = f"\nAtmosphere/Tone: {atmosphere}" if atmosphere else ""
+        
+        # Build series bible context section if available
+        series_context = ""
+        if series_bible:
+            series_context = "\n\nEPISODIC SERIES CONTEXT (MUST MAINTAIN CONTINUITY):\n"
+            series_context += series_bible.get_series_summary_for_ai()
+            series_context += (
+                "\n\nCRITICAL SERIES RULES:"
+                "\n- This is a NEW EPISODE in an ongoing series. Create a NEW self-contained conflict/storyline."
+                "\n- MAINTAIN all persistent characters listed above with consistent identity, personality, and appearance."
+                "\n- MAINTAIN all recurring locations with consistent structural characteristics."
+                "\n- ACKNOWLEDGE events from previous episodes where narratively relevant."
+                "\n- Main characters MUST appear unless explicitly excluded."
+                "\n- Supporting characters may appear, disappear, or be newly introduced."
+                "\n- Wardrobe may change between episodes depending on narrative context."
+                "\n- DO NOT contradict established world context or timeline events."
+            )
         
         # Build brand context section for promotional workflows
         brand_info = ""
@@ -5805,7 +6614,12 @@ TEXT SECTION {i + 1}/{len(chunks)}:
                         if char_growth:
                             character_info += f"  Growth Arc: {char_growth}\n"
                 
-                character_info += "\nCRITICAL: These are MAIN characters with outline and growth arc. You MUST incorporate these exact characters and their development arcs into the story framework. Use their names, backgrounds, motivations, and growth arcs as specified above. Do not replace them with other characters. character_focus in each scene must list only these main characters (when featured). Minor characters may appear in scene descriptions by name and role but do NOT belong in character_focus."
+                character_info += "\nCHARACTER INCLUSION RULES (MANDATORY):"
+                character_info += "\n- EVERY main character listed above MUST appear in at least one scene's character_focus. No main character may be left out of the entire story."
+                character_info += "\n- Characters with an outline AND a growth arc have HIGHEST PRIORITY — they MUST appear in enough scenes for their growth arc to play out meaningfully across the story."
+                character_info += "\n- Distribute characters across scenes so that every main character has meaningful screen time proportional to the story length."
+                character_info += "\n- character_focus lists ONLY main characters (when featured). Minor characters may appear in scene descriptions by name and role but do NOT belong in character_focus."
+                character_info += "\n- Do not replace, merge, or omit any listed character. Use their names, backgrounds, motivations, and growth arcs EXACTLY as specified above."
                 character_info += "\nOWNERSHIP RULE: If a character is established as the owner of a location (_underlined_), vehicle ({{braces}}), or object ([brackets]), this MUST be strictly enforced throughout the story. No other character may use, operate, or claim ownership of that entity unless the story explicitly transfers ownership."
         
         # Use framework structure from workflow profile
@@ -5825,16 +6639,22 @@ TEXT SECTION {i + 1}/{len(chunks)}:
             description = f"Experimental content ({total_scenes} visual themes, {act_count} act)"
         else:
             # Narrative structure
-            length_map = {
-                "micro": {"scenes_per_act": "1-5", "total_scenes": "1-5", "description": "Micro story (1-5 scenes, 1 act)"},
-                "short": {"scenes_per_act": "3-5", "total_scenes": "9-15", "description": "Short story (9-15 scenes, 3 acts)"},
-                "medium": {"scenes_per_act": "5-8", "total_scenes": "15-24", "description": "Medium story (15-24 scenes, 3 acts)"},
-                "long": {"scenes_per_act": "6-10", "total_scenes": "30-50", "description": "Long story (30-50 scenes, 5 acts)"}
-            }
-            length_info = length_map.get(length.lower(), length_map["medium"])
-            scenes_per_act = length_info["scenes_per_act"]
-            total_scenes = length_info["total_scenes"]
-            description = length_info["description"]
+            if length == "custom" and custom_duration_seconds > 0:
+                scenes_per_act = framework_structure.get("scenes_per_act_range", "3-8")
+                total_scenes = framework_structure.get("total_scenes_range", "6-15")
+                mins, secs = divmod(custom_duration_seconds, 60)
+                description = f"Custom duration story ({mins}m{secs}s target, {act_count} acts, ~{total_scenes} scenes)"
+            else:
+                length_map = {
+                    "micro": {"scenes_per_act": "1-5", "total_scenes": "1-5", "description": "Micro story (1-5 scenes, 1 act)"},
+                    "short": {"scenes_per_act": "3-5", "total_scenes": "9-15", "description": "Short story (9-15 scenes, 3 acts)"},
+                    "medium": {"scenes_per_act": "5-8", "total_scenes": "15-24", "description": "Medium story (15-24 scenes, 3 acts)"},
+                    "long": {"scenes_per_act": "6-10", "total_scenes": "30-50", "description": "Long story (30-50 scenes, 5 acts)"}
+                }
+                length_info = length_map.get(length.lower(), length_map["medium"])
+                scenes_per_act = length_info["scenes_per_act"]
+                total_scenes = length_info["total_scenes"]
+                description = length_info["description"]
         
         # Intent-aware adjustments
         intent_guidance = self._get_intent_guidance(intent)
@@ -5996,11 +6816,12 @@ Premise: {premise}
 Title: {title if title else "(none provided — you MUST generate an original, evocative title)"}
 Genres: {genre_text}
 Length: {description}
-Story Intent: {intent}{atmosphere_text}{character_info}{location_info}
+Story Intent: {intent}{atmosphere_text}{character_info}{location_info}{series_context}
 
 {intent_guidance}
 
 Create a story framework with {act_count} acts, containing approximately {scenes_per_act} scenes per act (total: {total_scenes} scenes).
+{self._build_duration_budget_instruction(custom_duration_seconds, total_scenes)}
 
 For each act, provide:
 1. Act title and description
@@ -6015,18 +6836,36 @@ For each scene within each act, provide:
    - CINEMATIC MARKUP IN SCENE DESCRIPTIONS (MANDATORY):
      * Characters: FULL CAPS on every mention (e.g. CHLOE BAXTER, MARCUS REED — never "Chloe" or "Marcus"). FULL CAPS are EXCLUSIVELY for individual character names — NEVER use FULL CAPS for emphasis, codenames, protocols, operations, programs, labels, warnings, signs, or any non-character phrase. Write these in Title Case instead (e.g. "Terminal Sanction" not "TERMINAL SANCTION").
      * Locations / Environments: _underscored_ on every mention (e.g. _Blackwood Manor_, _Foyer_, _Study_). Rooms within buildings are separate environments.
-     * Objects: [brackets] when a character directly interacts with them (e.g. [Ecto-Detector 3000], [phone])
-     * Vehicles: {{braces}} when referring to the vehicle exterior (e.g. {{motorcycle}})
+     * Objects: [brackets] for ALL named objects in the scene (e.g. [Ecto-Detector 3000], [phone], [workbench]). NOT clothing/footwear/accessories worn by a character — wardrobe is plain text.
+     * Vehicles: {{braces}} for ALL named vehicles in the scene (e.g. {{motorcycle}}). NEVER wrap buildings, venues, or locations (clubs, bars, restaurants, theaters, etc.) in {{braces}} — those are environments (_underscored_).
    - The scene description must explicitly name the ENVIRONMENT/LOCATION where the scene takes place using _underscored_ markup.
 3. Plot point (if applicable): "Inciting Incident", "First Plot Point", "Midpoint", "Climax", "Resolution", or null
 4. Character focus: List of MAIN characters (from the character details above) featured in this scene. Use ONLY their exact names (correct spelling). Do NOT add minor/supporting characters here — character_focus is for main characters only.
-5. Pacing: "Fast", "Medium", or "Slow"
+5. Pacing: "Fast", "Medium", or "Slow" — MUST follow the PACING RHYTHM rules below
 6. Estimated duration: CRITICAL - Approximate seconds this scene should take (MUST be provided, typically 30-180 seconds)
    - Simple scenes with minimal action: 30-60 seconds
    - Medium complexity scenes with dialogue: 60-120 seconds
    - Complex scenes with multiple events: 120-180 seconds
    - Key dramatic moments: 90-150 seconds
    - This duration is essential for determining how many storyboard items to generate
+
+PACING RHYTHM (MANDATORY — follow established story structure conventions):
+Pacing must vary throughout the story to create rhythm and breathing room. Do NOT assign the same pacing to many consecutive scenes.
+- ACT 1 (Setup/Introduction): Begin with Medium or Slow pacing for world-building and character introduction. Build toward Fast at the inciting incident. Typical pattern: Medium → Medium → Fast.
+- ACT 2 (Confrontation/Development): Alternate between Fast and Medium/Slow. After every action-heavy Fast scene, include a Medium or Slow scene for character reflection, dialogue, or planning (a "breather"). Typical pattern: Fast → Medium → Fast → Slow → Medium → Fast.
+- ACT 3 (Climax/Resolution): Build from Medium into the Fast climax, then end with Medium or Slow for the resolution/denouement. Typical pattern: Medium → Fast → Fast → Medium or Slow.
+- HARD LIMITS:
+  * NEVER assign more than 2 consecutive Fast scenes. After 2 Fast scenes, the next MUST be Medium or Slow.
+  * NEVER assign more than 2 consecutive Slow scenes. After 2 Slow scenes, the next MUST be Medium or Fast.
+  * The overall story should have roughly 30-50% Medium, 25-40% Fast, and 15-30% Slow scenes.
+- PACING BY SCENE TYPE:
+  * Establishing/introduction scenes → Medium or Slow
+  * Dialogue-heavy scenes → Medium or Slow
+  * Action sequences, chases, fights → Fast
+  * Emotional reveals, confrontations → Medium
+  * Climax → Fast
+  * Resolution/denouement → Medium or Slow
+  * Transitions, montages → Fast or Medium
 
 CRITICAL: You MUST return ONLY valid JSON. No markdown, no explanations, no code blocks.
 
@@ -6111,7 +6950,7 @@ Ensure EVERY scene has a valid estimated_duration value.
             finish_reason = response.choices[0].finish_reason if hasattr(response.choices[0], 'finish_reason') else None
             if finish_reason == 'length':
                 # Response was truncated - try to extract what we can
-                print(f"Warning: AI response was truncated (max_tokens: {framework_max_tokens}). Consider increasing max_tokens in settings.")
+                _safe_print(f"Warning: AI response was truncated (max_tokens: {framework_max_tokens}). Consider increasing max_tokens in settings.")
             
             # Try to extract and parse JSON from the response
             framework_data = self._extract_and_parse_json(content)
@@ -6235,6 +7074,19 @@ Ensure EVERY scene has a valid estimated_duration value.
                     # Ensure reasonable bounds
                     scene.estimated_duration = max(30, min(180, scene.estimated_duration))
             
+            # ── Pacing rhythm validation: fix consecutive-run violations ──
+            pacing_fixes = self._validate_and_fix_pacing(all_scenes)
+            if pacing_fixes:
+                _safe_print(f"Pacing validation: corrected {pacing_fixes} scene(s) for rhythm")
+
+            # ── Custom duration: normalize scene durations to hit target ──
+            if custom_duration_seconds > 0:
+                self._normalize_scene_durations(all_scenes, custom_duration_seconds)
+
+            # ── Character coverage validation: ensure every main character appears ──
+            if story_outline and isinstance(story_outline, dict):
+                self._ensure_character_coverage(all_scenes, story_outline)
+
             # ── Advertisement mode: post-generation validation ──
             if screenplay.is_advertisement_mode():
                 from core.ad_framework import validate_pre_generation
@@ -6320,6 +7172,11 @@ Ensure EVERY scene has a valid estimated_duration value.
             "full_cinematic": "MUSIC: Full cinematic score. Include dynamic music cue progression aligned with beat density.",
         }
         parts.append(music_map.get(music, music_map["ambient"]))
+
+        content_rating = ss.get("content_rating", "unrestricted")
+        rating_directive = _CONTENT_RATING_DIRECTIVES.get(content_rating, "")
+        if rating_directive:
+            parts.append(rating_directive)
 
         return "\n\nSTORY SETTINGS DIRECTIVES (apply to ALL items):\n" + "\n".join(f"- {p}" for p in parts) + "\n"
 
@@ -6476,19 +7333,26 @@ Context (previous scenes):
 
 {mapping_note}ABSOLUTELY CRITICAL — STRICT 1:1 PARAGRAPH MAPPING:
 {f'- The "storyboard_items" array MUST contain EXACTLY {item_count_for_prompt} items (one per paragraph).' if total_beat_count > 0 else f'- The "storyboard_items" array MUST contain AT LEAST {item_count_for_prompt} items.'}
-- Each item references ONLY entities from its corresponding paragraph
+- STORYLINE, DIALOGUE, and VIDEO PROMPT: reference ONLY characters and actions from the corresponding paragraph
+- IMAGE PROMPT and COMPOSITION NOTES: include all scene-level objects, props, vehicles, and
+  environmental features visible in the camera frame — even if mentioned only in other paragraphs
+  (props on set are visible before anyone interacts with them). Characters remain paragraph-scoped.
 - Items MUST progress chronologically through the scene
 - NO DUPLICATE ITEMS — each item must be distinct and correspond to its paragraph
-- Do NOT introduce entities from other paragraphs (cross-paragraph contamination is forbidden)
+- Do NOT introduce characters from other paragraphs (cross-paragraph contamination applies to characters only)
 
 For each storyboard item, you must:
 1. Choose the optimal duration in whole seconds (1-30) based on content:
    - Quick cuts, reaction shots, transitions = 2-3 seconds
    - Fast action beats = 3-5 seconds
-   - Standard action or dialogue = 5-8 seconds
-   - Complex scenes with extended dialogue = 8-12 seconds
+   - Standard action (no dialogue) = 4-6 seconds
+   - Short dialogue (1-8 words) = 5-7 seconds
+   - Medium dialogue (9-20 words) = 7-10 seconds
+   - Extended dialogue (20+ words) = 10-15 seconds
    - Key dramatic moments, reveals = 6-10 seconds
    - Establishing/atmospheric shots = 3-6 seconds
+   IMPORTANT: Dialogue needs time for delivery at ~2.3 words/second PLUS
+   natural pauses and reaction beats. Never set a dialogue item below 5s.
 
 2. Create a STORYLINE description (1-3 sentences):
    - ONE action, ONE reveal, or ONE reaction — never multiple
@@ -6500,20 +7364,46 @@ For each storyboard item, you must:
    - Include their placement and any action (e.g. "kneeling", "standing at the doorway")
    - Do NOT include physical descriptions, clothing, lighting, atmosphere, or style
    - The image generator already has reference images for each entity — only describe composition
-   - Use ONLY elements mentioned in THIS paragraph/beat
+   - Characters: include ONLY characters mentioned in THIS paragraph/beat
+   - Objects, props, vehicles, environmental features: include ALL that exist anywhere in the
+     scene content and would be physically visible in the camera frame, even if they are only
+     mentioned or interacted with in a DIFFERENT paragraph. A prop on set is visible before
+     anyone touches it.
+   - Characters must NOT look directly at the camera unless the storyline explicitly states they do
    - Example: "Wide shot of ELARA VANDERMERE kneeling in the fields of Briar's Hollow, her hands in the soil"
    - Example: "Close-up of MAELIS THORNE clutching a yellowed scroll, eyes wide"
 
-4. Create a comprehensive VIDEO PROMPT for higgsfield.ai video generation:
+4. Describe the BLOCKING / COMPOSITION for the start frame:
+   - MUST be derived directly from the storyline — entity positions in the frame must reflect
+     the spatial relationships described in the scene content (e.g. "beside", "next to",
+     "across from", "in front of")
+   - MUST be consistent with the environment reference image layout — if the reference shows
+     objects in a specific position, honour that arrangement
+   - MUST NOT contradict the image_prompt (Step 3) — composition_notes is a precise technical
+     breakdown of the same scene, not an independent reinterpretation
+   - MUST include ALL scene-level props, objects, vehicles, and environmental features that
+     would be visible in the camera frame — even if they are only mentioned or interacted
+     with in a different paragraph. Position them according to the environment reference image.
+   - State each character's position in the frame (camera-left, camera-right, centre, foreground, background)
+   - State each character's facing direction (facing camera, facing away, facing other character, profile view)
+   - State spatial relationships between characters and objects exactly as the storyline describes them
+   - Put this in the "composition_notes" field
+   - Example: If the storyline says "kneels beside the storage trunks" and the environment shows
+     trunks on the left, then: "LUCY CHEN camera-left kneeling beside storage trunks, facing right in profile view"
+   - If only one entity, describe their position and orientation relative to nearby objects as stated in the storyline.
+   - If no entities, describe the spatial layout of key elements.
+
+5. Create a comprehensive VIDEO PROMPT for higgsfield.ai video generation:
    - {video_prompt_guidance}
    - MUST explicitly describe ALL motion and dynamic changes
    - Use explicit action verbs: walking, running, appearing, revealing, forming, emerging, etc.
    - Include detailed visual description, camera angles, lighting, composition
    - Describe ONLY what is seen: visual action, camera, composition. No music or sound design.
+   - Characters must NOT look directly at the camera unless the storyline explicitly states they do
    - {brand_video_note}
 
-5. Generate dialogue if characters are speaking{dialogue_note}
-6. Provide detailed camera movement notes
+6. Generate dialogue if characters are speaking{dialogue_note}
+7. Provide detailed camera movement notes
 
 CRITICAL: visual_description must be an empty string (""). You MUST return ONLY valid JSON.
 
@@ -6525,6 +7415,7 @@ Format your response as a JSON object with this EXACT structure:
             "duration": 5,
             "storyline": "Narrative description of what happens.",
             "image_prompt": "Static establishing shot description.",
+            "composition_notes": "Entity positions, facing directions, spatial relationships.",
             "prompt": "Video generation prompt with explicit actions.",
             "visual_description": "",
             "dialogue": "Character: Dialogue text here",
@@ -6536,11 +7427,39 @@ Format your response as a JSON object with this EXACT structure:
 
 🚨 CRITICAL: Create EXACTLY {item_count_for_prompt} items. {"Sequence numbers " + str(chunk_start + 1) + "–" + str(chunk_end) + "." if is_chunked else ""}
 {beat_mapping_block}
+═══════════════════════════════════════════════════════════════════════════════
+REFERENCE IMAGE CONSISTENCY (MANDATORY)
+═══════════════════════════════════════════════════════════════════════════════
+
+Every character, environment, object, and vehicle has a supplied reference image.
+All prompts (image_prompt AND video prompt) MUST maintain EXACT visual consistency
+with those references:
+
+- Characters: identical facial features, body proportions, hairstyle, skin tone,
+  and clothing as shown in their reference image. No alterations.
+- Environments: identical setting details, architecture, and spatial layout as
+  shown in the reference image. No additions or removals.
+- Objects / Vehicles: identical appearance, colour, size, and condition as shown
+  in the reference image. No modifications.
+
+FORBIDDEN:
+- Do NOT add characters, objects, props, or background elements that are not
+  present in the storyline or reference images.
+- Do NOT alter a character's appearance, clothing, or features from their reference.
+- Do NOT invent environmental details not present in the scene content.
+- Characters must NEVER look directly at the camera unless the storyline
+  explicitly states they do. Default gaze must be natural and motivated by the
+  scene action.
+═══════════════════════════════════════════════════════════════════════════════
+
 ⚠️ FINAL REMINDER ⚠️
 YOU ARE A TRANSCRIPTION TOOL — NOT A CREATIVE WRITER.
 - Extract and represent ONLY what is in the provided SCENE CONTENT
-- DO NOT add new events, actions, dialogue, details, or entities
-- Each item MUST reference ONLY entities from its corresponding paragraph
+- DO NOT add new events, actions, dialogue, details, or entities not present anywhere in the scene
+- STORYLINE and DIALOGUE: reference ONLY entities from the corresponding paragraph
+- IMAGE PROMPT and COMPOSITION NOTES: include all scene-level objects/props/vehicles visible in the
+  camera frame even if they appear in other paragraphs (props are persistent in the environment)
+- EVERY item MUST include "composition_notes" describing entity positions, facing directions, and spatial relationships — this is mandatory for accurate image generation
 
 IMPORTANT JSON RULES:
 - Every property must be followed by a comma EXCEPT the last property in an object
@@ -6601,10 +7520,10 @@ IMPORTANT JSON RULES:
         if last_is_truncated:
             dropped = parsed_items.pop()
             seq = dropped.get("sequence_number", "?")
-            print(f"TRUNCATION SALVAGE: Dropped incomplete item (seq {seq}), keeping {len(parsed_items)} complete items")
+            _safe_print(f"TRUNCATION SALVAGE: Dropped incomplete item (seq {seq}), keeping {len(parsed_items)} complete items")
 
         if parsed_items:
-            print(f"TRUNCATION SALVAGE: Salvaged {len(parsed_items)} of {expected_count} expected items")
+            _safe_print(f"TRUNCATION SALVAGE: Salvaged {len(parsed_items)} of {expected_count} expected items")
             return parsed_items
 
         return None
@@ -6648,21 +7567,38 @@ IMPORTANT JSON RULES:
                 context_parts.append(f"Scene {s.scene_number}: {s.title}\n{digest}")
         context_text = "\n\n".join(context_parts) if context_parts else "Beginning of story"
         
+        # Inject series bible context for episodic continuity
+        series_storyboard_ctx = self._build_series_context_for_prompt(screenplay)
+        if series_storyboard_ctx:
+            context_text += series_storyboard_ctx
+        
         # Determine compression strategy
         compression_strategy = self._determine_compression_strategy(scene, screenplay)
         scene.compression_strategy = compression_strategy
         
         # Normalize scene content into beats/paragraphs
         scene_beats = self._normalize_scene_beats(scene)
+        
+        # Skip leading non-content paragraphs:
+        #  1. SFX-only paragraphs (e.g. "(ambient_buzz) (ambient_machinery)")
+        #  2. The environment-establishing first paragraph (used for identity block / hero frame)
+        # The storyboard begins from the paragraph where characters and actions start.
+        while len(scene_beats) > 1 and self._is_sfx_only_paragraph(scene_beats[0]):
+            sfx_skipped = scene_beats.pop(0)
+            _safe_print(f"DEBUG: Skipped SFX-only paragraph for storyboard: {sfx_skipped[:80]}...")
+        if len(scene_beats) > 1:
+            skipped = scene_beats.pop(0)
+            _safe_print(f"DEBUG: Skipped establishing first paragraph for storyboard: {skipped[:80]}...")
+        
         beat_count = len(scene_beats)
         
         # Debug output
         if beat_count > 0:
-            print(f"DEBUG: Extracted {beat_count} beats from scene '{scene.title}':")
+            _safe_print(f"DEBUG: Extracted {beat_count} beats from scene '{scene.title}':")
             for i, beat in enumerate(scene_beats, 1):
-                print(f"  BEAT {i}: {beat[:80]}...")
+                _safe_print(f"  BEAT {i}: {beat[:80]}...")
         else:
-            print(f"DEBUG: No beats extracted from scene '{scene.title}' - using fallback logic")
+            _safe_print(f"DEBUG: No beats extracted from scene '{scene.title}' - using fallback logic")
         
         # Determine minimum storyboard items: at least one per paragraph, more if paragraphs have multiple visual beats
         estimated_duration = scene.estimated_duration if scene.estimated_duration > 0 else 60
@@ -6670,8 +7606,8 @@ IMPORTANT JSON RULES:
         if beat_count > 0:
             # Minimum: one item per paragraph. AI may produce more by splitting multi-beat paragraphs.
             num_items = beat_count
-            print(f"Breaking down scene into at least {num_items} storyboard items ({beat_count} paragraphs, more if multi-beat)")
-            print(f"CRITICAL: One visual beat per item. Multi-beat paragraphs must be split.")
+            _safe_print(f"Breaking down scene into at least {num_items} storyboard items ({beat_count} paragraphs, more if multi-beat)")
+            _safe_print(f"CRITICAL: One visual beat per item. Multi-beat paragraphs must be split.")
         else:
             # Fallback to duration-based calculation only when no paragraphs/beats found
             min_items = max(2, estimated_duration // 10)
@@ -6688,7 +7624,7 @@ IMPORTANT JSON RULES:
                     num_items = max(2, int(estimated_duration // 15))
             else:
                 num_items = 1
-            print(f"Breaking down scene into {num_items} storyboard items based on estimated duration ({estimated_duration}s, strategy: {compression_strategy})")
+            _safe_print(f"Breaking down scene into {num_items} storyboard items based on estimated duration ({estimated_duration}s, strategy: {compression_strategy})")
         
         min_items = max(2, estimated_duration // 10)
         max_items = max(3, estimated_duration // 5)
@@ -6743,12 +7679,12 @@ IMPORTANT JSON RULES:
             env_metadata = screenplay.identity_block_metadata.get(scene.environment_id)
             if env_metadata and env_metadata.get("status") == "approved":
                 scene_environment_block = env_metadata.get("identity_block", "")
-                print(f"Using approved environment block for scene {scene.scene_number}")
+                _safe_print(f"Using approved environment block for scene {scene.scene_number}")
         
         if not scene_environment_block:
             # Create placeholder for environment
             env_name = f"{scene.title} Environment"
-            print(f"Creating environment placeholder for scene {scene.scene_number}...")
+            _safe_print(f"Creating environment placeholder for scene {scene.scene_number}...")
             env_id = screenplay.create_placeholder_identity_block(env_name, "environment", scene.scene_id)
             scene.environment_id = env_id
             
@@ -6781,7 +7717,7 @@ IMPORTANT JSON RULES:
             
             # Use a basic fallback for now
             scene_environment_block = f"a static establishing frame set in {scene.title.lower()}, grounded realistic environment, no motion"
-            print(f"Environment placeholder created with description - review in Identity Blocks tab")
+            _safe_print(f"Environment placeholder created with description - review in Identity Blocks tab")
         
         # Use beat_count (from normalized beats) for breakdown instructions
         paragraph_count = beat_count
@@ -6831,16 +7767,25 @@ Each numbered paragraph [#] in Scene Content generates EXACTLY ONE storyboard it
 COMPOSITION SCOPE RULE (MANDATORY)
 ═══════════════════════════════════════════════════════════════════════════════
 
-Each storyboard item may ONLY reference:
-  • Characters present in THAT paragraph
-  • Objects present in THAT paragraph
-  • Vehicles present in THAT paragraph
-  • The active environment of THAT paragraph
+STORYLINE, DIALOGUE, and VIDEO PROMPT fields are paragraph-scoped:
+  • Reference ONLY characters, actions, and dialogue from THAT paragraph.
+  • Do NOT pull storyline content from other paragraphs.
+
+IMAGE PROMPT and COMPOSITION NOTES fields use SCENE-LEVEL visibility:
+  • Include ALL objects, props, vehicles, and environmental features that would
+    be physically visible in the camera frame — even if they are only mentioned
+    or interacted with in OTHER paragraphs of the same scene.
+  • A prop that exists in the environment (e.g. a foam tombstone, a desk, storage
+    trunks) is visible from the start of the scene, not just when a character
+    touches it. Include it in every shot where the camera would see it.
+  • Characters should only appear in image_prompt if they are present in THAT
+    paragraph (characters can enter and exit; objects generally do not).
+  • The environment and its contents are persistent across all items in the scene.
 
 Do NOT reference:
-  • Items from OTHER paragraphs in the same scene
-  • Global scene objects not visible in the paragraph
-  • Future or past scene elements
+  • Characters from OTHER paragraphs (characters are paragraph-scoped)
+  • Entities from OTHER scenes
+  • Invented props or details not mentioned anywhere in the scene content
 
 ═══════════════════════════════════════════════════════════════════════════════
 PRIMARY ACTION EXTRACTION (BEAT DOMINANCE)
@@ -6921,10 +7866,13 @@ Paragraph N → Storyboard Item N.  No merging.  No splitting.  No exceptions.
 Key Guidelines:
 1. Extract content directly from each paragraph — use the exact dialogue, actions, and descriptions provided.
 2. Create EXACTLY ONE storyboard item per paragraph in sequential order. Do NOT combine paragraphs. Do NOT skip any paragraph. Do NOT split paragraphs.
-3. Each item may ONLY reference entities (characters, objects, vehicles, environments) that appear in its corresponding paragraph.
-4. Preserve specific object names, character details, and scene descriptions exactly as written.
-5. For the STORYLINE field: Convert the paragraph into present-tense cinematic action. Preserve *action* and (sfx) markup.
-6. Storyboard generation must NOT invent new story content. No new entities. No embellishment.
+3. STORYLINE, DIALOGUE, VIDEO PROMPT: reference ONLY characters and actions from the corresponding paragraph.
+4. IMAGE PROMPT and COMPOSITION NOTES: include ALL objects, props, vehicles, and environmental features
+   visible in the camera frame from ANYWHERE in the scene content — props on set are visible before
+   anyone interacts with them. Characters remain paragraph-scoped.
+5. Preserve specific object names, character details, and scene descriptions exactly as written.
+6. For the STORYLINE field: Convert the paragraph into present-tense cinematic action. Preserve *action* and (sfx) markup.
+7. Storyboard generation must NOT invent new story content. No new entities. No embellishment.
 
 Paragraph-to-Item Mapping (STRICT 1:1):
 - Paragraph 1 (BEAT 1) → Storyboard Item 1
@@ -6940,22 +7888,22 @@ Process:
 
 VALIDATION CHECKLIST:
 ✓ EXACTLY {beat_count} storyboard items created (one per paragraph)
-✓ Item N references ONLY entities from Paragraph N
-✓ No cross-paragraph contamination
+✓ Storyline/dialogue/video for Item N reference ONLY characters and actions from Paragraph N
+✓ image_prompt and composition_notes include all scene-level props/objects visible in the frame
 ✓ No invented entities or embellishment
 ✓ Paragraph order preserved chronologically
 
 """
             requirement_section = f"""Scene Breakdown:
-Create EXACTLY {beat_count} storyboard items (one per paragraph, strict 1:1). Each item references ONLY entities from its paragraph. Do NOT invent new story content.
+Create EXACTLY {beat_count} storyboard items (one per paragraph, strict 1:1). Storyline/dialogue scoped to its paragraph. image_prompt and composition_notes must include all scene-level props/objects visible in the frame. Do NOT invent new story content.
 Total duration: approximately {estimated_duration} seconds. Choose the optimal duration for each item (1-30 seconds) based on content complexity and pacing.
 
 """
-            breakdown_instructions = f"""Create EXACTLY {beat_count} storyboard items. Paragraph N → Item N. Each item references ONLY entities from its source paragraph. Do NOT combine or split paragraphs. Do NOT add new actions, entities, or story content.
+            breakdown_instructions = f"""Create EXACTLY {beat_count} storyboard items. Paragraph N → Item N. Storyline/dialogue scoped to its paragraph; image_prompt/composition_notes include all scene-level visible props. Do NOT combine or split paragraphs. Do NOT add new actions, entities, or story content.
 """
             critical_note = f"🚨 EXACTLY {beat_count} ITEMS REQUIRED. Strict 1:1 paragraph-to-item mapping. No merging. No splitting."
-            critical_instruction = f"Create EXACTLY {beat_count} items. Item N = Paragraph N. Each item scoped to its paragraph entities ONLY."
-            critical_breakdown = f"Paragraph N → Storyboard Item N. Each storyline = cinematic translation of that paragraph only. No new content. No cross-paragraph references."
+            critical_instruction = f"Create EXACTLY {beat_count} items. Item N = Paragraph N. Storyline scoped to paragraph; image_prompt includes all scene-visible props."
+            critical_breakdown = f"Paragraph N → Storyboard Item N. Each storyline = cinematic translation of that paragraph only. image_prompt/composition_notes = full scene-visible props and objects."
         elif scene_content_for_reference and scene_content_for_reference.strip():
             instructions_section = f"""Instructions for Creating Storyboard Items:
 {deterministic_rules}
@@ -7050,7 +7998,7 @@ Total should equal approximately {estimated_duration} seconds
             for start in range(0, beat_count, STORYBOARD_CHUNK_SIZE):
                 end = min(start + STORYBOARD_CHUNK_SIZE, beat_count)
                 chunks.append((start, end))
-            print(f"CHUNKED GENERATION: {beat_count} beats → {len(chunks)} chunks of up to {STORYBOARD_CHUNK_SIZE} beats each")
+            _safe_print(f"CHUNKED GENERATION: {beat_count} beats → {len(chunks)} chunks of up to {STORYBOARD_CHUNK_SIZE} beats each")
         else:
             chunks = [(0, beat_count if beat_count > 0 else num_items)]
         
@@ -7064,9 +8012,9 @@ Total should equal approximately {estimated_duration} seconds
                 is_chunked = len(chunks) > 1
 
                 if is_chunked:
-                    print(f"\n{'='*60}")
-                    print(f"CHUNK {chunk_idx + 1}/{len(chunks)}: Beats {chunk_start + 1}–{chunk_end} ({chunk_beat_count} items)")
-                    print(f"{'='*60}")
+                    _safe_print(f"\n{'='*60}")
+                    _safe_print(f"CHUNK {chunk_idx + 1}/{len(chunks)}: Beats {chunk_start + 1}–{chunk_end} ({chunk_beat_count} items)")
+                    _safe_print(f"{'='*60}")
 
                 chunk_prompt = self._build_storyboard_chunk_prompt(
                     scene_beats=scene_beats,
@@ -7102,10 +8050,10 @@ Total should equal approximately {estimated_duration} seconds
                             item_d["sequence_number"] = chunk_start + ci + 1
 
                     all_chunk_items.extend(chunk_items_raw)
-                    print(f"  ✓ Chunk {chunk_idx + 1}: received {len(chunk_items_raw)} items")
+                    _safe_print(f"  ✓ Chunk {chunk_idx + 1}: received {len(chunk_items_raw)} items")
 
                 except Exception as chunk_err:
-                    print(f"  ✗ Chunk {chunk_idx + 1} FAILED: {chunk_err}")
+                    _safe_print(f"  ✗ Chunk {chunk_idx + 1} FAILED: {chunk_err}")
                     chunk_failures.append((chunk_idx, chunk_start, chunk_end, str(chunk_err)))
 
             if chunk_failures and not all_chunk_items:
@@ -7114,7 +8062,7 @@ Total should equal approximately {estimated_duration} seconds
 
             if chunk_failures:
                 for cf_idx, cf_start, cf_end, cf_err in chunk_failures:
-                    print(f"WARNING: Chunk {cf_idx + 1} failed ({cf_err}). Beats {cf_start + 1}–{cf_end} will have placeholder items.")
+                    _safe_print(f"WARNING: Chunk {cf_idx + 1} failed ({cf_err}). Beats {cf_start + 1}–{cf_end} will have placeholder items.")
                     for placeholder_i in range(cf_start, cf_end):
                         beat_text = scene_beats[placeholder_i] if placeholder_i < len(scene_beats) else ""
                         all_chunk_items.append({
@@ -7133,12 +8081,33 @@ Total should equal approximately {estimated_duration} seconds
                 all_chunk_items.sort(key=lambda x: x.get("sequence_number", 0))
 
             storyboard_data = {"storyboard_items": all_chunk_items}
-            print(f"\nCHUNKED GENERATION COMPLETE: {len(all_chunk_items)} total items from {len(chunks)} chunk(s), {len(chunk_failures)} failure(s)")
+            _safe_print(f"\nCHUNKED GENERATION COMPLETE: {len(all_chunk_items)} total items from {len(chunks)} chunk(s), {len(chunk_failures)} failure(s)")
             
             # Create StoryboardItem objects and add to scene
             sequence_start = len(scene.storyboard_items) + 1
             n_items_before = len(scene.storyboard_items)
             seen_storylines = set()  # Track storylines to prevent duplicates
+
+            # Collect scene-level objects and vehicles from ALL paragraphs so
+            # the hero frame prompt can include props visible in the environment
+            # even if they're only interacted with in a different paragraph.
+            full_scene_text = generated_content or "\n".join(scene_beats)
+            scene_level_object_names = self._extract_objects_from_scene_markup(
+                full_scene_text, require_interaction=False
+            )
+            scene_level_vehicle_names = self._extract_vehicles_from_scene_markup(
+                full_scene_text, require_interaction=False
+            )
+            scene_level_props = scene_level_object_names + scene_level_vehicle_names
+            # Include passive entity names (name-only props with no identity block)
+            passive_names = screenplay.get_passive_entity_names() if screenplay else []
+            seen_lower = {p.lower() for p in scene_level_props}
+            for pn in passive_names:
+                if pn.lower() not in seen_lower:
+                    scene_level_props.append(pn)
+                    seen_lower.add(pn.lower())
+            if scene_level_props:
+                _safe_print(f"DEBUG: Scene-level props for hero frames: {scene_level_props}")
             for i, item_data in enumerate(storyboard_data.get("storyboard_items", [])):
                 duration = item_data.get("duration", 5)
                 duration = max(1, min(30, int(duration)))
@@ -7153,7 +8122,7 @@ Total should equal approximately {estimated_duration} seconds
                 if beat_count == 0:
                     storyline_normalized = storyline_text.lower().strip()[:100]
                     if storyline_normalized in seen_storylines:
-                        print(f"Warning: Duplicate storyline detected at item {i+1}, modifying...")
+                        _safe_print(f"Warning: Duplicate storyline detected at item {i+1}, modifying...")
                         storyline_text = f"{storyline_text} (Continued)"
                     seen_storylines.add(storyline_normalized)
                 
@@ -7174,6 +8143,7 @@ Total should equal approximately {estimated_duration} seconds
                 storyline_text = self._inject_identity_references(storyline_text, screenplay)
                 # Enforce full character names (e.g. "Fleck" → "DETECTIVE JUDE FLECK")
                 storyline_text = self._enforce_full_character_names(storyline_text, screenplay)
+                storyline_text = self._enforce_full_entity_markup_names(storyline_text, screenplay)
                 
                 # Get image prompt and clean it
                 image_prompt_text = item_data.get("image_prompt", "")
@@ -7214,11 +8184,12 @@ Total should equal approximately {estimated_duration} seconds
                     prompt=prompt_text,
                     camera_notes=item_data.get("camera_notes", "")
                 )
+                temp_item.composition_notes = (item_data.get("composition_notes", "") or "").strip()
                 
                 # CRITICAL: Preserve the AI-generated motion prompt from the response
                 # Only use _build_motion_video_prompt as a fallback if AI didn't provide a prompt
                 if not original_ai_prompt or len(original_ai_prompt) < 50:
-                    print(f"WARNING: AI did not provide motion prompt for item {i+1}, generating fallback...")
+                    _safe_print(f"WARNING: AI did not provide motion prompt for item {i+1}, generating fallback...")
                     entity_names_for_motion = []
                     approved_entities = screenplay.get_approved_identity_blocks()
                     for entity_meta in approved_entities:
@@ -7236,7 +8207,7 @@ Total should equal approximately {estimated_duration} seconds
                 else:
                     # Use the AI-generated prompt - it should already contain all necessary information
                     prompt_text = original_ai_prompt
-                    print(f"Using AI-generated motion prompt for item {i+1} ({len(prompt_text)} chars)")
+                    _safe_print(f"Using AI-generated motion prompt for item {i+1} ({len(prompt_text)} chars)")
                 
                 # VALIDATION: Check if motion prompt is empty when storyline contains action verbs
                 storyline_lower = storyline_text.lower() if storyline_text else ""
@@ -7256,7 +8227,7 @@ Total should equal approximately {estimated_duration} seconds
                 
                 if has_action_verbs and is_empty_or_static:
                     warning_msg = f"⚠️ WARNING: Storyboard item {i+1} has action verbs in storyline but motion prompt is empty or static. Regenerating motion extraction..."
-                    print(warning_msg)
+                    _safe_print(warning_msg)
                     # Try to extract motion again using the improved extraction
                     extracted_motion = self._extract_motion_from_storyline(storyline_text)
                     if extracted_motion and len(extracted_motion) > 20 and 'no motion' not in extracted_motion.lower():
@@ -7265,9 +8236,9 @@ Total should equal approximately {estimated_duration} seconds
                             prompt_text = f"{prompt_text} {extracted_motion}".strip()
                         else:
                             prompt_text = extracted_motion
-                        print(f"✓ Motion extracted: {extracted_motion[:100]}...")
+                        _safe_print(f"✓ Motion extracted: {extracted_motion[:100]}...")
                     else:
-                        print(f"⚠️ Motion extraction still failed for item {i+1}")
+                        _safe_print(f"⚠️ Motion extraction still failed for item {i+1}")
                 
                 # Build first-frame image prompt using pre-approved identity blocks
                 # NOTE: Entities are now extracted upfront after scene content generation
@@ -7277,18 +8248,18 @@ Total should equal approximately {estimated_duration} seconds
                 identity_blocks = []
                 approved_entities = screenplay.get_approved_identity_blocks()
                 
-                print(f"DEBUG: Found {len(approved_entities)} approved identity blocks available")
+                _safe_print(f"DEBUG: Found {len(approved_entities)} approved identity blocks available")
                 for entity_meta in approved_entities:
                     if entity_meta.get("identity_block"):
                         identity_blocks.append(entity_meta["identity_block"])
-                        print(f"DEBUG: Using approved identity block for {entity_meta.get('name', '?')} ({entity_meta.get('type', '?')})")
+                        _safe_print(f"DEBUG: Using approved identity block for {entity_meta.get('name', '?')} ({entity_meta.get('type', '?')})")
                 
                 # Check if we have enough approved blocks
                 pending_count = len(screenplay.get_pending_identity_blocks())
                 if pending_count > 0:
-                    print(f"WARNING: {pending_count} identity block(s) are still pending approval. Image prompts may be incomplete.")
+                    _safe_print(f"WARNING: {pending_count} identity block(s) are still pending approval. Image prompts may be incomplete.")
                 
-                print(f"DEBUG: Total approved identity blocks to use: {len(identity_blocks)}")
+                _safe_print(f"DEBUG: Total approved identity blocks to use: {len(identity_blocks)}")
                 
                 # Create a more detailed item-specific positioning description
                 # This makes each item unique by describing what's happening in THIS specific moment
@@ -7308,12 +8279,13 @@ Total should equal approximately {estimated_duration} seconds
                     item=temp_item,
                     screenplay=screenplay,
                     appearing_object_ids=appearing_objects,
-                    scene_id=scene.scene_id
+                    scene_id=scene.scene_id,
+                    scene_level_objects=scene_level_props
                 )
                 
-                print(f"DEBUG: Generated composition prompt length: {len(image_prompt_text)} chars")
-                print(f"DEBUG: Composition prompt preview: {image_prompt_text[:300]}...")
-                print(f"DEBUG: Motion prompt preview: {prompt_text[:300]}...")
+                _safe_print(f"DEBUG: Generated composition prompt length: {len(image_prompt_text)} chars")
+                _safe_print(f"DEBUG: Composition prompt preview: {image_prompt_text[:300]}...")
+                _safe_print(f"DEBUG: Motion prompt preview: {prompt_text[:300]}...")
                 
                 # Get dialogue (already included in motion prompt by _build_motion_video_prompt)
                 dialogue_text = item_data.get("dialogue", "")
@@ -7351,15 +8323,23 @@ Total should equal approximately {estimated_duration} seconds
                 if not isinstance(camera_notes_text, str):
                     camera_notes_text = str(camera_notes_text) if camera_notes_text else ""
                 if not camera_notes_text or len(camera_notes_text) < 20:
-                    scene_type_to_camera = {
-                        SceneType.CLOSEUP: "Close-up shot, static camera",
-                        SceneType.WIDE_SHOT: "Wide shot, static camera",
-                        SceneType.ACTION: "Medium shot, dynamic camera movement",
-                        SceneType.DIALOGUE: "Medium shot, static camera",
-                        SceneType.ESTABLISHING: "Wide establishing shot, slow pan",
-                    }
-                    if scene_type in scene_type_to_camera:
-                        camera_notes_text = scene_type_to_camera[scene_type]
+                    _cam_beat = scene_beats[i] if i < len(scene_beats) else ""
+                    if _cam_beat:
+                        from .screenplay_engine import SHOT_TYPE_OPTIONS, CAMERA_MOTION_OPTIONS as _CAM_OPTS
+                        _inf_shot, _inf_motion = infer_shot_and_motion_from_beat(_cam_beat)
+                        _shot_label = SHOT_TYPE_OPTIONS.get(_inf_shot, "Medium Shot")
+                        _motion_label = _CAM_OPTS.get(_inf_motion, "Static (Locked-Off)")
+                        camera_notes_text = f"{_shot_label}, {_motion_label}"
+                    else:
+                        scene_type_to_camera = {
+                            SceneType.CLOSEUP: "Close-up shot, static camera",
+                            SceneType.WIDE_SHOT: "Wide shot, static camera",
+                            SceneType.ACTION: "Medium shot, dynamic camera movement",
+                            SceneType.DIALOGUE: "Medium shot, static camera",
+                            SceneType.ESTABLISHING: "Wide establishing shot, slow pan",
+                        }
+                        if scene_type in scene_type_to_camera:
+                            camera_notes_text = scene_type_to_camera[scene_type]
                 
                 image_prompt_text = (image_prompt_text or "").strip()
                 prompt_text = (prompt_text or "").strip()
@@ -7376,17 +8356,22 @@ Total should equal approximately {estimated_duration} seconds
                     scene_type=scene_type,
                     camera_notes=camera_notes_text
                 )
+                item.composition_notes = (item_data.get("composition_notes", "") or "").strip()
                 # Set source paragraph index for strict 1:1 mapping
                 item.source_paragraph_index = i
-                # Infer shot_type from scene_type for new items
-                _scene_to_shot = {
-                    SceneType.CLOSEUP: "close_up",
-                    SceneType.WIDE_SHOT: "wide",
-                    SceneType.ACTION: "medium",
-                    SceneType.DIALOGUE: "medium",
-                    SceneType.ESTABLISHING: "wide",
-                }
-                item.shot_type = _scene_to_shot.get(scene_type, "wide")
+                # Infer shot_type and camera_motion from beat content
+                _beat_text = scene_beats[i] if i < len(scene_beats) else ""
+                if _beat_text:
+                    item.shot_type, item.camera_motion = infer_shot_and_motion_from_beat(_beat_text)
+                else:
+                    _scene_to_shot = {
+                        SceneType.CLOSEUP: "close_up",
+                        SceneType.WIDE_SHOT: "wide",
+                        SceneType.ACTION: "medium",
+                        SceneType.DIALOGUE: "medium",
+                        SceneType.ESTABLISHING: "wide",
+                    }
+                    item.shot_type = _scene_to_shot.get(scene_type, "wide")
                 # Optional audio layer: set from AI response only when project uses audio
                 if audio_strategy != "no_audio":
                     item.audio_intent = item_data.get("audio_intent", "") if isinstance(item_data.get("audio_intent"), str) else ""
@@ -7411,7 +8396,8 @@ Total should equal approximately {estimated_duration} seconds
                 for idx, item in enumerate(new_items):
                     beat_text = scene_beats[idx].strip()
                     storyline = self._inject_identity_references(beat_text, screenplay)
-                    item.storyline = self._enforce_full_character_names(storyline, screenplay)
+                    storyline = self._enforce_full_character_names(storyline, screenplay)
+                    item.storyline = self._enforce_full_entity_markup_names(storyline, screenplay)
             
             # ── STRICT 1:1 VALIDATION (beat_count > 0) or LEGACY EXPANSION ──
             items_created = len(storyboard_data.get("storyboard_items", []))
@@ -7426,7 +8412,7 @@ Total should equal approximately {estimated_duration} seconds
                         f"only {final_item_count} storyboard items were generated. "
                         f"The validation layer will handle missing items."
                     )
-                    print(f"{'=' * 80}\n{warning_msg}\n{'=' * 80}")
+                    _safe_print(f"{'=' * 80}\n{warning_msg}\n{'=' * 80}")
                     
                     if final_item_count == 0:
                         raise Exception(
@@ -7437,7 +8423,7 @@ Total should equal approximately {estimated_duration} seconds
                     # AI returned more items than paragraphs — trim to strict 1:1
                     excess = final_item_count - beat_count
                     del scene.storyboard_items[n_items_before + beat_count:]
-                    print(f"STRICT 1:1: Trimmed {excess} excess items to match {beat_count} paragraphs")
+                    _safe_print(f"STRICT 1:1: Trimmed {excess} excess items to match {beat_count} paragraphs")
                 
                 # Re-number and set source_paragraph_index
                 new_items = scene.storyboard_items[n_items_before:]
@@ -7445,7 +8431,7 @@ Total should equal approximately {estimated_duration} seconds
                     sb_item.sequence_number = n_items_before + idx + 1
                     sb_item.source_paragraph_index = idx
                 
-                print(f"✓ Strict 1:1: {len(new_items)} storyboard items for {beat_count} paragraphs")
+                _safe_print(f"✓ Strict 1:1: {len(new_items)} storyboard items for {beat_count} paragraphs")
                 
                 # ── MOMENT REWRITE + BEAT DOMINANCE POST-PROCESSING ──
                 for idx, sb_item in enumerate(new_items):
@@ -7456,23 +8442,31 @@ Total should equal approximately {estimated_duration} seconds
                         try:
                             grammar_result = enforce_cinematic_grammar(src_paragraph)
                             rewritten = grammar_result.corrected_text
-                            # Inject identity references and enforce full character names
+                            # Inject identity references and enforce full entity names
                             rewritten = self._inject_identity_references(rewritten, screenplay)
                             rewritten = self._enforce_full_character_names(rewritten, screenplay)
+                            rewritten = self._enforce_full_entity_markup_names(rewritten, screenplay)
                             sb_item.storyline = rewritten
                         except Exception as e:
-                            print(f"WARNING: Cinematic grammar rewrite failed for item {idx + 1}: {e}")
+                            _safe_print(f"WARNING: Cinematic grammar rewrite failed for item {idx + 1}: {e}")
                             storyline = self._inject_identity_references(src_paragraph, screenplay)
-                            sb_item.storyline = self._enforce_full_character_names(storyline, screenplay)
+                            storyline = self._enforce_full_character_names(storyline, screenplay)
+                            sb_item.storyline = self._enforce_full_entity_markup_names(storyline, screenplay)
                         
                         # Extract dominant action and suggest camera framing
                         dominant = extract_dominant_action(src_paragraph)
                         if dominant:
                             framing = suggest_camera_framing(dominant, src_paragraph)
-                            # Only override if current camera_notes are generic or empty
                             if not sb_item.camera_notes or len(sb_item.camera_notes) < 20:
                                 sb_item.camera_notes = framing
-                            print(f"  Item {idx + 1}: dominant action = *{dominant}* → {framing}")
+                            _safe_print(f"  Item {idx + 1}: dominant action = *{dominant}* → {framing}")
+
+                        # Composition fallback: extract from storyline if AI left it empty
+                        if not (getattr(sb_item, "composition_notes", "") or "").strip():
+                            extracted = self._extract_composition_from_storyline(src_paragraph)
+                            if extracted:
+                                sb_item.composition_notes = extracted
+                                _safe_print(f"  Item {idx + 1}: composition extracted from storyline")
                 
                 # ── ENTITY VALIDATION LAYER (MANDATORY) ──
                 new_items = scene.storyboard_items[n_items_before:]
@@ -7486,7 +8480,7 @@ Total should equal approximately {estimated_duration} seconds
                 ]
                 
                 if failed_indices:
-                    print(f"VALIDATION: {len(failed_indices)} item(s) failed entity validation — attempting regeneration")
+                    _safe_print(f"VALIDATION: {len(failed_indices)} item(s) failed entity validation — attempting regeneration")
                     
                     for fail_idx in failed_indices:
                         vr = validation_results[fail_idx]
@@ -7500,7 +8494,7 @@ Total should equal approximately {estimated_duration} seconds
                         
                         regen_success = False
                         for attempt in range(1, 3):  # Max 2 regeneration attempts
-                            print(f"  Regenerating item {fail_idx + 1} (attempt {attempt}/2): {vr.errors}")
+                            _safe_print(f"  Regenerating item {fail_idx + 1} (attempt {attempt}/2): {vr.errors}")
                             
                             regen_prompt = (
                                 f"Regenerate storyboard item {fail_idx + 1} for this paragraph.\n\n"
@@ -7508,9 +8502,11 @@ Total should equal approximately {estimated_duration} seconds
                                 f"VALIDATION ERRORS:\n" +
                                 "\n".join(f"- {e}" for e in vr.errors) +
                                 f"\n\nRULES:\n"
-                                f"- Reference ONLY entities from the paragraph above.\n"
-                                f"- Do NOT add entities from other paragraphs.\n"
-                                f"- Do NOT invent new entities.\n"
+                                f"- STORYLINE and DIALOGUE: reference ONLY characters and actions from the paragraph above.\n"
+                                f"- IMAGE PROMPT and COMPOSITION NOTES: include all scene-level objects, props,\n"
+                                f"  vehicles, and environmental features visible in the camera frame — even if\n"
+                                f"  mentioned in other paragraphs. Props on set are visible before interaction.\n"
+                                f"- Do NOT invent new entities not present anywhere in the scene.\n"
                                 f"- Preserve all *action* and (sfx) markup.\n"
                                 f"- Convert to present-tense cinematic action.\n\n"
                                 f"Return ONLY valid JSON with this structure:\n"
@@ -7525,8 +8521,9 @@ Total should equal approximately {estimated_duration} seconds
                                     messages=[
                                         {"role": "system", "content": (
                                             "You are a storyboard artist fixing a validation error. "
-                                            "Reference ONLY entities from the provided paragraph. "
-                                            "No cross-paragraph contamination. No invented entities."
+                                            "Storyline/dialogue: reference ONLY characters and actions from the provided paragraph. "
+                                            "image_prompt/composition_notes: include all scene-level visible objects and props. "
+                                            "No invented entities."
                                         )},
                                         {"role": "user", "content": regen_prompt}
                                     ],
@@ -7543,7 +8540,10 @@ Total should equal approximately {estimated_duration} seconds
                                         regen_storyline = self._inject_identity_references(
                                             regen_data["storyline"], screenplay
                                         )
-                                        sb_item.storyline = self._enforce_full_character_names(
+                                        regen_storyline = self._enforce_full_character_names(
+                                            regen_storyline, screenplay
+                                        )
+                                        sb_item.storyline = self._enforce_full_entity_markup_names(
                                             regen_storyline, screenplay
                                         )
                                     if regen_data.get("image_prompt"):
@@ -7569,20 +8569,20 @@ Total should equal approximately {estimated_duration} seconds
                                     sb_item.validation_status = "passed"
                                     sb_item.validation_errors = []
                                     regen_success = True
-                                    print(f"  ✓ Item {fail_idx + 1} passed validation after attempt {attempt}")
+                                    _safe_print(f"  ✓ Item {fail_idx + 1} passed validation after attempt {attempt}")
                                     break
                                 else:
                                     vr = vr._replace(errors=list(mismatch.errors))
-                                    print(f"  ✗ Item {fail_idx + 1} still failing: {mismatch.errors}")
+                                    _safe_print(f"  ✗ Item {fail_idx + 1} still failing: {mismatch.errors}")
                             except Exception as regen_err:
-                                print(f"  ✗ Regeneration attempt {attempt} failed: {regen_err}")
+                                _safe_print(f"  ✗ Regeneration attempt {attempt} failed: {regen_err}")
                         
                         if not regen_success:
                             sb_item.validation_status = "validation_failed"
                             sb_item.validation_errors = vr.errors
-                            print(f"  ⚠ Item {fail_idx + 1} flagged as validation_failed after 2 attempts")
+                            _safe_print(f"  ⚠ Item {fail_idx + 1} flagged as validation_failed after 2 attempts")
                 else:
-                    print(f"VALIDATION: All {len(new_items)} items passed entity validation")
+                    _safe_print(f"VALIDATION: All {len(new_items)} items passed entity validation")
                 
                 # Mark passing items
                 for idx, sb_item in enumerate(new_items):
@@ -7602,7 +8602,7 @@ Total should equal approximately {estimated_duration} seconds
                         start=n_items_before + 1
                     ):
                         sb_item.sequence_number = seq_idx
-                    print(f"BEAT DENSITY: Split {len(new_items)} items into {len(split_results)} items")
+                    _safe_print(f"BEAT DENSITY: Split {len(new_items)} items into {len(split_results)} items")
                 
                 # Duration adjustment for legacy mode
                 current_total = sum(item.duration for item in scene.storyboard_items)
@@ -7613,12 +8613,20 @@ Total should equal approximately {estimated_duration} seconds
                         sb_item.duration = new_duration
             
             # ── DIALOGUE DURATION FLOOR ──
-            # Ensure items with dialogue have enough duration for delivery
+            # Cinematic speech averages ~2.3 words/second with natural pauses.
+            # Add a buffer for dramatic beats, reactions, and visual action
+            # that accompanies the dialogue.
             for sb_item in scene.storyboard_items[n_items_before:]:
                 dialogue = (sb_item.dialogue or "").strip()
                 if dialogue:
-                    word_count = len(dialogue.split())
-                    min_duration = max(3, round(word_count / 2.0) + 1)
+                    # Strip character name prefix (e.g. "MAYA: Hello" → "Hello")
+                    dialogue_text = re.sub(r'^[A-Z][A-Z\s]+:\s*', '', dialogue)
+                    # Remove stage directions in parentheses
+                    dialogue_text = re.sub(r'\([^)]*\)', '', dialogue_text).strip()
+                    word_count = len(dialogue_text.split())
+                    # ~2.3 words/sec delivery + 1.5s buffer for pauses/reactions
+                    speech_seconds = word_count / 2.3
+                    min_duration = max(4, round(speech_seconds + 1.5))
                     if sb_item.duration < min_duration:
                         sb_item.duration = min(30, min_duration)
 
@@ -7627,7 +8635,7 @@ Total should equal approximately {estimated_duration} seconds
                 from core.multishot_engine import apply_multishot_clustering
                 apply_multishot_clustering(scene, screenplay, self.model_settings)
             except Exception as ms_err:
-                print(f"WARNING: Multi-shot clustering failed, reverting to single-shot: {ms_err}")
+                _safe_print(f"WARNING: Multi-shot clustering failed, reverting to single-shot: {ms_err}")
                 scene.generation_strategy = "single_shot"
                 scene.multishot_clusters = []
                 for sb_item in scene.storyboard_items:
@@ -7763,10 +8771,14 @@ For each storyboard item, you must:
 1. Choose the optimal duration in whole seconds (1-30) based on content:
    - Quick cuts, reaction shots, transitions = 2-3 seconds
    - Fast action beats = 3-5 seconds
-   - Standard action or dialogue = 5-8 seconds
-   - Complex scenes with extended dialogue = 8-12 seconds
+   - Standard action (no dialogue) = 4-6 seconds
+   - Short dialogue (1-8 words) = 5-7 seconds
+   - Medium dialogue (9-20 words) = 7-10 seconds
+   - Extended dialogue (20+ words) = 10-15 seconds
    - Key dramatic moments, reveals = 6-10 seconds
    - Establishing/atmospheric shots = 3-6 seconds
+   IMPORTANT: Dialogue needs time for delivery at ~2.3 words/second PLUS
+   natural pauses and reaction beats. Never set a dialogue item below 5s.
    - Choose the duration that best serves the pacing and content of each specific moment
 
 2. Create a COMPOSITION PROMPT for the start frame image:
@@ -7796,20 +8808,28 @@ For each storyboard item, you must:
    - The video prompt should start from the same visual state as described in the image prompt, then describe the action/movement
    - Example: "Character walks slowly across the dimly lit room, reaching for the door handle. As they approach, they crouch down to examine something on the floor, then stand up and turn to face the camera."
 
-4. Generate dialogue for the scene:
+4. Describe the BLOCKING / COMPOSITION for the start frame:
+   - State each character's position in the frame (camera-left, camera-right, centre, foreground, background)
+   - State each character's facing direction (facing camera, facing away, facing other character, profile view)
+   - State spatial relationships between characters (opposite, side-by-side, one behind the other)
+   - Put this in the "composition_notes" field
+   - Example: "DETECTIVE VASH camera-left facing right; DETECTIVE NOIR camera-right facing left, 3m apart, eyes locked."
+   - If only one entity, describe their position and orientation in the frame.
+
+5. Generate dialogue for the scene:
    - If characters are speaking, include realistic dialogue
    - Format as "Character: Dialogue text"
    - If no dialogue is needed, use empty string
    - Most scenes should have some dialogue unless it's purely action/visual
 
-5. Provide detailed camera movement notes:
+6. Provide detailed camera movement notes:
    - Specify camera movements (pan, tilt, zoom, dolly, tracking, static, etc.)
    - Include camera angles (high angle, low angle, eye level, Dutch angle, etc.)
    - Describe shot composition (close-up, medium shot, wide shot, extreme wide, etc.)
    - Note any camera transitions or movements within the shot
    - Be specific about camera direction (e.g., "Slow dolly forward", "Pan left to right", "Zoom in on character's face")
 
-6. Classify the scene type (action, dialogue, transition, establishing, closeup, wide_shot, montage)
+7. Classify the scene type (action, dialogue, transition, establishing, closeup, wide_shot, montage)
 
 STORY TITLE (MANDATORY): The "title" field MUST contain an original, compelling title. If the user provided a title, use it. If no title was provided, you MUST generate one — NEVER use "Untitled", "Untitled Story", or leave it blank.
 
@@ -7823,6 +8843,7 @@ Format your response as a JSON object with this EXACT structure (ensure all comm
             "sequence_number": 1,
             "duration": 5,
             "image_prompt": "Higgsfield.ai optimized image prompt (no length limit; be as detailed as needed) describing ONLY the static establishing shot/first frame. Be detailed and specific: precise setting, character appearance and exact positioning, camera angle/perspective, specific lighting conditions, environmental elements, atmospheric details. NO action or movement. Highly detailed photorealistic style.",
+            "composition_notes": "Entity positions, facing directions, spatial relationships. E.g. 'CHARACTER_A camera-left facing right; CHARACTER_B camera-right facing left, 3m apart.'",
             "prompt": "COMPREHENSIVE video generation prompt (no length limit; be as detailed as needed) for higgsfield.ai. Include: detailed scene description, camera angles, lighting, composition, character actions, setting, atmosphere, dialogue. Visual and camera only; no music or sound design.",
             "visual_description": "Keep this field for reference, but the prompts above should contain all visual details",
             "dialogue": "Character: Dialogue text here. Include dialogue for most scenes unless purely visual.",
@@ -7833,6 +8854,7 @@ Format your response as a JSON object with this EXACT structure (ensure all comm
             "sequence_number": 2,
             "duration": 10,
             "image_prompt": "Higgsfield.ai optimized image prompt (no length limit; be as detailed as needed) for the static establishing shot. Detailed and specific: setting, character positioning, camera angle, lighting, environment. NO action.",
+            "composition_notes": "Entity positions and orientations for this shot.",
             "prompt": "COMPREHENSIVE video generation prompt (no length limit; be as detailed as needed) with full visual and cinematic details",
             "visual_description": "",
             "dialogue": "Character: More dialogue here",
@@ -7853,6 +8875,7 @@ IMPORTANT REQUIREMENTS:
 - The "image_prompt" field is a COMPOSITION PROMPT — describe camera shot, entity names, placement, and action only
   - Reference entities BY NAME ONLY — no physical descriptions, clothing, lighting, atmosphere, or style
   - The image generator has reference images for each entity; only describe composition and framing
+  - Characters must NOT look directly at the camera unless the storyline explicitly states they do
   - Example: "Wide shot of ELARA VANDERMERE kneeling in the fields of Briar's Hollow, her hands in the soil"
 - The "prompt" field should be COMPREHENSIVE video generation prompt (no length limit; be as detailed as needed) for higgsfield.ai
   - CRITICAL: MUST explicitly describe ALL character actions using clear action verbs: walking, running, crouching, standing, sitting, jumping, reaching, grabbing, turning, looking, speaking, gesturing, moving, approaching, entering, leaving, etc.
@@ -7860,8 +8883,15 @@ IMPORTANT REQUIREMENTS:
   - MUST incorporate the atmosphere/tone ({atmosphere if atmosphere else "as appropriate"}) throughout the video prompt
   - MUST include dialogue from the "dialogue" field - incorporate dialogue naturally into the scene description
   - Describe ONLY what is seen: visual action, camera, composition. Do not include music or sound design in the prompt.
+  - Characters must NOT look directly at the camera unless the storyline explicitly states they do
 - Generate dialogue for scenes where characters interact or speak (most scenes should have dialogue)
 - Camera notes MUST include specific camera movements (pan, tilt, zoom, dolly, tracking, etc.) and angles
+
+REFERENCE IMAGE CONSISTENCY (MANDATORY):
+- Every character, environment, object, and vehicle must match their supplied reference images EXACTLY
+- Do NOT add characters, objects, props, or background elements not present in the storyline or references
+- Do NOT alter any entity's appearance from their reference image
+- Characters must NEVER look directly at the camera unless the storyline explicitly states they do
 
 Create a complete, sequential storyboard that tells the story from beginning to end.
 Make sure each item flows naturally into the next.
@@ -8019,6 +9049,7 @@ Do NOT stop early - create the full number of items requested to tell the comple
                     scene_type=scene_type,
                     camera_notes=camera_notes_text
                 )
+                item.composition_notes = (item_data.get("composition_notes", "") or "").strip()
                 
                 # Calculate render cost
                 render_cost, cost_factors = self._calculate_render_cost(item)
@@ -8031,6 +9062,18 @@ Do NOT stop early - create the full number of items requested to tell the comple
                 
                 screenplay.add_item(item)
             
+            # ── DIALOGUE DURATION FLOOR (legacy path) ──
+            for sb_item in screenplay.storyboard_items:
+                dialogue = (sb_item.dialogue or "").strip()
+                if dialogue:
+                    dialogue_text = re.sub(r'^[A-Z][A-Z\s]+:\s*', '', dialogue)
+                    dialogue_text = re.sub(r'\([^)]*\)', '', dialogue_text).strip()
+                    word_count = len(dialogue_text.split())
+                    speech_seconds = word_count / 2.3
+                    min_dur = max(4, round(speech_seconds + 1.5))
+                    if sb_item.duration < min_dur:
+                        sb_item.duration = min(30, min_dur)
+
             # Final validation - ensure we have enough items
             final_count = len(screenplay.storyboard_items)
             if final_count < min_items:
@@ -9096,7 +10139,7 @@ Do NOT stop early - create the full number of items requested to tell the comple
                 # Trim back to the last complete }
                 json_str = json_str[:last_complete_brace + 1]
                 json_str = json_str.rstrip().rstrip(',')
-                print("TRUNCATION REPAIR: Stripped incomplete trailing object")
+                _safe_print("TRUNCATION REPAIR: Stripped incomplete trailing object")
 
             # Recount after potential truncation trimming
             open_braces = json_str.count('{')
@@ -9114,7 +10157,35 @@ Do NOT stop early - create the full number of items requested to tell the comple
                     json_str += '\n}'
         
         return json_str
-    
+
+    def _salvage_truncated_chat_json(self, content: str) -> dict | None:
+        """Last-resort recovery for a chat_about_story response truncated mid-JSON.
+
+        Extracts the "text" and "intent" fields with regex so the user at
+        least gets the conversational reply even if suggestions are lost.
+        """
+        if not content:
+            return None
+        try:
+            # Try extracting "text" value
+            text_match = re.search(
+                r'"text"\s*:\s*"((?:[^"\\]|\\.)*)"', content, re.DOTALL
+            )
+            intent_match = re.search(
+                r'"intent"\s*:\s*"((?:[^"\\]|\\.)*)"', content
+            )
+            if text_match:
+                text_val = text_match.group(1).replace('\\"', '"').replace('\\n', '\n')
+                intent_val = intent_match.group(1) if intent_match else "discuss"
+                return {
+                    "text": text_val + "\n\n_(Response was truncated — suggestions may be incomplete.)_",
+                    "intent": intent_val,
+                    "suggestions": []
+                }
+        except Exception:
+            pass
+        return None
+
     def _extract_and_parse_json(self, content: str, prefer_array: bool = False):
         """Extract and parse JSON from AI response with multiple fallback strategies.
         
@@ -9134,7 +10205,7 @@ Do NOT stop early - create the full number of items requested to tell the comple
                     # Try to parse as JSON array
                     parsed = json.loads(array_str)
                     if isinstance(parsed, list):
-                        print(f"DEBUG _extract_and_parse_json: Successfully parsed array with {len(parsed)} items")
+                        _safe_print(f"DEBUG _extract_and_parse_json: Successfully parsed array with {len(parsed)} items")
                         return parsed
                 except json.JSONDecodeError:
                     # Array might be incomplete, try to repair
@@ -9148,7 +10219,7 @@ Do NOT stop early - create the full number of items requested to tell the comple
                         try:
                             parsed = json.loads(repaired)
                             if isinstance(parsed, list):
-                                print(f"DEBUG _extract_and_parse_json: Repaired and parsed array with {len(parsed)} items")
+                                _safe_print(f"DEBUG _extract_and_parse_json: Repaired and parsed array with {len(parsed)} items")
                                 return parsed
                         except:
                             pass
@@ -9707,7 +10778,7 @@ Entity types to look for: {entity_types_str}
 Text to analyze:
 {text[:2500]}
 
-ENTITY MARKUP (Wizard convention): Text inside _underscores_ = locations/environments ONLY. NEVER extract individual words from _underlined_ text as characters. Example: "_THE DARKENED LABORATORY_" is ONE environment—do NOT extract "DARKENED" or "LABORATORY" as characters.
+ENTITY MARKUP (Wizard convention): Text inside _underscores_ = locations/environments ONLY. NEVER extract individual words or partial phrases from _underlined_ text as separate entities of ANY type (character, vehicle, or object). Example: "_THE DARKENED LABORATORY_" is ONE environment—do NOT extract "DARKENED" or "LABORATORY" as characters. "_Temple of Dying Light_" is ONE environment—do NOT extract "Dying Light" as a vehicle or object. Extract the COMPLETE underlined phrase as a single environment entity.
 
 CRITICAL REQUIREMENTS:
 1. For CHARACTERS: Extract their FULL PROPER NAME (e.g., "Captain Jaxon Vash", not just "captain"). Characters use FULL CAPS in screenplay style. Words inside _underlined_ regions are location/environment text, NOT character names. CRITICAL: REBECCA 'REX' STERN and REX are the SAME character — extract ONCE using the full name. Never extract both; nickname-only references (REX) = same person as full name (REBECCA 'REX' STERN).
@@ -9796,7 +10867,7 @@ If no entities are found, return an empty array [].
             except:
                 pass
             
-            print(f"DEBUG: Entity extraction AI response (first 500 chars): {content[:500]}")
+            _safe_print(f"DEBUG: Entity extraction AI response (first 500 chars): {content[:500]}")
             
             # Extract JSON from response
             try:
@@ -9817,35 +10888,35 @@ If no entities are found, return an empty array [].
                 except:
                     pass
                 
-                print(f"DEBUG: Parsed entities data type: {type(entities_data)}")
+                _safe_print(f"DEBUG: Parsed entities data type: {type(entities_data)}")
                 
                 # Handle both list and dict responses
                 final_list = []
                 if isinstance(entities_data, list):
-                    print(f"DEBUG: Found {len(entities_data)} entities in list")
+                    _safe_print(f"DEBUG: Found {len(entities_data)} entities in list")
                     final_list = entities_data
                 elif isinstance(entities_data, dict):
                     # Check common dict keys that might contain the entities list
                     if "entities" in entities_data:
                         final_list = entities_data["entities"]
-                        print(f"DEBUG: Found {len(final_list)} entities in dict['entities']")
+                        _safe_print(f"DEBUG: Found {len(final_list)} entities in dict['entities']")
                     elif "items" in entities_data:
                         final_list = entities_data["items"]
-                        print(f"DEBUG: Found {len(final_list)} entities in dict['items']")
+                        _safe_print(f"DEBUG: Found {len(final_list)} entities in dict['items']")
                     elif "results" in entities_data:
                         final_list = entities_data["results"]
-                        print(f"DEBUG: Found {len(final_list)} entities in dict['results']")
+                        _safe_print(f"DEBUG: Found {len(final_list)} entities in dict['results']")
                     else:
                         # Maybe the dict itself IS the list values
                         # Or try to find any key that contains a list
                         for key, value in entities_data.items():
                             if isinstance(value, list) and len(value) > 0:
                                 final_list = value
-                                print(f"DEBUG: Found {len(final_list)} entities in dict['{key}']")
+                                _safe_print(f"DEBUG: Found {len(final_list)} entities in dict['{key}']")
                                 break
                 
                 if not final_list:
-                    print(f"DEBUG: No entities found in parsed data structure")
+                    _safe_print(f"DEBUG: No entities found in parsed data structure")
                     try:
                         with open("debug_entity_extraction.log", "a", encoding="utf-8") as debug_file:
                             debug_file.write(f"ERROR: Could not extract list from parsed data\n")
@@ -9863,7 +10934,7 @@ If no entities are found, return an empty array [].
                         
                         # Filter: Reject malformed names (dialogue blocks, paragraph text, compound names)
                         if '\n' in name or '"' in name or len(name) > 80:
-                            print(f"DEBUG: Filtered out malformed entity name: '{name[:60]}...' (contains newlines, quotes, or too long)")
+                            _safe_print(f"DEBUG: Filtered out malformed entity name: '{name[:60]}...' (contains newlines, quotes, or too long)")
                             try:
                                 with open("debug_entity_extraction.log", "a", encoding="utf-8") as debug_file:
                                     debug_file.write(f"FILTERED OUT: malformed name (newlines/quotes/length)\n")
@@ -9877,7 +10948,7 @@ If no entities are found, return an empty array [].
                         
                         # Filter 2: Skip extras (guests, crowd, etc.) - extras belong to environment only, not character blocks
                         if self._is_extras_entity(name, entity.get("description", ""), entity_type):
-                            print(f"DEBUG: Filtered out extras entity: '{name}' (environment-level only)")
+                            _safe_print(f"DEBUG: Filtered out extras entity: '{name}' (environment-level only)")
                             try:
                                 with open("debug_entity_extraction.log", "a", encoding="utf-8") as debug_file:
                                     debug_file.write(f"FILTERED OUT: name='{name}' (extras - environment only)\n")
@@ -9887,7 +10958,7 @@ If no entities are found, return an empty array [].
                         
                         # Filter 2b: Characters must be people — reject company/department/concept/brand names
                         if entity_type == "character" and self._is_company_or_concept_entity(name):
-                            print(f"DEBUG: Filtered out non-person character: '{name}' (company/department/concept)")
+                            _safe_print(f"DEBUG: Filtered out non-person character: '{name}' (company/department/concept)")
                             try:
                                 with open("debug_entity_extraction.log", "a", encoding="utf-8") as debug_file:
                                     debug_file.write(f"FILTERED OUT: name='{name}' (not a human character)\n")
@@ -9903,7 +10974,7 @@ If no entities are found, return an empty array [].
                             }
                             name_lower = name.lower().strip()
                             if name_lower in temporal_or_invalid:
-                                print(f"DEBUG: Filtered out bogus environment: '{name}' (temporal word, not a place)")
+                                _safe_print(f"DEBUG: Filtered out bogus environment: '{name}' (temporal word, not a place)")
                                 try:
                                     with open("debug_entity_extraction.log", "a", encoding="utf-8") as debug_file:
                                         debug_file.write(f"FILTERED OUT: name='{name}' (temporal/invalid environment)\n")
@@ -9912,7 +10983,7 @@ If no entities are found, return an empty array [].
                                 continue
                             # Reject comma-separated temporal phrases like "Once, Soon"
                             if "," in name and any(t in name_lower for t in ["once", "soon", "later", "then"]):
-                                print(f"DEBUG: Filtered out bogus environment: '{name}' (temporal phrase, not a place)")
+                                _safe_print(f"DEBUG: Filtered out bogus environment: '{name}' (temporal phrase, not a place)")
                                 try:
                                     with open("debug_entity_extraction.log", "a", encoding="utf-8") as debug_file:
                                         debug_file.write(f"FILTERED OUT: name='{name}' (temporal phrase as environment)\n")
@@ -9929,7 +11000,7 @@ If no entities are found, return an empty array [].
                             # Find all occurrences of this name (word-boundary) in text
                             matches = list(re.finditer(r'\b' + re.escape(name) + r'\b', text, re.IGNORECASE))
                             if matches and all(_inside_underlined(m.start()) for m in matches):
-                                print(f"DEBUG: Filtered out character '{name}' (only appears inside _underlined_ location markup)")
+                                _safe_print(f"DEBUG: Filtered out character '{name}' (only appears inside _underlined_ location markup)")
                                 try:
                                     with open("debug_entity_extraction.log", "a", encoding="utf-8") as debug_file:
                                         debug_file.write(f"FILTERED OUT: name='{name}' (inside underlined env markup)\n")
@@ -9941,13 +11012,13 @@ If no entities are found, return an empty array [].
                         if len(name) > 2 and name.lower() not in ["the", "a", "an", "it", "that", "this"]:
                             filtered_entities.append(entity)
                         else:
-                            print(f"DEBUG: Filtered out entity with name: '{name}'")
+                            _safe_print(f"DEBUG: Filtered out entity with name: '{name}'")
                             try:
                                 with open("debug_entity_extraction.log", "a", encoding="utf-8") as debug_file:
                                     debug_file.write(f"FILTERED OUT: name='{name}' (too short or generic)\n")
                             except:
                                 pass
-                print(f"DEBUG: After filtering: {len(filtered_entities)} entities")
+                _safe_print(f"DEBUG: After filtering: {len(filtered_entities)} entities")
                 
                 registry_frozen = screenplay is not None and getattr(screenplay, "character_registry_frozen", False)
                 
@@ -9987,7 +11058,7 @@ If no entities are found, return an empty array [].
                     
                     # Validate vehicle classification (object → vehicle)
                     if entity_type == "object" and self._is_vehicle_entity(entity_name, entity_desc):
-                        print(f"RECLASSIFY: '{entity_name}' from object → vehicle")
+                        _safe_print(f"RECLASSIFY: '{entity_name}' from object → vehicle")
                         try:
                             with open("debug_entity_extraction.log", "a", encoding="utf-8") as debug_file:
                                 debug_file.write(f"RECLASSIFY: '{entity_name}' from object → vehicle\n")
@@ -10001,7 +11072,7 @@ If no entities are found, return an empty array [].
                         if registry_frozen and screenplay and screenplay.resolve_character_to_canonical(entity_name) is not None:
                             pass  # Do not reclassify Wizard characters to environment
                         else:
-                            print(f"RECLASSIFY: '{entity_name}' from {entity_type} → environment")
+                            _safe_print(f"RECLASSIFY: '{entity_name}' from {entity_type} → environment")
                             try:
                                 with open("debug_entity_extraction.log", "a", encoding="utf-8") as debug_file:
                                     debug_file.write(f"RECLASSIFY: '{entity_name}' from {entity_type} → environment\n")
@@ -10022,7 +11093,7 @@ If no entities are found, return an empty array [].
                             except:
                                 pass
                         elif self._is_person_name(entity_name):
-                            print(f"RECLASSIFY: '{entity_name}' from environment → character (person name in env block)")
+                            _safe_print(f"RECLASSIFY: '{entity_name}' from environment → character (person name in env block)")
                             try:
                                 with open("debug_entity_extraction.log", "a", encoding="utf-8") as debug_file:
                                     debug_file.write(f"RECLASSIFY: '{entity_name}' from environment → character\n")
@@ -10032,6 +11103,44 @@ If no entities are found, return an empty array [].
                 
                 # Character identity normalization: one human = one character. Deduplicate by normalized name.
                 filtered_entities = self._deduplicate_character_entities(filtered_entities)
+                
+                # Drop entities whose name is a substring of an extracted environment name.
+                # Prevents the AI splitting "Temple of Dying Light" into an env + a spurious
+                # "Dying Light" vehicle/object.
+                env_names_lower = [
+                    (e.get("name") or "").strip().lower()
+                    for e in filtered_entities
+                    if isinstance(e, dict) and (e.get("type") or "").lower() == "environment"
+                ]
+                if env_names_lower:
+                    before_substr = len(filtered_entities)
+                    kept = []
+                    for e in filtered_entities:
+                        if not isinstance(e, dict):
+                            kept.append(e)
+                            continue
+                        etype = (e.get("type") or "").lower()
+                        if etype == "environment":
+                            kept.append(e)
+                            continue
+                        ename = (e.get("name") or "").strip().lower()
+                        if not ename:
+                            kept.append(e)
+                            continue
+                        is_fragment = any(
+                            ename in env_n and ename != env_n
+                            for env_n in env_names_lower
+                        )
+                        if is_fragment:
+                            _safe_print(f"DROP FRAGMENT: '{e.get('name')}' ({etype}) — substring of an environment name")
+                            try:
+                                with open("debug_entity_extraction.log", "a", encoding="utf-8") as debug_file:
+                                    debug_file.write(f"DROP FRAGMENT: '{e.get('name')}' ({etype}) — substring of environment name\n")
+                            except Exception:
+                                pass
+                        else:
+                            kept.append(e)
+                    filtered_entities = kept
                 
                 # When registry is frozen: drop any character entity not in the Wizard list (no new characters)
                 if registry_frozen and screenplay:
@@ -10179,7 +11288,30 @@ If no entities are found, return an empty array [].
         if (entity_type or "").lower() == "character":
             character_canonical_rule = """
 CHARACTER IDENTITY RULE: Use the canonical character name verbatim. Generate PHYSICAL APPEARANCE ONLY: gender, height, face structure, hair color/style, eye color, skin tone, age range, build/body type, permanent features (scars, tattoos, glasses if permanent). Do NOT include the character's name in the physical description. Character identity MUST NOT include clothing, attire, or accessories—those belong in scene wardrobe. Do NOT rename or split this character."""
+        elif (entity_type or "").lower() == "group":
+            character_canonical_rule = """
+GROUP IDENTITY RULE: This entity is a GROUP of multiple individuals who share a collective visual identity (e.g. soldiers, guards, knights). Describe their SHARED visual appearance: uniform/armor style, colours, insignia/markings, equipment carried, headgear, and overall condition. Do NOT describe individual faces, unique physical traits, or personal distinguishing features. The identity block ensures all group members look like they belong to the same unit. Start with "the same group of [description] with..." """
         
+        spatial_layout_section = ""
+        # For environments, restrict the AI's source to paragraph 1 (the
+        # establishment paragraph) plus spatial layout inferred from actions.
+        # This prevents random objects from later paragraphs bleeding into
+        # the environment identity block.
+        env_scene_text = scene_text
+        if (entity_type or "").lower() == "environment" and scene_text:
+            _env_paras = scene_text.split("\n\n")
+            if _env_paras:
+                env_scene_text = _env_paras[0]
+            spatial_facts = self._extract_spatial_layout_from_actions(scene_text)
+            if spatial_facts:
+                spatial_layout_section = (
+                    "\n\nSPATIAL LAYOUT (derived from character movement — "
+                    "must be reflected in the environment description):\n"
+                    + spatial_facts
+                )
+        
+        _scene_text_for_prompt = env_scene_text if (entity_type or "").lower() == "environment" else scene_text
+
         prompt = f"""You are a script supervisor creating an IDENTITY BLOCK for a recurring entity in a video production.
 
 ⚠️ ABSOLUTELY CRITICAL RULES - FOLLOW THESE EXACTLY:
@@ -10196,7 +11328,7 @@ Entity Type: {entity_type}
 Initial Description: {description}
 
 SCENE TEXT (extract details ONLY from this - this is your ONLY source):
-{scene_text[:5000]}
+{_scene_text_for_prompt[:5000]}{spatial_layout_section}
 
 ═══════════════════════════════════════════════════════════════════════════════
 8-FIELD UNIVERSAL IDENTITY BLOCK SCHEMA
@@ -10248,14 +11380,20 @@ IMPORTANT RULES:
 Output ONLY the identity block text - no labels, no explanations, no markdown."""
         
         try:
+            _ib_sys = "You are a script supervisor. Extract EXACT details from scene text. For characters: physical identity only (face, hair, eyes, skin, age, build, scars)—NEVER include clothing, attire, or accessories. Use only what is explicitly stated in the scene."
+            _ib_ss = getattr(screenplay, "story_settings", None) or {}
+            _ib_cr = _CONTENT_RATING_DIRECTIVES.get(_ib_ss.get("content_rating", "unrestricted"), "")
+            if _ib_cr:
+                _ib_sys += " " + _ib_cr
+
             response = self._chat_completion(
                 model=self.model_settings["model"],
                 messages=[
-                    {"role": "system", "content": "You are a script supervisor. Extract EXACT details from scene text. For characters: physical identity only (face, hair, eyes, skin, age, build, scars)—NEVER include clothing, attire, or accessories. Use only what is explicitly stated in the scene."},
+                    {"role": "system", "content": _ib_sys},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.1,  # Very low temperature for consistent extraction following 8-field schema
-                max_tokens=400  # Increased for 8-field schema
+                temperature=0.1,
+                max_tokens=400
             )
             
             content = response.choices[0].message.content
@@ -10282,7 +11420,7 @@ Output ONLY the identity block text - no labels, no explanations, no markdown.""
             
             # Validate the identity block
             if not self._validate_identity_block(identity_block, entity_type):
-                print(f"Warning: Generated identity block for {entity_name} ({entity_type}) failed validation")
+                _safe_print(f"Warning: Generated identity block for {entity_name} ({entity_type}) failed validation")
                 # Try to fix it if it doesn't start with "the same"
                 if not identity_block.lower().startswith("the same"):
                     identity_block = f"the same {entity_type} with {identity_block}"
@@ -10395,13 +11533,40 @@ Output ONLY the identity block text - no labels, no explanations, no markdown.""
         if (entity_type or "").lower() == "environment":
             environment_rule = (
                 "\nENVIRONMENT IDENTITY RULE: This entity is a LOCATION/SETTING. "
-                "Describe the physical space in rich detail: architecture, layout, furniture, fixtures, "
+                "Describe the physical space in rich detail: architecture, layout, "
                 "materials, surfaces, textures, colours, lighting quality "
                 "(including which objects are the light sources — torches, lamps, candles, screens, fires, neon, "
                 "sconces, braziers, chandeliers — and their specific visual effect: colour cast, warmth, intensity, "
                 "shadow direction; also note any objects that are specifically unlit or dark), and atmosphere. "
+                "Include ONLY fixtures, structures, and objects that are PERMANENT parts of the environment "
+                "(built-in furniture, architectural features, natural formations, fixed light sources). "
+                "Do NOT include portable objects that characters carry or interact with — items like "
+                "swords, daggers, medallions, compasses, journals, papers, boots, chairs, and temporary "
+                "props belong to characters, NOT the environment. Only include furniture (tables, chairs, "
+                "desks) if the environment is an INDOOR setting where such items naturally belong (offices, "
+                "taverns, homes, libraries). Outdoor environments (fields, wastelands, ruins, plains, forests) "
+                "should describe terrain, vegetation, sky, weather, geological features, and architecture — "
+                "NOT portable items placed there by characters. "
+                "If the scene context lists PASSIVE SET DRESSING items, incorporate each one into your "
+                "environment description with enough visual detail for consistent image generation. "
+                "If the scene context lists entities under DO NOT DESCRIBE, you MUST completely omit them — "
+                "those entities have their own separate identity blocks and must NOT appear in the environment description. "
+                "If a SPATIAL LAYOUT section is provided, you MUST incorporate those layout facts into the "
+                "environment description. Spatial layout facts describe how furniture and structures are "
+                "physically arranged (e.g. freestanding shelves with aisles, multiple exits, hidden passages). "
+                "These are derived from character movement in the scene and are critical for image accuracy. "
                 "Be expansive and specific — the more visual detail the better for image generation consistency. "
                 "Do NOT mention any characters, character actions, wardrobe, or dialogue.\n"
+            )
+        elif (entity_type or "").lower() == "group":
+            environment_rule = (
+                "\nGROUP IDENTITY RULE: This entity is a GROUP of multiple individuals who share a collective "
+                "visual identity (e.g. soldiers, guards, knights, rebels). Describe their SHARED visual appearance: "
+                "uniform/armor style, colours, insignia/markings/emblems, equipment carried (weapons, shields, tools), "
+                "headgear/helmets, and overall condition (pristine, battle-worn, dusty). "
+                "Do NOT describe individual faces or unique physical traits — all members share the same visual identity. "
+                "Start with 'the same group of [description] with...' "
+                "Be detailed about materials, textures, and colours for consistent image generation.\n"
             )
         
         if include_physical_traits:
@@ -10526,6 +11691,11 @@ Output ONLY the identity block text - no labels, no explanations, no markdown.""
                 "For environments: describe the physical space with rich detail (architecture, furniture, materials, lighting, atmosphere)—do NOT mention characters, actions, wardrobe, or dialogue. "
                 "For other non-characters: describe physical/visual identity."
             )
+            _notes_ss = getattr(screenplay, "story_settings", None) or {}
+            _notes_cr = _CONTENT_RATING_DIRECTIVES.get(_notes_ss.get("content_rating", "unrestricted"), "")
+            if _notes_cr:
+                system_content += " " + _notes_cr
+
             response = self._chat_completion(
                 model=self.model_settings["model"],
                 messages=[
@@ -10570,28 +11740,47 @@ Output ONLY the identity block text - no labels, no explanations, no markdown.""
             return f"the same {entity_type} with {user_notes}"
     
     def extract_character_wardrobe_from_scene(
-        self, content: str, character_name: str, scene_context: str = ""
+        self, content: str, character_name: str, scene_context: str = "",
+        species: str = "Human"
     ) -> str:
-        """Extract wardrobe (clothing, accessories, armor, condition) for a character from scene content.
+        """Extract wardrobe or visual appearance for a character from scene content.
         
-        Used for scene-level character state. Does NOT include physical identity.
+        For human characters: extracts clothing, accessories, armor, condition.
+        For non-human characters: extracts visual form, spectral/physical features,
+        and any worn accessories or harnesses.
         
         Args:
             content: Scene content text
             character_name: Name of the character
             scene_context: Optional additional context (e.g., scene title, description)
+            species: Character species (e.g. "Human", "Ghost/Spirit", "Phoenix")
             
         Returns:
-            1-2 sentence wardrobe description, or "" if nothing found
+            1-2 sentence description, or "" if nothing found
         """
         if not self._adapter or not content or not character_name:
             return ""
-        
-        context_line = f"\nScene context: {scene_context[:200]}" if scene_context else ""
-        prompt = f"""Extract ONLY the wardrobe (clothing, accessories, armor) for the character "{character_name}" from this scene.
 
-Scene content:
-{content[:2000]}
+        paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
+        name_upper = character_name.strip().upper()
+        relevant = []
+        for para in paragraphs:
+            if name_upper in para.upper():
+                relevant.append(para)
+        if not relevant:
+            relevant = paragraphs[:4]
+
+        focused_content = "\n\n".join(relevant)[:3000]
+        context_line = f"\nScene context: {scene_context[:200]}" if scene_context else ""
+
+        is_human = (not species or species.strip().lower() in ("human", ""))
+
+        if is_human:
+            system_msg = "You extract only clothing and wardrobe from scene text. No physical identity, no actions."
+            prompt = f"""Extract ONLY the wardrobe (clothing, accessories, armor) for the character "{character_name}" from this scene.
+
+Scene content (paragraphs mentioning {character_name}):
+{focused_content}
 {context_line}
 
 Output 1-2 concise sentences describing what {character_name} is WEARING in this scene:
@@ -10604,24 +11793,105 @@ Do NOT include: physical appearance (face, hair, build), actions, setting, or di
 If no clothing is described, return "No wardrobe specified" (exactly that phrase).
 
 Respond with ONLY the wardrobe description."""
+        else:
+            system_msg = (
+                f"You extract the visual appearance of a non-human character ({species}) from scene text. "
+                "Focus on their physical form, visual qualities, and any worn items."
+            )
+            prompt = f"""Extract the VISUAL APPEARANCE of the non-human character "{character_name}" (species: {species}) from this scene.
+
+Scene content (paragraphs mentioning {character_name}):
+{focused_content}
+{context_line}
+
+This character is a {species}, NOT a human. Output 1-2 concise sentences describing how {character_name} LOOKS in this scene:
+- Physical form (translucent, ethereal, luminous, scaled, feathered, etc.)
+- Visual qualities (glow colour, aura, trailing wisps, spectral effects, etc.)
+- Size, shape, or body structure if described
+- Any worn accessories, harnesses, or adornments
+- Condition or visual state (fading, flickering, burning, etc.)
+
+Do NOT include: actions, setting, dialogue, or emotional state (unless it visually manifests).
+If no visual appearance is described, return "No appearance specified" (exactly that phrase).
+
+Respond with ONLY the appearance description."""
 
         try:
             response = self._chat_completion(
                 model=self.model_settings["model"],
                 messages=[
-                    {"role": "system", "content": "You extract only clothing and wardrobe from scene text. No physical identity, no actions."},
+                    {"role": "system", "content": system_msg},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.2,
-                max_tokens=100
+                max_tokens=150
             )
             desc = (response.choices[0].message.content or "").strip().strip('"\'')
-            if not desc or "no wardrobe specified" in desc.lower():
-                return ""
+            no_result_phrases = ("no wardrobe specified", "no appearance specified")
+            if not desc or any(p in desc.lower() for p in no_result_phrases):
+                desc = self._regex_wardrobe_fallback(relevant, character_name, species=species)
             return desc
         except Exception as e:
-            print(f"Error extracting character wardrobe: {e}")
+            _safe_print(f"Error extracting character wardrobe/appearance: {e}")
+            return self._regex_wardrobe_fallback(relevant, character_name, species=species) if relevant else ""
+
+    @staticmethod
+    def _regex_wardrobe_fallback(paragraphs: list, character_name: str, species: str = "Human") -> str:
+        """Last-resort regex extraction of wardrobe/appearance from paragraphs mentioning a character.
+        
+        For human characters, matches clothing keywords.
+        For non-human characters, also matches visual-form keywords (translucent, glowing, etc.).
+        """
+        import re
+
+        _CLOTHING_KW = re.compile(
+            r'\b(?:armor|armour|armored|uniform|cloak|cape|robe|robes|tunic|jacket|coat|'
+            r'vest|shirt|blouse|dress|gown|trousers|pants|boots|sandals|shoes|'
+            r'gloves?|gauntlets?|helmet|helm|hood|hooded|cowl|hat|crown|circlet|'
+            r'belt|sash|scarf|goggles|mask|visor|breastplate|cuirass|'
+            r'leather\s+(?:jerkin|jacket|armor|vest)|chain\s*mail|plate\s*mail|'
+            r'overcoat|greatcoat|tabard|surcoat)\b',
+            re.IGNORECASE,
+        )
+
+        _VISUAL_FORM_KW = re.compile(
+            r'\b(?:translucent|transparent|ethereal|spectral|ghostly|incorporeal|'
+            r'luminous|luminescent|glowing|radiant|shimmering|flickering|pulsing|'
+            r'wispy|wisps|trailing|vaporous|misty|hazy|'
+            r'scales?|scaled|feathered|feathers|plumage|fur|furred|furry|'
+            r'wings?|wingspan|talons?|claws?|horns?|antlers?|tusks?|fangs?|'
+            r'carapace|exoskeleton|shell|chitin|'
+            r'crystalline|metallic|obsidian|iridescent|opalescent|'
+            r'aura|halo|nimbus|corona|'
+            r'form|silhouette|figure|apparition|manifestation|materializ\w+|'
+            r'burning|smoldering|ablaze|wreathed\s+in\s+flame|'
+            r'towering|massive|diminutive|'
+            r'embers?|tendrils?|coils?)\b',
+            re.IGNORECASE,
+        )
+
+        is_human = (not species or species.strip().lower() in ("human", ""))
+        keyword_pattern = _CLOTHING_KW if is_human else re.compile(
+            _CLOTHING_KW.pattern + r'|' + _VISUAL_FORM_KW.pattern, re.IGNORECASE
+        )
+
+        name_upper = character_name.strip().upper()
+        snippets = []
+        for para in paragraphs:
+            if name_upper not in para.upper():
+                continue
+            for sent in re.split(r'(?<=[.!?])\s+', para):
+                if keyword_pattern.search(sent):
+                    clean = re.sub(r'\*([^*]+)\*', r'\1', sent).strip()
+                    clean = re.sub(r'\([\w_]+\)', '', clean).strip()
+                    if clean and len(clean) > 10:
+                        snippets.append(clean)
+        if not snippets:
             return ""
+        combined = " ".join(snippets[:3])
+        if len(combined) > 250:
+            combined = combined[:247] + "..."
+        return combined
     
     @staticmethod
     def _extract_environment_only_context(scene_text: str, env_name: str = "") -> str:
@@ -10685,6 +11955,105 @@ Respond with ONLY the wardrobe description."""
                     env_sentences.append(sentence.strip())
         
         return " ".join(env_sentences) if env_sentences else ""
+
+    @staticmethod
+    def _extract_spatial_layout_from_actions(scene_text: str) -> str:
+        """Extract spatial/architectural implications from character actions in scene text.
+
+        Character actions reveal physical layout (freestanding furniture, exits, passages,
+        structural features) that the environment identity block needs to be accurate.
+        This function mines those implications without including character behaviour itself.
+
+        Returns a newline-separated list of spatial layout facts, or empty string.
+        """
+        if not scene_text or not scene_text.strip():
+            return ""
+
+        import re as _re
+
+        spatial_facts: list = []
+        seen: set = set()
+
+        def _add(fact: str):
+            key = fact.lower().strip()
+            if key not in seen:
+                seen.add(key)
+                spatial_facts.append(f"- {fact}")
+
+        text = _re.sub(r'^\[\d+\]\s*', '', scene_text, flags=_re.MULTILINE)
+        paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
+
+        for para in paragraphs:
+            p_lower = para.lower()
+
+            # --- Behind / between objects → freestanding with accessible space ---
+            for m in _re.finditer(r'\bbehind\s+(?:a\s+(?:row\s+of\s+)?)?(?:the\s+)?\[([^\]]+)\]', para, _re.IGNORECASE):
+                obj = m.group(1).strip()
+                _add(f"[{obj}] are freestanding with accessible space behind them (not wall-mounted)")
+
+            for m in _re.finditer(r'\bbetween\s+(?:two\s+|the\s+)?\[([^\]]+)\]', para, _re.IGNORECASE):
+                obj = m.group(1).strip()
+                _add(f"[{obj}] are arranged with navigable gaps between them")
+
+            for m in _re.finditer(r'\brows?\s+of\s+\[([^\]]+)\]', para, _re.IGNORECASE):
+                obj = m.group(1).strip()
+                _add(f"[{obj}] are arranged in freestanding rows with aisles between them")
+
+            # --- Through / into passages, archways, doorways → traversable openings ---
+            for m in _re.finditer(
+                r'\bthrough\s+(?:a\s+)?(?:collapsing\s+|crumbling\s+|narrow\s+|hidden\s+|dark\s+)?'
+                r'(archway|passage|passageway|doorway|opening|corridor|tunnel|staircase|gateway|portal)',
+                para, _re.IGNORECASE
+            ):
+                feature = m.group(1).strip()
+                adj_match = _re.search(
+                    r'(collapsing|crumbling|narrow|hidden|dark|stone|wooden)\s+' + _re.escape(feature),
+                    para, _re.IGNORECASE
+                )
+                desc = f"{adj_match.group(1)} {feature}" if adj_match else feature
+                _add(f"The space has a traversable {desc}")
+
+            # --- Blocking/sealing exits → multiple exits exist ---
+            if _re.search(r'\bblock(?:ing|s|ed)?\s+(?:the\s+)?exits?\b', p_lower):
+                _add("The space has multiple exits/entrances")
+
+            if _re.search(r'\bseal(?:ing|s|ed)?\s+(?:the\s+)?exits?\b', p_lower):
+                _add("The space has sealable exits/entrances")
+
+            for m in _re.finditer(r'\b(?:far|main|rear|side|back)\s+(entrance|exit|door|doorway)\b', para, _re.IGNORECASE):
+                _add(f"The space has a {m.group(0).strip()}")
+
+            # --- Ceiling structural events → ceiling material/type ---
+            if _re.search(r'\bceiling\s+\*?(?:caves?|collapses?|crumbles?|cracks?)\b', p_lower):
+                _add("The ceiling is structural stone/masonry (capable of collapsing)")
+
+            if _re.search(r'\bstone\s+debris\b', p_lower):
+                _add("Stone construction (debris falls from structural elements)")
+
+            # --- Hidden mechanisms / secret passages ---
+            if _re.search(r'\bhidden\s+(?:mechanism|door|switch|lever|panel|passage)\b', p_lower):
+                _add("The space contains a hidden mechanism or concealed passage in the walls")
+
+            if _re.search(r'\bwall\s+\*?(?:slides?|opens?|shifts?|moves?)\b', p_lower):
+                _add("A section of wall is movable (concealed passage)")
+
+            # --- Freestanding fire/heat sources mentioned as objects ---
+            for m in _re.finditer(r'\[(brazier|torch|oil lamp|lantern|fire pit|hearth|candelabra|sconce)\]', para, _re.IGNORECASE):
+                obj = m.group(1).strip()
+                _add(f"A [{obj}] is present as a freestanding fixture in the space")
+
+            # --- Floor material implied by crawling/sliding ---
+            if _re.search(r'\b\*?(?:crawls?|slides?|drags?)\*?\s+(?:along|across|over)\s+(?:the\s+)?floor\b', p_lower):
+                _add("The floor has open traversable space at ground level")
+
+            # --- Elevated features ---
+            if _re.search(r'\bhigh[\s,]+arched\s+windows?\b', p_lower):
+                _add("The space has high arched windows")
+
+            if _re.search(r'\btowering\s+shelves?\b', p_lower):
+                _add("Shelving extends to significant height (towering)")
+
+        return "\n".join(spatial_facts) if spatial_facts else ""
 
     def _extract_lighting_from_scene(self, scene) -> str:
         """Extract lighting description from scene content, scanning multiple paragraphs.
@@ -10770,12 +12139,14 @@ Respond with ONLY the wardrobe description."""
         entity_type: str,
         identity_block: str,
         metadata: Optional[Dict[str, Any]] = None,
-        scene_lighting: str = ""
+        scene_lighting: str = "",
+        visual_style: str = "",
+        content_rating: str = ""
     ) -> str:
-        """Generate a Higgsfield reference image prompt from an approved identity block.
+        """Generate a reference image prompt from an approved identity block.
         
         This creates a standalone prompt for generating a reference image of an entity
-        that can be used in Higgsfield Cinema Studio for consistent visual identity.
+        that can be used for consistent visual identity across generation platforms.
         
         Args:
             entity_name: Name of entity (e.g., "Captain Jaxon Vash")
@@ -10783,52 +12154,66 @@ Respond with ONLY the wardrobe description."""
             identity_block: The approved identity block text
             metadata: Optional identity block metadata (for environment: extras_present, extras_density, etc.)
             scene_lighting: Optional lighting description extracted from scene content (used for environments)
+            visual_style: Visual style key from story settings (e.g. "comic_book", "anime_cartoon").
+                          Defaults to photorealistic when empty.
+            content_rating: Content rating key (e.g. "child_safe", "family_friendly").
             
         Returns:
-            A prompt optimized for generating a Higgsfield reference image
+            A prompt optimized for generating a reference image in the project's visual style
         """
+        from .video_prompt_builder import get_visual_style_directive
+        from .screenplay_engine import VISUAL_STYLE_OPTIONS
+
+        style_key = visual_style.strip() if visual_style else "photorealistic"
+        style_directive = get_visual_style_directive(style_key)
+        style_label = VISUAL_STYLE_OPTIONS.get(style_key, "Photorealistic")
+        is_photorealistic = (style_key == "photorealistic" or not style_directive)
+
+        if is_photorealistic:
+            style_opener = "Photorealistic"
+            style_suffix = "Reference photo style"
+        else:
+            style_opener = f"{style_label} style, {style_directive}"
+            style_suffix = f"Reference image in {style_label.lower()} style"
+
         if not identity_block:
-            return f"A photorealistic reference image of {entity_name}"
+            return f"A {style_opener.lower()} reference image of {entity_name}"
         
-        # Build type-specific reference image prompt
         if entity_type == "character":
             char_species = (metadata or {}).get("species", "Human") if metadata else "Human"
             is_human_char = (not char_species or char_species.strip().lower() in ("human", ""))
             if is_human_char:
-                prompt = f"""Photorealistic reference image for video production.
-Full body portrait of {entity_name}, neutral standing pose, facing camera at slight 3/4 angle.
+                prompt = f"""{style_opener} reference image for video production.
+Full body, showing head to toe, including the footwear, portrait of {entity_name}, neutral standing pose, facing camera at slight 3/4 angle.
 {identity_block}
 Plain neutral grey backdrop, soft even studio lighting, full figure visible head to toe.
 No props, no action, no motion blur, sharp focus, high detail.
-Reference photo style, suitable for character consistency in video production."""
+{style_suffix}, suitable for character consistency in video production."""
             else:
-                prompt = f"""Photorealistic reference image for video production.
-Full body portrait of {entity_name} ({char_species}), neutral pose, facing camera at slight 3/4 angle.
+                prompt = f"""{style_opener} reference image for video production.
+Full body, showing head to toe, including the footwear, portrait of {entity_name} ({char_species}), neutral pose, facing camera at slight 3/4 angle.
 {identity_block}
 Plain neutral grey backdrop, soft even studio lighting, entire body visible.
 No props, no action, no motion blur, sharp focus, high detail.
-Reference photo style, suitable for character consistency in video production."""
+{style_suffix}, suitable for character consistency in video production."""
         
         elif entity_type == "vehicle":
-            # Vehicles: 3/4 view, clean background
-            prompt = f"""Photorealistic reference image for video production.
+            prompt = f"""{style_opener} reference image for video production.
 {entity_name} shown in clean 3/4 front view angle.
 {identity_block}
 Plain neutral backdrop, bright even lighting showing all details, no reflections.
 No driver, no passengers, no motion, stationary vehicle, sharp focus.
-Reference photo style, suitable for vehicle consistency in video production."""
+{style_suffix}, suitable for vehicle consistency in video production."""
         
         elif entity_type == "object":
-            # Objects: Product-shot style, neutral background
-            prompt = f"""Photorealistic reference image for video production.
+            prompt = f"""{style_opener} reference image for video production.
 Product-style shot of {entity_name}, centered in frame.
 {identity_block}
 Plain white or neutral grey backdrop, soft diffused lighting from multiple angles.
 Object shown at optimal viewing angle, all details visible, sharp focus.
-Reference photo style, suitable for prop consistency in video production."""
+{style_suffix}, suitable for prop consistency in video production."""
         
         elif entity_type == "environment":
-            # MODE A (empty) vs MODE B (with extras) - backward compat: missing metadata = MODE A
             extras_present = bool(metadata.get("extras_present", False)) if metadata else False
             lighting_line = f"Lighting: {scene_lighting}." if scene_lighting else "Natural lighting appropriate to the setting."
             if extras_present:
@@ -10837,39 +12222,67 @@ Reference photo style, suitable for prop consistency in video production."""
                 extras_depth = (metadata or {}).get("extras_depth", "background_only")
                 fg_zone = (metadata or {}).get("foreground_zone", "clear")
                 extras_line = f"Soft-focus {extras_activities} in the {extras_depth.replace('_', ' ')}, {extras_density} density, {fg_zone} foreground."
-                prompt = f"""Photorealistic reference image for video production.
+                prompt = f"""{style_opener} reference image for video production.
 Wide establishing shot of {entity_name}. {extras_line}
 {identity_block}
 Full environment visible. {lighting_line} Extras non-distinct, non-identifiable; foreground reserved for character placement.
-Static scene, no motion, no activity. Reference photo style, suitable for environment consistency in video production."""
+Static scene, no motion, no activity. {style_suffix}, suitable for environment consistency in video production."""
             else:
-                prompt = f"""Photorealistic reference image for video production.
+                prompt = f"""{style_opener} reference image for video production.
 Wide establishing shot of {entity_name}, no people present, empty, unoccupied.
 {identity_block}
 Full environment visible. {lighting_line}
 Static scene, no motion, no activity, empty space ready for character placement.
-Reference photo style, suitable for environment consistency in video production."""
+{style_suffix}, suitable for environment consistency in video production."""
+        
+        elif entity_type == "group":
+            individuality = (metadata or {}).get("individuality", "slight_variation")
+            if individuality == "identical":
+                group_ref_note = (
+                    "This reference will be replicated exactly across all group members — "
+                    "identical face, body, and uniform (clones/robots/duplicates)."
+                )
+            elif individuality == "distinct":
+                group_ref_note = (
+                    "This reference shows the shared faction colours and insignia only. "
+                    "Individual members will vary significantly in gear, build, and appearance."
+                )
+            else:
+                group_ref_note = (
+                    "This reference shows the shared uniform and armor. Individual group "
+                    "members will share this outfit but have different faces, skin tones, "
+                    "builds, and heights — they are different people, not clones."
+                )
+            prompt = f"""{style_opener} reference image for video production.
+Full body portrait of a single representative member of {entity_name}, neutral standing pose, facing camera at slight 3/4 angle.
+{identity_block}
+Plain neutral grey backdrop, soft even studio lighting, full figure visible head to toe.
+No other people, single figure only. No action, no motion blur, sharp focus, high detail.
+{style_suffix}, suitable for group member consistency in video production. {group_ref_note}"""
         
         else:
-            # Generic fallback
-            prompt = f"""Photorealistic reference image of {entity_name}.
+            prompt = f"""{style_opener} reference image of {entity_name}.
 {identity_block}
 Neutral background, even lighting, sharp focus, high detail.
-Reference photo style for video production consistency."""
+{style_suffix} for video production consistency."""
         
-        # Clean up the prompt
         prompt = prompt.strip()
-        # Remove any "the same X with" prefix from identity block if it's in the middle
         prompt = re.sub(r'\bthe same \w+ with\b', '', prompt, flags=re.IGNORECASE)
-        prompt = re.sub(r'\s+', ' ', prompt)  # Collapse multiple spaces
-        
+        prompt = re.sub(r'\s+', ' ', prompt)
+
+        _rip_cr = _CONTENT_RATING_DIRECTIVES.get(content_rating or "unrestricted", "")
+        if _rip_cr:
+            prompt = prompt.strip() + " " + _rip_cr
+
         return prompt.strip()
     
     def generate_character_appearance_prompt(
         self,
         character_name: str,
         physical_appearance: str,
-        species: str = "Human"
+        species: str = "Human",
+        visual_style: str = "",
+        content_rating: str = ""
     ) -> str:
         """Generate a canonical full-body appearance prompt for a character's reference image.
         
@@ -10881,37 +12294,59 @@ Reference photo style for video production consistency."""
             character_name: The character's name
             physical_appearance: The persistent Physical Appearance text from Wizard Step 2
             species: The character's species/form (e.g. "Human", "Dragon", "Elf")
+            visual_style: Visual style key from story settings (e.g. "comic_book", "anime_cartoon").
+                          Defaults to photorealistic when empty.
+            content_rating: Content rating key (e.g. "child_safe", "family_friendly").
             
         Returns:
             A single-paragraph prompt optimized for generating a canonical reference image
         """
+        from .video_prompt_builder import get_visual_style_directive
+        from .screenplay_engine import VISUAL_STYLE_OPTIONS
+
+        style_key = visual_style.strip() if visual_style else "photorealistic"
+        style_directive = get_visual_style_directive(style_key)
+        style_label = VISUAL_STYLE_OPTIONS.get(style_key, "Photorealistic")
+        is_photorealistic = (style_key == "photorealistic" or not style_directive)
+
+        if is_photorealistic:
+            style_opener = "Photorealistic"
+            style_ai_rule = "7. Style: Photorealistic, cinematic realism"
+            style_format_start = 'Start with "Photorealistic full body reference image..."'
+        else:
+            style_opener = f"{style_label} style"
+            style_ai_rule = f"7. Style: {style_label} — {style_directive}"
+            style_format_start = f'Start with "{style_label} style full body reference image..."'
+
         is_human_species = (not species or species.strip().lower() in ("human", ""))
         species_label = species.strip() if species and species.strip() else "Human"
         
         if not physical_appearance or not physical_appearance.strip():
             if is_human_species:
-                return f"Photorealistic full body reference image of {character_name}, neutral standing pose, plain studio backdrop."
+                return f"{style_opener} full body reference image of {character_name}, neutral standing pose, plain studio backdrop."
             else:
-                return f"Photorealistic full body reference image of {character_name} ({species_label}), neutral pose, plain studio backdrop."
+                return f"{style_opener} full body reference image of {character_name} ({species_label}), neutral pose, plain studio backdrop."
         
         if not self._adapter:
             if is_human_species:
                 return (
-                    f"Photorealistic full body reference image of {character_name}. "
+                    f"{style_opener} full body reference image of {character_name}. "
                     f"{physical_appearance.strip()} "
                     "Wearing neutral generic clothing (plain fitted shirt, dark trousers, simple shoes); "
                     "wardrobe will vary by scene. "
                     "Full body visible head to toe, neutral standing pose, slight 3/4 angle facing camera. "
                     "Plain neutral grey studio backdrop, soft even lighting, sharp focus, high detail. "
-                    "No props, no action, no motion blur. Reference photo style for video production."
+                    "No props, no action, no motion blur. "
+                    f"{'Reference photo style' if is_photorealistic else 'Reference image in ' + style_label.lower() + ' style'} for video production."
                 )
             else:
                 return (
-                    f"Photorealistic full body reference image of {character_name} ({species_label}). "
+                    f"{style_opener} full body reference image of {character_name} ({species_label}). "
                     f"{physical_appearance.strip()} "
                     "Entire body visible, neutral pose, slight 3/4 angle facing camera. "
                     "Plain neutral grey studio backdrop, soft even lighting, sharp focus, high detail. "
-                    "No props, no action, no motion blur. Reference photo style for video production."
+                    "No props, no action, no motion blur. "
+                    f"{'Reference photo style' if is_photorealistic else 'Reference image in ' + style_label.lower() + ' style'} for video production."
                 )
         
         if is_human_species:
@@ -10947,7 +12382,7 @@ RULES:
 4. Pose: Neutral pose, slight 3/4 angle facing camera
 5. Background: Plain neutral grey studio backdrop
 6. Lighting: Soft even studio lighting, high clarity
-7. Style: Photorealistic, cinematic realism
+{style_ai_rule}
 8. Emphasize body proportions, distinguishing features, and overall silhouette
 9. Do NOT include the character's name in the prompt output
 
@@ -10963,7 +12398,7 @@ MUST NOT INCLUDE:
 FORMAT:
 - One continuous descriptive paragraph
 - Optimized for image generation models
-- Start with "Photorealistic full body reference image..."
+- {style_format_start}
 
 Output ONLY the prompt text — no labels, no explanations, no markdown."""
 
@@ -10990,7 +12425,6 @@ Output ONLY the prompt text — no labels, no explanations, no markdown."""
                 raise Exception("AI returned empty response")
             
             result = content.strip()
-            # Clean up any quotes or markdown
             result = result.strip('"').strip("'").strip()
             if result.startswith("```"):
                 lines = result.split("\n")
@@ -11000,10 +12434,13 @@ Output ONLY the prompt text — no labels, no explanations, no markdown."""
                     lines = lines[:-1]
                 result = "\n".join(lines).strip()
             
-            # Collapse to single paragraph
             result = re.sub(r'\n+', ' ', result)
             result = re.sub(r'\s+', ' ', result)
-            
+
+            _cap_cr = _CONTENT_RATING_DIRECTIVES.get(content_rating or "unrestricted", "")
+            if _cap_cr:
+                result = result.strip() + " " + _cap_cr
+
             return result.strip()
             
         except Exception as e:
@@ -11195,7 +12632,7 @@ Output ONLY the environment block text - no labels, no explanations, no markdown
             
             # Validate the environment block
             if not self._validate_environment_block(environment_block):
-                print(f"Warning: Generated environment block for scene {scene.scene_id} failed validation")
+                _safe_print(f"Warning: Generated environment block for scene {scene.scene_id} failed validation")
                 # Try to fix it
                 if not environment_block.lower().startswith("a static establishing frame"):
                     environment_block = f"a static establishing frame set in {environment_block}"
@@ -11222,7 +12659,7 @@ Output ONLY the environment block text - no labels, no explanations, no markdown
             
         except Exception as e:
             error_message = str(e)
-            print(f"Warning: Failed to generate environment block: {error_message}")
+            _safe_print(f"Warning: Failed to generate environment block: {error_message}")
             # Fallback to basic environment description
             fallback = "a static establishing frame set in a cinematic location, grounded realistic environment, no motion"
             if hasattr(scene, 'environment_block'):
@@ -11464,8 +12901,87 @@ Output ONLY the environment block text - no labels, no explanations, no markdown
                         replacement = f"{canonical_name} ({entity_id})"
                     result = result[:bare_match.start()] + replacement + result[bare_match.end():]
         
+        # Sanitize nested brackets that occur when a short entity name (e.g. "saber")
+        # gets injected inside a longer entity's brackets (e.g. "[ceremonial [saber] (OBJECT_A325)]")
+        result = self._flatten_nested_entity_brackets(result)
+
         return result
+
+    @staticmethod
+    def _flatten_nested_entity_brackets(text: str) -> str:
+        """Flatten nested entity markup brackets.
+
+        Detects patterns like ``[outer [inner] (ID_XXXX)]`` and keeps only the
+        outermost bracket pair with the outer entity's ID.  The inner ID tag is
+        removed so the text reads ``[outer inner] (OUTER_ID)``.
+        """
+        # [outer text [inner] (INNER_ID) more text] (OUTER_ID)
+        _nested_sq = re.compile(
+            r'\[([^\[\]]*)\[([^\]]+)\]\s*\(([A-Z]+_[A-F0-9]{4,})\)([^\[\]]*)\]\s*\(([A-Z]+_[A-F0-9]{4,})\)'
+        )
+        prev = None
+        while prev != text:
+            prev = text
+            text = _nested_sq.sub(lambda m: f'[{m.group(1)}{m.group(2)}{m.group(4)}] ({m.group(5)})', text)
+
+        # {outer {inner} (INNER_ID) more} (OUTER_ID)  — vehicle braces
+        _nested_br = re.compile(
+            r'\{([^{}]*)\{([^}]+)\}\s*\(([A-Z]+_[A-F0-9]{4,})\)([^{}]*)\}\s*\(([A-Z]+_[A-F0-9]{4,})\)'
+        )
+        prev = None
+        while prev != text:
+            prev = text
+            text = _nested_br.sub(lambda m: f'{{{m.group(1)}{m.group(2)}{m.group(4)}}} ({m.group(5)})', text)
+
+        return text
     
+    def _fix_location_names_as_characters(self, text: str, screenplay: Screenplay) -> str:
+        """Convert location/city names written in ALL-CAPS to Title Case.
+
+        The AI sometimes writes city names like LONDON, PARIS, BERLIN in
+        ALL-CAPS which makes them look like character names in screenplay
+        format.  This method finds such occurrences (when not part of a
+        registered character name) and converts them to Title Case so
+        they won't be extracted as characters.
+        """
+        if not text or not screenplay:
+            return text
+
+        registered_upper = set()
+        if getattr(screenplay, "character_registry", None):
+            for n in screenplay.character_registry:
+                if n:
+                    registered_upper.add(n.strip().upper())
+        if screenplay.story_outline and isinstance(screenplay.story_outline, dict):
+            for c in screenplay.story_outline.get("characters", []):
+                if isinstance(c, dict) and c.get("name"):
+                    registered_upper.add(c["name"].strip().upper())
+
+        # Collect location names from the story outline
+        outline_locations = set()
+        if screenplay.story_outline and isinstance(screenplay.story_outline, dict):
+            for loc in screenplay.story_outline.get("locations", []) or []:
+                if isinstance(loc, str) and loc.strip():
+                    outline_locations.add(loc.strip().lower())
+
+        # Build the set of place names to fix: known places + outline locations
+        place_names = set(self._KNOWN_PLACE_NAMES) | outline_locations
+
+        def _replace_caps_place(match: re.Match) -> str:
+            word = match.group(0)
+            if word.upper() in registered_upper:
+                return word
+            return word.title()
+
+        for place in sorted(place_names, key=len, reverse=True):
+            caps_form = place.upper()
+            if caps_form in registered_upper:
+                continue
+            pattern = r'\b' + re.escape(caps_form) + r'\b'
+            text = re.sub(pattern, _replace_caps_place, text)
+
+        return text
+
     def _enforce_full_character_names(self, text: str, screenplay: Screenplay) -> str:
         """Replace abbreviated or partial character names with full registered names.
         
@@ -11503,6 +13019,12 @@ Output ONLY the environment block text - no labels, no explanations, no markdown
             "PROFESSOR", "CHIEF", "DUKE", "PRINCE", "PRINCESS", "KING",
             "QUEEN", "LORD", "LADY", "SIR", "BARON", "COUNT", "DC",
         })
+        # Common English articles/connectives that may appear inside quoted nicknames
+        # (e.g., EDDIE 'THE JESTER' MARTINEZ) — must never be standalone partials
+        _COMMON_WORDS = frozenset({
+            "THE", "A", "AN", "OF", "AND", "DE", "LA", "LE", "VON", "VAN",
+            "EL", "AL", "DI", "DA", "DU", "DEL", "LOS", "LAS", "DES",
+        })
         
         result = text
         
@@ -11515,10 +13037,10 @@ Output ONLY the environment block text - no labels, no explanations, no markdown
             clean_words = [w.strip("'\"") for w in words]
             nickname = self._extract_nickname_from_full_name(full_name)
             
-            # Build partial words: significant non-title words (>= 3 chars)
+            # Build partial words: significant non-title, non-common words (>= 3 chars)
             partials = []
             for cw in clean_words:
-                if cw and cw not in _TITLE_WORDS and len(cw) >= 3:
+                if cw and cw not in _TITLE_WORDS and cw not in _COMMON_WORDS and len(cw) >= 3:
                     partials.append(cw)
             if not partials:
                 continue
@@ -11542,7 +13064,7 @@ Output ONLY the environment block text - no labels, no explanations, no markdown
                         if combo.upper() != full_upper:
                             abbrev_patterns.append(combo)
             # First + last without nickname (e.g. "REGINALD BARTLETT")
-            non_title = [w for w in clean_words if w not in _TITLE_WORDS and len(w) >= 2]
+            non_title = [w for w in clean_words if w not in _TITLE_WORDS and w not in _COMMON_WORDS and len(w) >= 2]
             if len(non_title) >= 2:
                 for i in range(len(non_title)):
                     for j in range(i + 1, len(non_title)):
@@ -11595,6 +13117,87 @@ Output ONLY the environment block text - no labels, no explanations, no markdown
                         changed = True
                         break
         
+        return result
+
+    def _enforce_full_entity_markup_names(self, text: str, screenplay: Screenplay) -> str:
+        """Replace abbreviated [object] and {vehicle} names with their full canonical forms.
+
+        For example, if the canonical object name is "vintage microphone", an
+        abbreviated reference like [microphone] is replaced with [vintage microphone].
+        Only replaces when there is exactly one unambiguous canonical match.
+        """
+        if not text or not screenplay:
+            return text
+        meta = getattr(screenplay, 'identity_block_metadata', None) or {}
+        if not meta:
+            return text
+
+        import re
+
+        canonical_objects = []
+        canonical_vehicles = []
+        for _eid, m in meta.items():
+            name = (m.get("name") or "").strip()
+            if not name:
+                continue
+            etype = (m.get("type") or "").lower()
+            if etype == "object":
+                canonical_objects.append(name)
+            elif etype == "vehicle":
+                canonical_vehicles.append(name)
+
+        def _build_word_set(name: str) -> set:
+            return {w.lower() for w in re.split(r"[\s\-]+", name) if len(w) >= 2}
+
+        def _find_canonical(short_name: str, canonical_list: list) -> Optional[str]:
+            """Return the unique canonical name that the short form abbreviates, or None."""
+            sn_lower = short_name.strip().lower()
+            sn_words = _build_word_set(short_name)
+            if not sn_words:
+                return None
+            matches = []
+            for canon in canonical_list:
+                cn_lower = canon.strip().lower()
+                if cn_lower == sn_lower:
+                    return None  # already full form
+                cn_words = _build_word_set(canon)
+                if sn_words < cn_words and sn_words:
+                    matches.append(canon)
+                elif sn_lower in cn_lower and len(sn_lower) < len(cn_lower):
+                    matches.append(canon)
+            if len(matches) == 1:
+                return matches[0]
+            return None
+
+        result = text
+
+        # ── Objects: [short name] → [canonical name] ──
+        for m in reversed(list(re.finditer(r'\[([^\]]+)\]', result))):
+            inner = m.group(1).strip()
+            if not inner:
+                continue
+            # Skip if inside dialogue (odd quote count before match)
+            if result[:m.start()].count('"') % 2 == 1:
+                continue
+            canon = _find_canonical(inner, canonical_objects)
+            if canon:
+                result = result[:m.start()] + f"[{canon}]" + result[m.end():]
+
+        # ── Vehicles: {short name} or {{short name}} → {canonical} / {{canonical}} ──
+        for m in reversed(list(re.finditer(r'\{\{([^}]+)\}\}|\{([^}]+)\}', result))):
+            inner = (m.group(1) or m.group(2) or "").strip()
+            if not inner:
+                continue
+            if result[:m.start()].count('"') % 2 == 1:
+                continue
+            canon = _find_canonical(inner, canonical_vehicles)
+            if canon:
+                is_double = m.group(1) is not None
+                if is_double:
+                    result = result[:m.start()] + "{{" + canon + "}}" + result[m.end():]
+                else:
+                    result = result[:m.start()] + "{" + canon + "}" + result[m.end():]
+
         return result
 
     def _detect_appearing_objects(self, storyline: str, screenplay: Screenplay) -> set:
@@ -11741,7 +13344,7 @@ Return only the motion description, nothing else. If no motion is present, retur
             
             # If storyline has action verbs but motion text says "no motion", that's an error
             if has_action_verbs and ('no motion' in motion_lower or 'static' in motion_lower):
-                print(f"WARNING: Storyline contains action verbs but motion extraction returned 'no motion'. Using fallback.")
+                _safe_print(f"WARNING: Storyline contains action verbs but motion extraction returned 'no motion'. Using fallback.")
                 return self._extract_motion_fallback(storyline)
             
             # If motion text is empty or too short, use fallback
@@ -11751,7 +13354,7 @@ Return only the motion description, nothing else. If no motion is present, retur
             return motion_text
             
         except Exception as e:
-            print(f"AI motion extraction failed: {e}")
+            _safe_print(f"AI motion extraction failed: {e}")
             return self._extract_motion_fallback(storyline)
     
     def _extract_motion_fallback(self, storyline: str) -> str:
@@ -11883,24 +13486,33 @@ Return only the motion description, nothing else. If no motion is present, retur
         item: 'StoryboardItem',
         screenplay: 'Screenplay',
         appearing_object_ids: set = None,
-        scene_id: str = ""
+        scene_id: str = "",
+        scene_level_objects: List[str] = None
     ) -> str:
         """Build a Popcorn-style keyframe prompt for Higgsfield Cinema Studio 2.0.
         
         Produces a structured static-scene description following the Popcorn
         field layout: shot type, camera framing, lighting, environment, lens,
         mood.  No motion verbs — this is a hero-frame prompt.
+        
+        Args:
+            scene_level_objects: Names of all objects/props/vehicles present
+                anywhere in the scene content. These are included in the prompt
+                even if they aren't mentioned in this item's paragraph, because
+                props on set are visible before anyone interacts with them.
         """
         from .screenplay_engine import SHOT_TYPE_OPTIONS, APERTURE_STYLE_OPTIONS
-        from .video_prompt_builder import _make_static_description
+        from .video_prompt_builder import _make_static_description, _strip_character_descriptions
 
         parts: list[str] = []
 
-        # 1. Shot type and subject — strip all motion from storyline
+        # 1. Shot type and subject — strip motion and character descriptions
         shot_key = getattr(item, 'shot_type', 'medium') or 'medium'
         shot_label = SHOT_TYPE_OPTIONS.get(shot_key, "Medium Shot")
 
-        static_text = _make_static_description(storyline or "")
+        static_text = _strip_character_descriptions(
+            _make_static_description(storyline or "")
+        )
         if static_text:
             parts.append(f"{shot_label} of {static_text}")
         else:
@@ -11910,12 +13522,17 @@ Return only the motion description, nothing else. If no motion is present, retur
             else:
                 parts.append(shot_label)
 
-        # 2. Lighting
+        # 2. Composition / blocking
+        composition = (getattr(item, 'composition_notes', '') or '').strip()
+        if composition:
+            parts.append(f"Composition: {_strip_character_descriptions(composition)}")
+
+        # 3. Lighting
         lighting = (getattr(item, 'lighting_description', '') or '').strip()
         if lighting:
             parts.append(f"Lighting: {lighting}")
 
-        # 3. Environment
+        # 4. Environment
         env_name = ""
         if screenplay and scene_id:
             scene_obj = screenplay.get_scene(scene_id)
@@ -11927,18 +13544,35 @@ Return only the motion description, nothing else. If no motion is present, retur
         if env_name:
             parts.append(f"Setting: {env_name}")
 
-        # 4. Lens / film look
+        # 5. Lens / film look
         focal = getattr(item, 'focal_length', 35) or 35
         aperture_key = getattr(item, 'aperture_style', 'cinematic_bokeh') or 'cinematic_bokeh'
         aperture_label = APERTURE_STYLE_OPTIONS.get(aperture_key, 'Cinematic Bokeh')
         parts.append(f"{focal}mm lens, {aperture_label.lower()}")
 
-        # 5. Mood and tone
+        # 6. Mood and tone
         mood = (getattr(item, 'mood_tone', '') or '').strip()
         if mood:
             parts.append(f"Mood: {mood}")
         elif screenplay and screenplay.atmosphere:
             parts.append(f"Mood: {screenplay.atmosphere}")
+
+        # 7. Visual style
+        from .video_prompt_builder import _resolve_visual_style
+        style_directive = _resolve_visual_style(item, screenplay)
+        if style_directive:
+            parts.append(f"Style: {style_directive}")
+
+        # 8. Strict consistency enforcement
+        parts.append(
+            "STRICT CONSISTENCY: Reproduce every character, environment, and object "
+            "EXACTLY as shown in their supplied reference images — identical facial "
+            "features, body proportions, hairstyle, skin tone, clothing, and setting "
+            "details. Do NOT add, remove, or alter any entities, props, or background "
+            "elements beyond what is specified in the storyline and reference images. "
+            "Characters must NOT look directly at the camera unless the storyline "
+            "explicitly states they do"
+        )
 
         return ". ".join(parts)
 
@@ -11985,7 +13619,7 @@ Return only the motion description, nothing else. If no motion is present, retur
         block_lower = block.lower()
         for verb in motion_verbs:
             if verb in block_lower:
-                print(f"Warning: Identity block contains motion verb '{verb}': {block[:100]}...")
+                _safe_print(f"Warning: Identity block contains motion verb '{verb}': {block[:100]}...")
                 return False
         
         return True
@@ -12029,7 +13663,7 @@ Return only the motion description, nothing else. If no motion is present, retur
         block_lower = block.lower()
         for verb in motion_verbs:
             if verb in block_lower:
-                print(f"Warning: Environment block contains motion verb '{verb}': {block[:100]}...")
+                _safe_print(f"Warning: Environment block contains motion verb '{verb}': {block[:100]}...")
                 return False
         
         return True
@@ -12251,6 +13885,8 @@ Generate Section D (Action, Motion & Intent) for a Higgsfield video prompt:
 - Include spatial relationships
 - Use realistic motion descriptions
 - Include intent and motivation
+- Characters must NOT look directly at the camera unless the storyline explicitly states they do
+- Do NOT add entities, props, or details not present in the storyline or reference images
 
 Return ONLY the action description (Section D content), no labels."""
                 
@@ -12324,11 +13960,11 @@ Return ONLY the action description (Section D content), no labels."""
             environment_block = parent_scene.environment_block
         elif parent_scene:
             # Generate environment block if missing
-            print(f"Generating environment block for scene {parent_scene.scene_number} during image prompt regeneration...")
+            _safe_print(f"Generating environment block for scene {parent_scene.scene_number} during image prompt regeneration...")
             environment_block = self._generate_environment_block(parent_scene, scene_content or "", screenplay)
         else:
             # Fallback: create a basic environment block
-            print("Warning: Could not find parent scene for item, using fallback environment block")
+            _safe_print("Warning: Could not find parent scene for item, using fallback environment block")
             environment_block = "a static establishing frame set in a cinematic location, grounded realistic environment, no motion"
         
         # Combine scene content with storyline for comprehensive entity detection
@@ -12366,7 +14002,7 @@ Return ONLY the action description (Section D content), no labels."""
             if existing_block:
                 identity_blocks.append(existing_block)
             else:
-                print(f"Warning: Identity block for {char_name} (character) not found, generating new one")
+                _safe_print(f"Warning: Identity block for {char_name} (character) not found, generating new one")
                 new_block = self._generate_identity_block_from_scene(
                     char_name,
                     "character",
@@ -12386,7 +14022,7 @@ Return ONLY the action description (Section D content), no labels."""
             if existing_block:
                 identity_blocks.append(existing_block)
             else:
-                print(f"Warning: Identity block for {entity_name} ({entity_type}) not found, generating new one")
+                _safe_print(f"Warning: Identity block for {entity_name} ({entity_type}) not found, generating new one")
                 new_block = self._generate_identity_block_from_scene(
                     entity_name,
                     entity_type,
@@ -12402,10 +14038,10 @@ Return ONLY the action description (Section D content), no labels."""
                 scene_text_for_entities, screenplay, identity_blocks
             )
             if not passed and missing:
-                print(f"Validation FAILED: Missing identity blocks for: {missing}")
+                _safe_print(f"Validation FAILED: Missing identity blocks for: {missing}")
                 # Generate identity blocks for missing characters (do NOT proceed with partial data)
                 for char_name in missing:
-                    print(f"  Generating missing identity block for: {char_name}")
+                    _safe_print(f"  Generating missing identity block for: {char_name}")
                     existing_block = screenplay.get_identity_block_by_name(char_name, "character")
                     if existing_block:
                         identity_blocks.append(existing_block)
@@ -12423,10 +14059,26 @@ Return ONLY the action description (Section D content), no labels."""
                     scene_text_for_entities, screenplay, identity_blocks
                 )
                 if not passed:
-                    print(f"Warning: Still missing identity blocks after retry: {still_missing}")
+                    _safe_print(f"Warning: Still missing identity blocks after retry: {still_missing}")
             else:
-                print(f"Validation PASSED: All {len(characters_named_in_scene)} characters have identity blocks")
+                _safe_print(f"Validation PASSED: All {len(characters_named_in_scene)} characters have identity blocks")
         
+        # Collect scene-level objects/vehicles visible in the environment
+        scene_level_props: List[str] = []
+        if scene_content and scene_content.strip():
+            scene_level_props = (
+                self._extract_objects_from_scene_markup(scene_content, require_interaction=False)
+                + self._extract_vehicles_from_scene_markup(scene_content, require_interaction=False)
+            )
+        passive_names = screenplay.get_passive_entity_names() if screenplay else []
+        seen_lower = {p.lower() for p in scene_level_props}
+        for pn in passive_names:
+            if pn.lower() not in seen_lower:
+                scene_level_props.append(pn)
+                seen_lower.add(pn.lower())
+        if scene_level_props:
+            _safe_print(f"DEBUG: Scene-level props for hero frame regen: {scene_level_props}")
+
         # Build first-frame image prompt using new six-section structure
         try:
             scene_id = parent_scene.scene_id if parent_scene else ""
@@ -12436,14 +14088,15 @@ Return ONLY the action description (Section D content), no labels."""
                 storyline=storyline,
                 item=item,
                 screenplay=screenplay,
-                scene_id=scene_id
+                scene_id=scene_id,
+                scene_level_objects=scene_level_props
             )
             
             return new_image_prompt
                 
         except Exception as e:
             error_message = str(e)
-            print(f"Error generating first-frame image prompt: {error_message}")
+            _safe_print(f"Error generating first-frame image prompt: {error_message}")
             # Fallback to old method if new method fails
             pass
         
@@ -12480,6 +14133,9 @@ Context (surrounding scenes):
 - Style: Highly detailed, photorealistic, cinematic quality, STATIC composition
 - This image will be used as the starting frame for higgsfield.ai video generation
 - Think of it as describing a detailed photograph or painting - a frozen moment, not a scene in motion
+- STRICT CONSISTENCY: Every character, environment, and object must match their supplied reference images EXACTLY — identical facial features, body proportions, hairstyle, skin tone, clothing, and setting details
+- Do NOT add, remove, or alter any entities, props, or background elements beyond what is specified in the storyline and reference images
+- Characters must NOT look directly at the camera unless the storyline explicitly states they do
 
 Return ONLY the prompt text, no additional formatting.
 """
@@ -12575,7 +14231,7 @@ Return ONLY the static positioning description (Section D content), no labels.""
             return get_comprehensive_instructions()
         except ImportError:
             # Fallback to basic instructions if import fails
-            return """FRAMEFORGE - STEP-BY-STEP USAGE GUIDE
+            return """SCENEWRITE - STEP-BY-STEP USAGE GUIDE
 
 ═══════════════════════════════════════════════════════════════════════════════
 
@@ -12779,6 +14435,98 @@ WORKFLOW EXAMPLE
 
 Remember: You can always ask me (the AI assistant) for help with any step or feature!"""
     
+    # Keyword → PART title mapping for targeted instruction lookup.
+    # Each entry maps search terms to the PART header prefix used in the
+    # comprehensive instructions text (e.g. "PART 8: IDENTITY BLOCKS").
+    _INSTRUCTION_SECTION_INDEX = {
+        "ai provider": "PART 1", "api key": "PART 1", "openai": "PART 1",
+        "anthropic": "PART 1", "ollama": "PART 1", "together ai": "PART 1",
+        "openrouter": "PART 1", "local model": "PART 1", "configure ai": "PART 1",
+        "video platform": "PART 2", "higgsfield": "PART 2", "runway": "PART 2",
+        "kling": "PART 2", "luma": "PART 2", "pika": "PART 2", "sora": "PART 2",
+        "veo": "PART 2", "minimax": "PART 2", "hailuo": "PART 2",
+        "getting started": "PART 3", "new story": "PART 3", "create story": "PART 3",
+        "open story": "PART 3", "import": "PART 3", "quick micro": "PART 3",
+        "wizard": "PART 4", "story creation": "PART 4", "premise": "PART 4",
+        "story outline": "PART 4", "framework": "PART 4", "custom duration": "PART 4",
+        "story settings": "PART 5", "aspect ratio": "PART 5", "visual style": "PART 5",
+        "focal length": "PART 5", "identity lock": "PART 5", "beat density": "PART 5",
+        "main editor": "PART 6", "tabs": "PART 6", "dock": "PART 6",
+        "scene content": "PART 7", "markup": "PART 7", "cinematic markup": "PART 7",
+        "wardrobe": "PART 7", "recurring object": "PART 7", "species": "PART 7",
+        "storyboard": "PART 7", "generate storyboard": "PART 7",
+        "identity block": "PART 8", "entity": "PART 8", "group": "PART 8",
+        "groups": "PART 8", "referenced environment": "PART 8", "approve": "PART 8",
+        "reference image": "PART 8", "extras": "PART 8", "passive": "PART 8",
+        "storyboard item editor": "PART 9", "shot type": "PART 9",
+        "camera motion": "PART 9", "camera": "PART 9", "image mapping": "PART 9",
+        "hero frame": "PART 9", "scene setup": "PART 9",
+        "three-layer": "PART 10", "prompt architecture": "PART 10",
+        "keyframe": "PART 10", "identity prompt": "PART 10", "video prompt": "PART 10",
+        "platform prompt": "PART 10", "prompt layer": "PART 10",
+        "multi-shot": "PART 11", "clustering": "PART 11", "cluster": "PART 11",
+        "advertisement": "PART 12", "brand film": "PART 12", "ad mode": "PART 12",
+        "commercial": "PART 12", "6-beat": "PART 12",
+        "video generation": "PART 13", "generate video": "PART 13",
+        "ai chat": "PART 14", "chat assistant": "PART 14", "story assistant": "PART 14",
+        "export": "PART 15", "json export": "PART 15", "csv": "PART 15",
+        "action rules": "PART 16", "sfx rules": "PART 16", "whitelist": "PART 16",
+        "sound effect": "PART 16", "action verb": "PART 16",
+        "theme": "PART 17", "dark mode": "PART 17", "font size": "PART 17",
+        "auto-save": "PART 17", "ui config": "PART 17",
+        "keyboard shortcut": "PART 18", "shortcut": "PART 18", "hotkey": "PART 18",
+        "post-generation": "PART 19", "validation": "PART 19", "quality": "PART 19",
+        "dialogue duplication": "PART 19", "drift": "PART 19",
+        "preamble": "PART 19", "prompt length": "PART 19",
+        "series": "PART 20", "episodic": "PART 20", "series bible": "PART 20",
+        "episode": "PART 20",
+        "pacing": "PART 21", "rhythm": "PART 21", "fast scene": "PART 21",
+        "slow scene": "PART 21",
+        "environment": "PART 22", "spatial": "PART 22", "held-object": "PART 22",
+        "zone logic": "PART 22", "physical access": "PART 22",
+        "best practice": "PART 23", "tips": "PART 23", "workflow": "PART 23",
+    }
+
+    def _find_relevant_instruction_sections(self, query: str) -> str:
+        """Extract instruction sections relevant to the user's question.
+
+        Returns the matching section text (one or two sections), or empty
+        string if no specific section matches.
+        """
+        try:
+            from ui.help_dialogs import get_comprehensive_instructions
+            full_text = get_comprehensive_instructions()
+        except ImportError:
+            return ""
+
+        query_lower = query.lower()
+        matched_parts: list[str] = []
+        for keyword, part_id in self._INSTRUCTION_SECTION_INDEX.items():
+            if keyword in query_lower and part_id not in matched_parts:
+                matched_parts.append(part_id)
+            if len(matched_parts) >= 3:
+                break
+
+        if not matched_parts:
+            return ""
+
+        import re
+        sections: list[str] = []
+        for part_id in matched_parts:
+            pattern = re.compile(
+                r'(═+\n' + re.escape(part_id) + r':.*?\n═+\n)(.*?)(?=═+\nPART \d+:|═+\nGETTING HELP|═+\nEND OF GUIDE|\Z)',
+                re.DOTALL,
+            )
+            m = pattern.search(full_text)
+            if m:
+                header = m.group(1).strip()
+                body = m.group(2).strip()
+                section_text = f"{header}\n{body}"
+                if len(section_text) > 50:
+                    sections.append(section_text)
+
+        return "\n\n".join(sections) if sections else ""
+
     def chat_about_story(self, user_message: str, context: dict) -> dict:
         """Handle chat about story and determine what changes to make."""
         
@@ -12796,7 +14544,41 @@ Remember: You can always ask me (the AI assistant) for help with any step or fea
         is_instruction_request = any(keyword in user_lower for keyword in instruction_keywords)
         
         if is_instruction_request:
-            # Return comprehensive app usage instructions (no AI client needed)
+            # Check if this is a SPECIFIC feature question (has section matches)
+            # vs a generic "how do I use this app?" request
+            relevant_sections = self._find_relevant_instruction_sections(user_message)
+            ai_ready = getattr(self, 'client', None) or getattr(self, '_adapter', None)
+
+            if relevant_sections and ai_ready:
+                try:
+                    response = self._chat_completion(
+                        messages=[
+                            {"role": "system", "content": (
+                                "You are the built-in help assistant for SceneWrite, a professional "
+                                "screenplay and storyboard application. Answer the user's question "
+                                "using ONLY the reference documentation provided below. Be concise, "
+                                "specific, and practical. If the documentation doesn't cover the "
+                                "question, say so and suggest they check Help → Instructions for "
+                                "the full guide."
+                            )},
+                            {"role": "user", "content": (
+                                f"USER QUESTION: {user_message}\n\n"
+                                f"REFERENCE DOCUMENTATION:\n{relevant_sections}"
+                            )},
+                        ],
+                        temperature=0.3,
+                        max_tokens=1500,
+                    )
+                    answer = response.choices[0].message.content.strip()
+                    return {
+                        "text": answer,
+                        "intent": "discuss",
+                        "suggestions": []
+                    }
+                except Exception as e:
+                    _safe_print(f"Instruction Q&A failed, falling back to full guide: {e}")
+
+            # Fallback: return the full guide (works without AI)
             instructions = self._get_app_usage_instructions()
             return {
                 "text": instructions,
@@ -12865,9 +14647,47 @@ Remember: You can always ask me (the AI assistant) for help with any step or fea
             "extend", "expand", "add to", "develop", "elaborate", "enhance", "build on"
         ])
         
+        # Build series bible context if available
+        series_bible_context = ""
+        if screenplay and getattr(screenplay, "series_metadata", None):
+            bible_path = (screenplay.series_metadata or {}).get("series_bible_path", "")
+            if bible_path and os.path.exists(bible_path):
+                try:
+                    from core.series_bible import SeriesBible
+                    bible = SeriesBible.load(bible_path)
+                    wc = bible.world_context or {}
+                    series_bible_context = (
+                        f"\nSeries Bible (editable via edit_series_bible):"
+                        f"\n  Series Title: {bible.series_title}"
+                        f"\n  Setting: {wc.get('setting_description', '')[:200]}"
+                        f"\n  Time Period: {wc.get('time_period', '')}"
+                        f"\n  Rules/Lore: {wc.get('rules_and_lore', '')[:200]}"
+                        f"\n  Tone: {wc.get('tone', '')}"
+                        f"\n  Episodes recorded: {len(bible.episode_history)}"
+                    )
+                except Exception:
+                    pass
+
+        # Build identity block context
+        identity_block_context = ""
+        if screenplay and screenplay.identity_block_metadata:
+            ib_entries = []
+            for eid, meta in screenplay.identity_block_metadata.items():
+                if not isinstance(meta, dict):
+                    continue
+                name = (meta.get("name") or "").strip()
+                etype = (meta.get("type") or "").strip()
+                status = (meta.get("status") or "placeholder").strip()
+                if name:
+                    ib_entries.append(f"  - {name} ({etype}) [{status}]")
+            if ib_entries:
+                identity_block_context = "\nIdentity Blocks:\n" + "\n".join(ib_entries[:20])
+
         prompt = f"""You are an AI assistant helping a screenwriter develop their story. The user wants to discuss and potentially modify their screenplay.
 
 {context_description}
+{series_bible_context}
+{identity_block_context}
 
 Recent conversation:
 {history_text if history_text else "No previous conversation."}
@@ -12878,88 +14698,84 @@ IMPORTANT CONTEXT:
 - "Character outlines" refer to character descriptions stored in the story_outline (background, role, personality, etc.)
 - "Character focus" refers to which characters appear in a specific scene
 - "Scene content" refers to the actual narrative text describing what happens in a scene
+- "Premise" is the core story concept stored at the top level of the screenplay
+- "Story outline" contains main_storyline, subplots, characters, and conclusion
+- "Identity blocks" are visual identity descriptions (8-field schema) for characters, environments, vehicles, and objects
+- "Series Bible" stores persistent world context, characters, and lore shared across episodes
 
 Analyze the user's message and determine:
-1. What is the user asking for? (discussion, regenerate content, edit content, add items, remove items, edit character outline, etc.)
-2. What context are they referring to? (current scene, selected storyboard items, character outlines, or general story)
+1. What is the user asking for?
+2. What context are they referring to?
 3. What changes should be made (if any)?
 
-{"⚠️ CRITICAL: The user is asking about CHARACTER OUTLINES (character descriptions/backstories), NOT scene content. Focus on the character's outline, growth arc, and background information from the story_outline, NOT scene narrative content." if is_character_outline_request else ""}
-{"🚨 EXTEND REQUEST DETECTED: The user wants to EXTEND/EXPAND the character outline. You MUST include the EXISTING outline text in your response and ADD new content. The extended version must be LONGER than the original. Do NOT replace or shorten it." if (is_character_outline_request and is_extend_request) else ""}
+{"⚠️ CRITICAL: The user is asking about CHARACTER OUTLINES (character descriptions/backstories), NOT scene content." if is_character_outline_request else ""}
+{"🚨 EXTEND REQUEST: Include the EXISTING outline text and ADD new content. The extended version must be LONGER." if (is_character_outline_request and is_extend_request) else ""}
 
-Respond in JSON format with this structure:
+Respond in JSON format:
 {{
     "text": "Your conversational response to the user",
-    "intent": "discuss|regenerate_scene|edit_scene|regenerate_items|edit_items|add_items|remove_items|edit_character_outline",
+    "intent": "discuss|regenerate_scene|edit_scene|regenerate_items|edit_items|add_items|remove_items|edit_character_outline|edit_premise|edit_story_outline|regenerate_framework|edit_series_bible|edit_identity_block|approve_identity_block",
     "suggestions": [
         {{
-            "change_type": "edit_character_outline" if is_character_outline_request and mentioned_character else "regenerate_scene|edit_scene|regenerate_items|edit_items|add_items|remove_items",
+            "change_type": "<one of the intent values above>",
             "description": "Brief description of the suggested change",
-            "change_data": {{
-                "character_name": "CharacterName",  // For edit_character_outline: name of character to edit
-                "character_outline": "...",  // For edit_character_outline: new or extended character outline text
-                "character_growth_arc": "...",  // For edit_character_outline: new or extended growth arc text (optional)
-                "new_content": "...",  // For regenerate_scene
-                "edits": {{
-                    "description": "...",  // For edit_scene: scene description
-                    "title": "...",  // For edit_scene: scene title
-                    "estimated_duration": 60,  // For edit_scene: duration in seconds
-                    "character_focus": ["Character1", "Character2"]  // For edit_scene: list of character names OR comma-separated string
-                }},  // For edit_scene or edit_items
-                "new_items": [...],  // For regenerate_items or add_items
-                "items_to_remove": [...]  // For remove_items
-            }}
+            "change_data": {{ ... }}
         }}
     ]
 }}
 
-For edit_character_outline: Use this when the user wants to modify a character's outline, backstory, or growth arc from the story_outline.
-- character_name: The name of the character to edit (must match exactly)
-- character_outline: The EXTENDED character outline text - MUST include the existing outline PLUS new content. If the user asks to "extend", "expand", or "add to" the outline, you MUST keep the original text and add more detail. The result should be LONGER than the original, not shorter.
-- character_growth_arc: Optional - the EXTENDED growth arc text - CRITICAL: If the user asks to extend a character, you MUST also extend the growth arc. Include the COMPLETE existing growth arc text PLUS new content. The extended growth arc MUST be LONGER than the original. Do NOT shorten or replace the growth arc - only extend it.
+═══ CHANGE TYPE REFERENCE ═══
 
-CRITICAL: When the user asks to "extend", "expand", "add to", or "develop" a character outline:
-1. You MUST include the existing outline text in your response
-2. You MUST add new content that builds upon the existing outline
-3. The final outline MUST be longer than the original
-4. Do NOT replace the existing outline - extend it with additional details, background, personality traits, relationships, motivations, etc.
-5. If you provide character_growth_arc, you MUST include the COMPLETE existing growth arc text PLUS new content
-6. The extended growth arc MUST be LONGER than the original - do NOT shorten it
-7. If you're not extending the growth arc, do NOT include character_growth_arc in the response (leave it out entirely)
+1. edit_character_outline — Edit a character's outline or growth arc from the story_outline.
+   change_data: {{ "character_name": "Name", "character_outline": "...", "character_growth_arc": "..." }}
+   When extending: include the COMPLETE existing text word-for-word, then ADD new content. Result MUST be longer.
 
-For edit_scene: The "edits" object can contain any of these properties: description, title, estimated_duration, or character_focus. 
-- character_focus should be a list of character names (e.g., ["John", "Sarah"]) or a comma-separated string (e.g., "John, Sarah")
-- If the user wants to change which characters are featured in the scene, use edit_scene with character_focus in edits
+2. regenerate_scene / edit_scene — Modify scene content or properties.
+   change_data for content: {{ "new_content": "..." }}
+   change_data for properties: {{ "edits": {{ "description": "...", "title": "...", "estimated_duration": 60, "character_focus": ["Char1", "Char2"] }} }}
 
-IMPORTANT: If the user mentions a specific character by name and asks about their "outline", "backstory", "background", "description", or "growth arc", you MUST use edit_character_outline, NOT edit_scene or regenerate_scene.
-- Character outlines are stored separately from scene content
-- When editing character outlines, focus on the character's role, background, personality, and growth arc
-- Do NOT suggest editing scene content when the user asks about character outlines
+3. regenerate_items / edit_items — Modify storyboard items for the selected scene.
+   change_data: {{ "new_items": [...], "user_request": "..." }}
 
-CRITICAL FOR EXTENDING CHARACTER OUTLINES:
-- If the user asks to "extend", "expand", "add to", "develop", or "elaborate on" a character outline:
-  1. You MUST include the COMPLETE EXISTING outline text word-for-word in your character_outline response
-  2. You MUST add NEW content that builds upon what's already there - add more sentences, details, depth
-  3. The extended outline MUST be LONGER than the original (check the character count shown in context)
-  4. Add details like: deeper background, more personality traits, specific motivations, relationships, past experiences, fears, desires, goals, conflicts, etc.
-  5. Do NOT summarize, shorten, or paraphrase the existing outline - keep it EXACTLY as is and ADD to it
-  6. The format MUST be: [Complete original outline text] [Additional new sentences that expand and develop the character further]
-  7. Example: If original is "Sarah is a detective. She is determined." Extended should be "Sarah is a detective. She is determined. [ADD MORE: Her determination stems from... She has a troubled past involving... Her relationships with... etc.]"
-  8. The extended version should be at least 1.5x longer than the original, preferably 2x longer
+4. add_items — Add new storyboard items to the current scene.
+   change_data: {{ "new_items": [{{ "storyline": "...", "duration": 5, "dialogue": "" }}] }}
 
-CRITICAL FOR GROWTH ARC WHEN EXTENDING:
-- If you provide character_growth_arc when extending a character:
-  1. You MUST include the COMPLETE EXISTING growth arc text word-for-word
-  2. You MUST add NEW content that expands the growth arc
-  3. The extended growth arc MUST be LONGER than the original - check the character count in context
-  4. Do NOT shorten, summarize, or replace the growth arc - only extend it
-  5. If you cannot extend the growth arc properly, do NOT include character_growth_arc in your response
-  6. The format MUST be: [Complete original growth arc text] [Additional new sentences that expand the character's development]
-  7. The extended growth arc should be at least 1.5x longer than the original
-  8. Example: If original growth arc is "Sarah starts as a rookie. She becomes experienced." Extended should be "Sarah starts as a rookie. She becomes experienced. [ADD MORE: Her journey involves... She faces challenges such as... Her transformation includes... etc.]"
+5. remove_items — Remove selected storyboard items.
+   change_data: {{ "confirm": true }}
 
-If the user is just discussing or asking questions without requesting changes, set "suggestions" to an empty array.
-If the user wants changes, include appropriate suggestions with the change_data needed to implement them.
+6. edit_premise — Edit the story's premise, title, genres, or atmosphere.
+   change_data: {{ "premise": "new premise text", "title": "new title", "genres": ["genre1", "genre2"], "atmosphere": "new atmosphere" }}
+   Include ONLY the fields the user wants to change.
+
+7. edit_story_outline — Edit the main storyline, subplots, or conclusion.
+   change_data: {{ "main_storyline": "...", "subplots": "...", "conclusion": "..." }}
+   Include ONLY the fields the user wants to change. Provide the FULL text of each field, not just the diff.
+
+8. regenerate_framework — Regenerate the entire story framework (acts and scenes). DESTRUCTIVE — only suggest when user explicitly asks.
+   change_data: {{ "confirm": true, "user_request": "what the user wants changed" }}
+
+9. edit_series_bible — Edit the Series Bible (world context, continuity notes, tone, etc.). Only available for episodic series.
+   change_data: {{ "setting_description": "...", "time_period": "...", "rules_and_lore": "...", "tone": "..." }}
+   Include ONLY the fields the user wants to change.
+
+10. edit_identity_block — Edit an entity's identity block user notes or description.
+    change_data: {{ "entity_name": "Name", "entity_type": "character|environment|vehicle|object", "user_notes": "new description" }}
+
+11. approve_identity_block — Approve an entity's identity block (mark as approved).
+    change_data: {{ "entity_name": "Name", "entity_type": "character|environment|vehicle|object" }}
+
+═══ RULES ═══
+
+- If the user mentions a character by name and asks about their "outline", "backstory", "background", or "growth arc", use edit_character_outline.
+- If the user asks about the premise, story concept, title, genres, or atmosphere, use edit_premise.
+- If the user asks to change the main storyline, subplots, or conclusion, use edit_story_outline.
+- If the user asks to regenerate or redo the framework/structure, use regenerate_framework.
+- If the user asks about world-building, lore, setting, or continuity for a series, use edit_series_bible.
+- If the user asks about an entity's visual description or identity block, use edit_identity_block.
+- If the user asks to approve an identity block, use approve_identity_block.
+- If the user is just discussing or asking questions, set "suggestions" to an empty array.
+- For extend/expand requests on character outlines: include COMPLETE existing text + ADD new content. Must be LONGER.
+- regenerate_framework is destructive — only suggest when the user explicitly asks to redo the framework.
 
 CRITICAL: Return ONLY valid JSON. No markdown, no explanations, no code blocks.
 """
@@ -12972,7 +14788,7 @@ CRITICAL: Return ONLY valid JSON. No markdown, no explanations, no code blocks.
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.7,
-                max_tokens=max(self.model_settings.get("max_tokens", 500), 1000)
+                max_tokens=max(self.model_settings.get("max_tokens", 500), 4000)
             )
             
             content = response.choices[0].message.content.strip()
@@ -13088,10 +14904,12 @@ CRITICAL: Return ONLY valid JSON. No markdown, no explanations, no code blocks.
                                     except json.JSONDecodeError:
                                         continue
                     
-                    # If still None, raise the original error
+                    # Last resort: response was likely truncated mid-JSON.
+                    # Try to extract at least "text" and "intent" with regex.
                     if chat_response is None:
-                        # Save full response for debugging
-                        import os
+                        chat_response = self._salvage_truncated_chat_json(content)
+
+                    if chat_response is None:
                         debug_file = "debug_json_error.json"
                         try:
                             with open(debug_file, 'w', encoding='utf-8') as f:
@@ -13171,7 +14989,7 @@ CRITICAL: Return ONLY valid JSON. No markdown, no explanations, no code blocks.
                     if not change_data.get("character_name") and mentioned_character:
                         # Set character_name from mentioned_character if missing
                         change_data["character_name"] = mentioned_character
-                        print(f"DEBUG: Set character_name to {mentioned_character} from mentioned_character")
+                        _safe_print(f"DEBUG: Set character_name to {mentioned_character} from mentioned_character")
                     elif not change_data.get("character_name"):
                         # Try to extract from user message
                         import re
@@ -13183,7 +15001,7 @@ CRITICAL: Return ONLY valid JSON. No markdown, no explanations, no code blocks.
                             for word in words:
                                 if word in char_names:
                                     change_data["character_name"] = word
-                                    print(f"DEBUG: Extracted character_name {word} from user message")
+                                    _safe_print(f"DEBUG: Extracted character_name {word} from user message")
                                     break
             
             return chat_response
@@ -13304,7 +15122,7 @@ Output ONLY the digest. No preamble."""
             digest = digest.strip('"\'')
             return digest[:500] if digest else ""
         except Exception as e:
-            print(f"Could not extract consistency digest: {e}")
+            _safe_print(f"Could not extract consistency digest: {e}")
             return ""
     
     def _build_previous_scenes_context(self, previous_scenes: List[StoryScene]) -> str:
@@ -13313,11 +15131,14 @@ Output ONLY the digest. No preamble."""
         Prefers LLM-extracted consistency_digest (compact, continuity-focused). Falls back to
         truncated full content for scenes without a digest (e.g. from before this feature).
         Includes character wardrobe data from previous scenes for visual continuity.
+        Appends an explicit CHARACTER LOCATION RULE derived from the most recent
+        scene's digest to prevent impossible character placement.
         """
         if not previous_scenes:
             return ""
         
         context_parts = ["\nPrevious Scenes (key continuity facts — must not contradict):"]
+        last_digest = ""
         for prev_scene in previous_scenes:
             digest = ""
             if prev_scene.metadata and prev_scene.metadata.get("consistency_digest"):
@@ -13330,6 +15151,7 @@ Output ONLY the digest. No preamble."""
             if digest:
                 context_parts.append(f"\nScene {prev_scene.scene_number} - {prev_scene.title}:")
                 context_parts.append(digest)
+                last_digest = digest
             
             # Include character wardrobe from previous scenes
             if hasattr(prev_scene, 'character_wardrobe') and prev_scene.character_wardrobe:
@@ -13340,9 +15162,1232 @@ Output ONLY the digest. No preamble."""
                 if wardrobe_lines:
                     context_parts.append(f"  Character Wardrobe (Scene {prev_scene.scene_number}):")
                     context_parts.extend(wardrobe_lines)
+
+        # Add explicit character location constraint
+        if last_digest:
+            context_parts.append(
+                "\nCHARACTER LOCATION RULE (MANDATORY):"
+                "\n- A character who was stranded, captured, left behind, separated, "
+                "or remained at a DIFFERENT location at the end of the previous scene "
+                "CANNOT freely appear in the current scene unless the scene description "
+                "EXPLICITLY accounts for their arrival (e.g. 'they are rescued', "
+                "'they catch up', 'they appear on their own ship')."
+                "\n- Antagonists left behind at a collapsing/destroyed location MUST NOT "
+                "appear on the protagonists' vehicle in the next scene."
+                "\n- If the scene description says a character is OBSERVED (e.g. through "
+                "viewports, from a distance), they are NOT physically present in the "
+                "protagonists' location — describe them as seen from afar."
+                "\n- Check the previous scene digest above carefully before placing "
+                "any character in this scene."
+            )
         
         return "\n".join(context_parts)
-    
+
+    def _validate_cross_scene_continuity(
+        self,
+        content: str,
+        scene: "StoryScene",
+        screenplay: "Screenplay",
+    ) -> List[str]:
+        """Check whether characters present in the current scene could
+        plausibly be there given where they were at the end of the previous
+        scene.
+
+        Uses AI to compare the previous scene's ``consistency_digest`` with
+        the characters appearing in the new scene.  Returns a list of
+        human-readable warning strings (empty if no issues found).
+        """
+        if not content or not screenplay or not self._adapter:
+            return []
+
+        # Find the previous scene
+        all_scenes = screenplay.get_all_scenes()
+        scene_idx = None
+        for i, s in enumerate(all_scenes):
+            if s.scene_id == scene.scene_id:
+                scene_idx = i
+                break
+        if scene_idx is None or scene_idx == 0:
+            return []
+
+        prev_scene = all_scenes[scene_idx - 1]
+        prev_digest = ""
+        if prev_scene.metadata:
+            prev_digest = prev_scene.metadata.get("consistency_digest", "")
+        if not prev_digest:
+            return []
+
+        # Extract CAPS character names from the current scene content
+        char_names = set(re.findall(r'\b([A-Z][A-Z\s\']{2,}[A-Z])\b', content))
+        # Filter to registered characters only
+        registry = set()
+        for r in getattr(screenplay, "character_registry", []) or []:
+            if isinstance(r, str) and r.strip():
+                registry.add(r.strip().upper())
+        present_chars = char_names & registry
+        if not present_chars:
+            return []
+
+        try:
+            prompt = (
+                f"PREVIOUS SCENE DIGEST (what happened and where everyone ended up):\n"
+                f"{prev_digest}\n\n"
+                f"CURRENT SCENE: {scene.title}\n"
+                f"Scene Description: {scene.description or ''}\n\n"
+                f"CHARACTERS APPEARING IN CURRENT SCENE:\n"
+                f"{', '.join(sorted(present_chars))}\n\n"
+                "For each character listed above, determine whether their presence "
+                "in the current scene is PLAUSIBLE given the previous scene's ending.\n\n"
+                "RULES:\n"
+                "- If the previous scene ended with a character stranded, captured, "
+                "separated from the group, or in a completely different location, "
+                "they should NOT appear freely in the current scene unless the scene "
+                "description explicitly accounts for their arrival.\n"
+                "- Characters who escaped together or were in the same vehicle/location "
+                "at the end of the previous scene CAN appear together.\n"
+                "- Antagonists who were stranded/left behind should NOT be on the "
+                "heroes' vehicle in the next scene.\n\n"
+                "Output format:\n"
+                "For each IMPLAUSIBLE character presence, output:\n"
+                "IMPLAUSIBLE: CHARACTER_NAME — reason why they can't be here\n\n"
+                "If all characters are plausible, output exactly: ALL_PLAUSIBLE"
+            )
+
+            response = self._chat_completion(
+                messages=[
+                    {"role": "system", "content": (
+                        "You are a story continuity checker. Verify that characters "
+                        "appearing in a scene could plausibly be there given events "
+                        "in the previous scene. Only flag clear impossibilities."
+                    )},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,
+                max_tokens=400,
+            )
+            result = (response.choices[0].message.content or "").strip()
+
+            if "ALL_PLAUSIBLE" in result:
+                return []
+
+            warnings: List[str] = []
+            for line in result.split("\n"):
+                if line.strip().startswith("IMPLAUSIBLE:"):
+                    detail = line.strip()[len("IMPLAUSIBLE:"):].strip()
+                    warnings.append(f"[continuity] {detail}")
+                    _safe_print(f"  ⚠ [cross-scene continuity] {detail}")
+
+            return warnings
+
+        except Exception as e:
+            _safe_print(f"  [cross-scene continuity] Check failed: {e}")
+            return []
+
+    def _build_environment_establishment_prompt(self, environment_changed: bool, prev_env_name: str = "") -> str:
+        """Return the ENVIRONMENT ESTABLISHMENT prompt section.
+
+        When the environment is the same as the previous scene, instructs the
+        AI to fold a brief location reference into the first action paragraph
+        instead of writing a dedicated establishing paragraph.
+        """
+        _mid_scene_switch = (
+            "\n\nMID-SCENE ENVIRONMENT SWITCH (MANDATORY when the location changes within a scene):\n"
+            "- If a character moves to a DIFFERENT environment mid-scene, the transition paragraph "
+            "MUST follow the SAME conventions as the opening establishing paragraph:\n"
+            "  1. Begin with a dedicated environment-only sentence (or short paragraph) describing the "
+            "NEW location: architecture, surfaces, lighting, atmosphere, key visual features.\n"
+            "  2. Use _underscored_ markup with a SPECIFIC name that distinguishes this space from the "
+            "previous one. Include the sub-area in the markup — e.g. _Laughing Skull Comedy Club Stage_ "
+            "not just _Laughing Skull Comedy Club_; _Blackwood Manor Library_ not just _Blackwood Manor_.\n"
+            "  3. Only AFTER the new environment has been visually established should character action "
+            "or dialogue resume.\n"
+            "- Every distinct area a character enters needs its own visual establishment — the reader "
+            "(and the video pipeline) cannot see the new space unless you describe it."
+        )
+        if environment_changed:
+            return (
+                "ENVIRONMENT ESTABLISHMENT (MANDATORY — PARAGRAPH STRUCTURE):\n"
+                "\n"
+                "PARAGRAPH 1 — ENVIRONMENT ONLY (NO CHARACTERS):\n"
+                "- The FIRST paragraph is a PURE ENVIRONMENT description. It is used to generate\n"
+                "  the hero-frame image and environment identity block.\n"
+                "- Describe the setting: architecture, surfaces, lighting, atmosphere, key visual features.\n"
+                "- Use _underscored_ location markup on every mention (e.g. _Foyer_, _Blackwood Manor_).\n"
+                "- Provide a full sensory description: what the space looks like, its condition,\n"
+                "  lighting, textures, and mood.\n"
+                "- SPATIAL SCALE (MANDATORY): Establish the SIZE of the space — is it a cramped closet,\n"
+                "  a modest room, a cavernous hall, an open plaza? Give the reader (and the camera) a\n"
+                "  clear sense of how much room there is. If many characters will act here, the space\n"
+                "  MUST be large enough to accommodate them.\n"
+                "- ENTRIES AND EXITS (MANDATORY): Describe ALL doorways, archways, corridors, windows,\n"
+                "  and exits that are used ANYWHERE later in the scene. If soldiers block the exits in\n"
+                "  paragraph 3, those exits MUST be described in paragraph 1. If a character escapes\n"
+                "  through a hidden passage, the wall or area concealing it should be visually established\n"
+                "  here (even if its secret nature is revealed later).\n"
+                "- PRE-PLAN THE SPACE: Before writing, mentally map the full scene — every action,\n"
+                "  movement, and interaction that occurs. The environment paragraph must describe a space\n"
+                "  that is physically plausible for ALL events that follow.\n"
+                "- ⛔ ABSOLUTELY FORBIDDEN in Paragraph 1: character names (FULL CAPS), character\n"
+                "  descriptions, character placement, objects [brackets], vehicles {braces}, *actions*,\n"
+                "  or dialogue. If a sentence mentions ANY character by name, it belongs in Paragraph 2.\n"
+                "- ⛔ Paragraph 1 MUST be descriptive prose — NEVER a bare list of SFX tags.\n"
+                "  Do NOT start the scene with standalone (ambient_*) or (sfx) tags. Ambient SFX\n"
+                "  may be woven INTO the environment prose (e.g. 'A low (ambient_hum) pulses through\n"
+                "  the _Control Room_...') but NEVER as the entire paragraph.\n"
+                "\n"
+                "PARAGRAPH 2 — CHARACTER PLACEMENT & SCENE ENTRY:\n"
+                "- The SECOND paragraph introduces characters into the established environment.\n"
+                "- Describe where each character is positioned, what they are wearing, and what they\n"
+                "  are doing when the scene opens (e.g. 'ELARA VANCE *stands* at the [command console],\n"
+                "  wearing a fitted navy flight suit.').\n"
+                "- This is the first storyboard item — the establishing shot WITH characters.\n"
+                "\n"
+                "PARAGRAPH 3+ — STORY ACTION:\n"
+                "- From the third paragraph onwards, the story unfolds with dialogue and action."
+                + _mid_scene_switch
+            )
+        loc_hint = f" (_{prev_env_name}_)" if prev_env_name else ""
+        return (
+            "ENVIRONMENT CONTINUITY (SAME LOCATION AS PREVIOUS SCENE):\n"
+            f"- This scene takes place in the SAME location as the previous scene{loc_hint}.\n"
+            "- Do NOT write a dedicated environment-establishing paragraph. The environment was "
+            "already fully described in the previous scene.\n"
+            "- Instead, weave a brief one-line transitional reference to the setting into the "
+            "first action paragraph (e.g. 'Still in the _Workshop_, HENRY *turns* toward the "
+            "[workbench].').\n"
+            "- The first paragraph should begin with character action or dialogue, NOT a "
+            "standalone environment description.\n"
+            "- Use _underscored_ location markup on the brief reference.\n"
+            "- If any environmental detail has CHANGED since the previous scene (e.g. time of "
+            "day shifted, damage occurred, lights turned off), describe ONLY the change — not "
+            "the full environment again."
+            + _mid_scene_switch
+        )
+
+    @staticmethod
+    def _is_sfx_only_paragraph(text: str) -> bool:
+        """Return True if *text* consists entirely of SFX tags and whitespace."""
+        stripped = text.strip()
+        if not stripped:
+            return True
+        without_sfx = re.sub(r'\([a-z_]+\)', '', stripped)
+        without_sfx = re.sub(r'\[\d+\]', '', without_sfx)  # strip paragraph numbers like [1]
+        return not without_sfx.strip()
+
+    def _enforce_environment_first_paragraph(self, content: str,
+                                               environment_changed: bool,
+                                               screenplay=None) -> str:
+        """Ensure paragraph 1 is a proper environment description.
+
+        Handles two failure modes:
+        1. SFX-only paragraph 1 (e.g. '(ambient_buzz) (ambient_machinery)') —
+           merge the SFX tags into paragraph 2 instead.
+        2. Character content blended into the environment paragraph —
+           split character-containing sentences into a new paragraph 2.
+        """
+        if not environment_changed or not content or not content.strip():
+            return content
+
+        paragraphs = content.split("\n\n")
+        if not paragraphs:
+            return content
+
+        # ── Fix 1: SFX-only first paragraph → merge into next paragraph ──
+        first_para = paragraphs[0].strip()
+        if self._is_sfx_only_paragraph(first_para) and len(paragraphs) > 1:
+            sfx_tags = first_para
+            # Strip paragraph number from sfx_tags (e.g. "[1] ")
+            sfx_tags = re.sub(r'^\[\d+\]\s*', '', sfx_tags).strip()
+            # Prepend the SFX tags to the beginning of the next paragraph
+            next_para = paragraphs[1].strip()
+            merged = f"{sfx_tags} {next_para}" if sfx_tags else next_para
+            paragraphs = [merged] + paragraphs[2:]
+            first_para = paragraphs[0]
+
+        # ── Fix 2: Character content in environment paragraph → split ──
+        sentences = re.split(r'(?<=[.!?])\s+', first_para)
+        if len(sentences) <= 1:
+            if not re.search(r'\b[A-Z]{2,}(?:\s+[A-Z]{2,})*\b', first_para):
+                return "\n\n".join(paragraphs)
+            return "\n\n".join(paragraphs)
+
+        known_chars = set()
+        if screenplay:
+            if getattr(screenplay, "character_registry", None):
+                known_chars = {n.upper() for n in screenplay.character_registry if n}
+            if screenplay.story_outline and isinstance(screenplay.story_outline, dict):
+                for c in screenplay.story_outline.get("characters", []):
+                    if isinstance(c, dict) and c.get("name"):
+                        known_chars.add(c["name"].upper())
+
+        env_sentences = []
+        char_sentences = []
+
+        for sent in sentences:
+            has_character = False
+            caps_words = re.findall(r'\b([A-Z]{2,}(?:\s+[A-Z]{2,})*)\b', sent)
+            for cw in caps_words:
+                if cw in known_chars:
+                    has_character = True
+                    break
+                if len(cw.split()) >= 2:
+                    has_character = True
+                    break
+            # Dialogue is never environment-only
+            if '"' in sent:
+                has_character = True
+
+            if has_character:
+                char_sentences.append(sent)
+            else:
+                env_sentences.append(sent)
+
+        if not char_sentences:
+            return "\n\n".join(paragraphs)
+
+        if not env_sentences:
+            return "\n\n".join(paragraphs)
+
+        new_para_1 = " ".join(env_sentences)
+        new_para_2 = " ".join(char_sentences)
+
+        remaining = paragraphs[1:]
+        result_parts = [new_para_1, new_para_2] + remaining
+        return "\n\n".join(result_parts)
+
+    # ── Spatial features that should be established in the opening paragraph ──
+    _SPATIAL_KEYWORDS = re.compile(
+        r'\b(?:exit|exits|entrance|entrances|doorway|doorways|archway|archways|'
+        r'arched\s+entrance|arched\s+doorway|corridor|corridors|passage|passages|'
+        r'passageway|staircase|staircases|stairwell|stairs|ladder|'
+        r'window|windows|gate|gates|portcullis|hatch|hatches|'
+        r'hidden\s+door|secret\s+door|hidden\s+passage|trapdoor|'
+        r'balcony|balconies|alcove|alcoves|tunnel|tunnels)\b',
+        re.IGNORECASE,
+    )
+
+    _SCALE_KEYWORDS = re.compile(
+        r'\b(?:vast|cavernous|sprawling|enormous|immense|spacious|'
+        r'cramped|narrow|tiny|small|wide|towering|vaulted|'
+        r'high.ceiling|cathedral.like|expansive|open.plan|grand|massive)\b',
+        re.IGNORECASE,
+    )
+
+    def _validate_spatial_completeness(self, content: str,
+                                        environment_changed: bool) -> str:
+        """Check that spatial features used later in the scene are established
+        in the environment paragraph, and patch if needed.
+
+        Scans paragraphs 2+ for exit/entry/passage references that do not appear
+        in paragraph 1, then asks the AI to weave them into the opening description.
+        """
+        if not environment_changed or not content or not content.strip():
+            return content
+
+        paragraphs = content.split("\n\n")
+        if len(paragraphs) < 2:
+            return content
+
+        first_para = paragraphs[0]
+        first_para_lower = first_para.lower()
+        rest_text = "\n\n".join(paragraphs[1:])
+
+        # Find spatial features mentioned in paragraphs 2+ but NOT in paragraph 1
+        later_features = set()
+        for m in self._SPATIAL_KEYWORDS.finditer(rest_text):
+            feature = m.group(0).lower().strip()
+            if feature not in first_para_lower:
+                later_features.add(feature)
+
+        # Check if scale words are entirely missing from paragraph 1
+        has_scale = bool(self._SCALE_KEYWORDS.search(first_para))
+
+        if not later_features and has_scale:
+            return content
+
+        if not self._adapter:
+            return content
+
+        # Build the patch request
+        missing_parts = []
+        if later_features:
+            missing_parts.append(
+                f"Spatial features used later but missing from paragraph 1: "
+                f"{', '.join(sorted(later_features))}."
+            )
+        if not has_scale:
+            missing_parts.append(
+                "No sense of spatial scale (room size). Add a word or phrase "
+                "that conveys how large/small the space is."
+            )
+
+        patch_instruction = " ".join(missing_parts)
+
+        try:
+            prompt = (
+                "The FIRST paragraph below is the environment-establishing paragraph of a screenplay scene. "
+                "It is missing spatial details that are needed later.\n\n"
+                f"MISSING: {patch_instruction}\n\n"
+                "Rewrite ONLY paragraph 1 to naturally incorporate these missing spatial details. "
+                "Keep the existing descriptions, atmosphere, and lighting — just weave in the missing "
+                "architectural/spatial features. Do NOT add characters, actions, dialogue, or [bracketed] objects. "
+                "Do NOT change the location name or lighting. "
+                "Output ONLY the rewritten paragraph 1. "
+                "Do NOT include any introductory text, explanation, or commentary.\n\n"
+                f"ORIGINAL PARAGRAPH 1:\n{first_para}\n\n"
+                f"LATER PARAGRAPHS (for context — do NOT rewrite these):\n{rest_text[:3000]}"
+            )
+
+            response = self._chat_completion(
+                messages=[
+                    {"role": "system", "content": (
+                        "You rewrite environment-establishing paragraphs for screenplays. "
+                        "Add only the requested spatial details (exits, entries, room scale). "
+                        "Preserve everything else exactly. Output only the rewritten paragraph, no preamble."
+                    )},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.2,
+                max_tokens=500,
+            )
+            patched = (response.choices[0].message.content or "").strip()
+            patched = patched.strip('"""').strip("'''").strip('"').strip("'")
+            patched = self._strip_ai_preamble(patched)
+
+            if not patched or len(patched) < 20:
+                return content
+
+            # Preserve the paragraph number tag if present (e.g. "[1] ")
+            tag_match = re.match(r'^(\[\d+\]\s*)', first_para)
+            if tag_match and not re.match(r'^\[\d+\]', patched):
+                patched = tag_match.group(1) + patched
+
+            paragraphs[0] = patched
+            _safe_print(f"  [spatial patch] Enriched environment paragraph with: {patch_instruction}")
+            return "\n\n".join(paragraphs)
+
+        except Exception as e:
+            _safe_print(f"  [spatial patch] Failed: {e}")
+            return content
+
+    # ── Post-generation validators ────────────────────────────────────────
+
+    # Technology terms that are inappropriate for each genre family
+    _GENRE_BANNED_TERMS: Dict[str, List[str]] = {
+        "fantasy": [
+            "pulse rifle", "pulse pistol", "laser", "plasma", "blaster",
+            "energy weapon", "energy bolt", "energy blast", "energy beam", "photon",
+            "holographic", "hologram", "holo-", "cybernetic", "android",
+            "robot", "mech ", "datapad", "terminal", "computer", "monitor",
+            "hud", "tactical hud", "scanner", "comm link", "comms",
+            "radio", "transmitter", "satellite", "drone", "turret",
+            "force field", "shield generator", "power cell", "battery",
+            "reactor", "synthetic", "polymer", "carbon fiber",
+            "neon", "led", "circuit", "wiring", "electric",
+            "mechanical eye", "mechanical implant", "ocular implant",
+            "cybernetic implant", "bionic", "prosthetic implant",
+            "pistol", "gunshot", "bullet", "rifle", "firearm",
+            "ammunition", "revolver", "shotgun",
+        ],
+        "scifi": [
+            "crossbow", "longbow", "trebuchet", "catapult", "battering ram",
+            "drawbridge", "portcullis", "moat", "castle keep",
+            "chainmail", "plate armor", "heraldic", "tabard", "surcoat",
+            "jousting", "squire", "blacksmith forge",
+        ],
+        "western": [
+            "pulse rifle", "laser", "plasma", "blaster", "energy weapon",
+            "holographic", "cybernetic", "android", "robot",
+            "force field", "shield generator", "power cell",
+            "chainmail", "plate armor", "heraldic", "trebuchet",
+        ],
+    }
+
+    _GENRE_BANNED_SFX: Dict[str, List[str]] = {
+        "fantasy": [
+            "gunshot", "bullet_impact", "bullet_ricochet", "laser_fire",
+            "energy_blast", "plasma_fire", "hologram_activate",
+            "electric_hum", "electric_crackle", "radio_static",
+        ],
+        "scifi": [],
+        "western": [
+            "laser_fire", "energy_blast", "plasma_fire",
+        ],
+    }
+
+    _GENRE_FAMILY_MAP = {
+        "fantasy": "fantasy", "high fantasy": "fantasy", "dark fantasy": "fantasy",
+        "epic fantasy": "fantasy", "sword and sorcery": "fantasy",
+        "medieval": "fantasy", "historical": "fantasy",
+        "sci-fi": "scifi", "science fiction": "scifi", "cyberpunk": "scifi",
+        "space opera": "scifi", "dystopian": "scifi", "post-apocalyptic": "scifi",
+        "western": "western", "frontier": "western",
+    }
+
+    def _resolve_genre_family(self, screenplay: "Screenplay") -> Optional[str]:
+        """Return the single genre family ('fantasy', 'scifi', 'western') if
+        the story has a pure genre.  Returns None for hybrid/multi-family or
+        unrecognised genres."""
+        genres = getattr(screenplay, "genre", []) or []
+        if not genres:
+            return None
+        genres_lower = {g.lower() for g in genres}
+        families = {self._GENRE_FAMILY_MAP.get(g) for g in genres_lower} - {None}
+        if len(families) != 1:
+            return None
+        return families.pop()
+
+    # Genre-appropriate replacement suggestions for physical traits.
+    # Maps banned-term fragments to a list of genre→suggestion pairs so the
+    # warning message includes actionable guidance.
+    _GENRE_TRAIT_REPLACEMENTS: Dict[str, Dict[str, str]] = {
+        "mechanical eye": {
+            "fantasy": "a milky-white blind eye with a faint arcane glow",
+            "western": "a glass eye",
+        },
+        "mechanical implant": {
+            "fantasy": "a runic tattoo channelling residual magic",
+            "western": "a crude prosthetic brace",
+        },
+        "ocular implant": {
+            "fantasy": "an eye clouded with crystalline arcane silver",
+            "western": "a glass eye",
+        },
+        "cybernetic implant": {
+            "fantasy": "a magically-fused bone graft",
+            "western": "a leather-and-steel prosthetic",
+        },
+        "bionic": {
+            "fantasy": "enchanted / magically reinforced",
+            "western": "mechanical / clockwork",
+        },
+        "prosthetic implant": {
+            "fantasy": "a living-wood or bone prosthetic shaped by druidic craft",
+            "western": "a hand-carved wooden prosthetic",
+        },
+        "cybernetic": {
+            "fantasy": "arcane-etched / rune-bound",
+            "western": "gear-driven / clockwork",
+        },
+        "pulse rifle": {
+            "fantasy": "crossbow / longbow",
+        },
+        "pistol": {
+            "fantasy": "hand-crossbow / flintlock",
+        },
+        "rifle": {
+            "fantasy": "longbow / arbalest",
+        },
+        "holographic": {
+            "fantasy": "spectral / ethereal",
+        },
+        "hologram": {
+            "fantasy": "spectral projection / phantasm",
+        },
+        "energy bolt": {
+            "fantasy": "arcane bolt / lightning bolt",
+        },
+        "energy beam": {
+            "fantasy": "beam of concentrated arcane fire",
+        },
+    }
+
+    def validate_identity_block_genre(self, screenplay: "Screenplay") -> List[str]:
+        """Scan identity blocks and character descriptions for genre violations.
+
+        Returns a list of human-readable warning strings describing each
+        violation found, including suggested replacements when available.
+        Does NOT auto-fix — the caller decides what to do.
+        """
+        family = self._resolve_genre_family(screenplay)
+        if not family:
+            return []
+
+        banned = self._GENRE_BANNED_TERMS.get(family, [])
+        if not banned:
+            return []
+
+        warnings: List[str] = []
+        meta = getattr(screenplay, "identity_block_metadata", {}) or {}
+        blocks = getattr(screenplay, "identity_blocks", {}) or {}
+
+        for eid, m in meta.items():
+            ename = (m.get("name") or eid).strip()
+            fields_to_check = [
+                ("identity_block", blocks.get(eid, "")),
+                ("user_notes", m.get("user_notes", "")),
+                ("physical_appearance", m.get("physical_appearance", "")),
+                ("uniform_description", m.get("uniform_description", "")),
+            ]
+            for field_label, field_val in fields_to_check:
+                if not field_val:
+                    continue
+                val_lower = field_val.lower()
+                for term in banned:
+                    if term in val_lower:
+                        suggestion = self._get_trait_replacement(term, family)
+                        hint = f" → consider: {suggestion}" if suggestion else ""
+                        warnings.append(
+                            f"[{ename}] {field_label} contains genre-banned "
+                            f"term \"{term}\"{hint}"
+                        )
+
+        # Also scan story_outline character descriptions
+        outline = getattr(screenplay, "story_outline", None) or {}
+        if isinstance(outline, dict):
+            for char in outline.get("characters", []) or []:
+                if not isinstance(char, dict):
+                    continue
+                cname = (char.get("name") or "").strip()
+                for field in ("outline", "growth_arc", "physical_appearance"):
+                    val = char.get(field, "")
+                    if not val:
+                        continue
+                    val_lower = val.lower()
+                    for term in banned:
+                        if term in val_lower:
+                            suggestion = self._get_trait_replacement(term, family)
+                            hint = f" → consider: {suggestion}" if suggestion else ""
+                            warnings.append(
+                                f"[{cname}] story_outline.{field} contains "
+                                f"genre-banned term \"{term}\"{hint}"
+                            )
+
+        return warnings
+
+    def _get_trait_replacement(self, banned_term: str, genre_family: str) -> str:
+        """Return a suggested genre-appropriate replacement for *banned_term*,
+        or '' if none is mapped."""
+        entry = self._GENRE_TRAIT_REPLACEMENTS.get(banned_term.lower())
+        if not entry:
+            for key, val in self._GENRE_TRAIT_REPLACEMENTS.items():
+                if key in banned_term.lower():
+                    entry = val
+                    break
+        if entry:
+            return entry.get(genre_family, next(iter(entry.values()), ""))
+        return ""
+
+    def _validate_genre_compliance(self, content: str,
+                                    screenplay: "Screenplay") -> str:
+        """Scan generated content for technology-level mismatches and fix them.
+
+        If the story is pure fantasy but the AI used sci-fi weapons (pulse rifles,
+        energy blasters), ask the AI to replace them with genre-appropriate alternatives.
+        Skipped for hybrid genres (e.g. fantasy + sci-fi) where mixing is intentional.
+        """
+        if not content or not screenplay:
+            return content
+
+        family = self._resolve_genre_family(screenplay)
+        if not family:
+            return content
+
+        banned = self._GENRE_BANNED_TERMS.get(family, [])
+        banned_sfx = self._GENRE_BANNED_SFX.get(family, [])
+        if not banned and not banned_sfx:
+            return content
+
+        content_lower = content.lower()
+        violations = [term for term in banned if term in content_lower]
+
+        # Check SFX markup: (gunshot), (bullet_impact), etc.
+        sfx_in_content = re.findall(r'\(([a-z_]+)\)', content_lower)
+        sfx_violations = [s for s in sfx_in_content if s in banned_sfx]
+        if sfx_violations:
+            violations.extend([f"({s})" for s in sfx_violations])
+
+        if not violations:
+            return content
+
+        if not self._adapter:
+            _safe_print(f"  [genre check] Found {len(violations)} genre violations but no AI adapter for fix: {violations[:5]}")
+            return content
+
+        family_labels = {"fantasy": "fantasy/medieval", "scifi": "sci-fi/futuristic", "western": "western"}
+        label = family_labels.get(family, family)
+
+        try:
+            prompt = (
+                f"The scene below is from a {label} story but contains technology/items that "
+                f"don't fit the genre.\n\n"
+                f"VIOLATIONS FOUND: {', '.join(violations)}\n\n"
+                f"Rewrite the scene, replacing ONLY the genre-inappropriate items with "
+                f"{label}-appropriate equivalents. For example:\n"
+                f"- 'pulse rifle' → 'crossbow' or 'longbow' (fantasy)\n"
+                f"- 'energy blast' → 'bolt' or 'arrow' (fantasy)\n"
+                f"- 'holographic display' → 'enchanted mirror' (fantasy)\n\n"
+                f"RULES:\n"
+                f"- Replace ONLY the inappropriate items — keep everything else IDENTICAL.\n"
+                f"- Preserve all character names, dialogue, paragraph structure, markup "
+                f"([brackets], _underscores_, *asterisks*, (sfx)).\n"
+                f"- Adjust any sentences that describe the replaced item's behavior "
+                f"(e.g. 'Blue energy crackles along its barrel' → 'The bolt gleams in the firelight').\n"
+                f"- Output ONLY the rewritten scene starting with [1]. "
+                f"Do NOT include any introductory text, explanation, or commentary.\n\n"
+                f"SCENE:\n{content}"
+            )
+
+            response = self._chat_completion(
+                messages=[
+                    {"role": "system", "content": (
+                        f"You fix genre-inappropriate items in screenplay scenes. "
+                        f"Replace only the flagged items with {label}-appropriate equivalents. "
+                        f"Preserve all formatting, names, and structure exactly. "
+                        f"Output only the scene text, no preamble."
+                    )},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.15,
+                max_tokens=4000,
+            )
+            fixed = (response.choices[0].message.content or "").strip()
+
+            if not fixed or len(fixed) < len(content) * 0.5:
+                return content
+
+            fixed = self._strip_ai_preamble(fixed)
+
+            fixed_lower = fixed.lower()
+            remaining = [t for t in violations if t in fixed_lower]
+            if len(remaining) < len(violations):
+                _safe_print(f"  [genre fix] Replaced {len(violations) - len(remaining)} genre violations: {violations}")
+                return fixed
+            return content
+
+        except Exception as e:
+            _safe_print(f"  [genre fix] Failed: {e}")
+            return content
+
+    def _validate_object_establishment(self, content: str,
+                                        environment_changed: bool) -> str:
+        """Verify that [bracketed] objects appearing in paragraphs 2+ were
+        either established in paragraph 1 or introduced through character
+        action in their first-mention paragraph.
+
+        Flags objects that appear out of thin air with no setup. Uses AI
+        to weave missing objects into paragraph 1 as set dressing.
+        """
+        if not environment_changed or not content or not content.strip():
+            return content
+
+        paragraphs = content.split("\n\n")
+        if len(paragraphs) < 2:
+            return content
+
+        # Extract [bracketed] objects from each paragraph
+        bracket_pattern = re.compile(r'\[([^\]]+)\]')
+        para1_objects = {m.group(1).lower().strip() for m in bracket_pattern.finditer(paragraphs[0])}
+
+        # Track objects across all paragraphs — note first appearance
+        all_objects_by_first_para: Dict[str, int] = {}
+        for i, para in enumerate(paragraphs):
+            for m in bracket_pattern.finditer(para):
+                obj = m.group(1).lower().strip()
+                if obj not in all_objects_by_first_para:
+                    all_objects_by_first_para[obj] = i
+
+        # Objects first appearing in para 2+ that weren't in para 1
+        # Exclude objects that are clearly character-brought items (weapons, tools
+        # a character picks up, etc.) — those are introduced via character action
+        # and don't need environment pre-establishment.
+        _CHARACTER_ITEMS = re.compile(
+            r'(?:draws?|pulls?|grabs?|holds?|carries|wields?|raises?|'
+            r'brandish|unsheathes?|unholsters?|takes?\s+out|produces?|'
+            r'picks?\s+up|scoops?\s+up|reaches?\s+for)\b',
+            re.IGNORECASE,
+        )
+
+        unestablished = []
+        for obj, first_para_idx in all_objects_by_first_para.items():
+            if first_para_idx == 0:
+                continue
+            # Check if the object is introduced via character action in its first paragraph
+            para_text = paragraphs[first_para_idx]
+            obj_escaped = re.escape(obj)
+            # Look for action verb near the object mention
+            nearby = re.search(
+                rf'{_CHARACTER_ITEMS.pattern}\s*(?:\w+\s+){{0,3}}\[{obj_escaped}\]',
+                para_text, re.IGNORECASE,
+            )
+            if nearby:
+                continue
+            # Also check if the object is on a character's person (wardrobe/equipment)
+            nearby2 = re.search(
+                rf'\[{obj_escaped}\]\s*(?:at|on|from)\s+(?:his|her|their)',
+                para_text, re.IGNORECASE,
+            )
+            if nearby2:
+                continue
+            unestablished.append(obj)
+
+        if not unestablished:
+            return content
+
+        if not self._adapter:
+            _safe_print(f"  [object check] {len(unestablished)} unestablished objects: {unestablished}")
+            return content
+
+        try:
+            obj_list = ", ".join(f"[{o}]" for o in unestablished)
+            prompt = (
+                f"The environment-establishing paragraph below is missing some objects "
+                f"that appear later in the scene.\n\n"
+                f"MISSING OBJECTS: {obj_list}\n\n"
+                f"Rewrite ONLY paragraph 1 to naturally include these objects as part of "
+                f"the environment (set dressing, furniture, fixtures). Keep ALL existing "
+                f"content — just add the missing items where they'd logically be.\n"
+                f"Use [bracket] markup for each added object.\n"
+                f"Do NOT add characters, actions, or dialogue.\n"
+                f"Output ONLY the rewritten paragraph 1. "
+                f"Do NOT include any introductory text, explanation, or commentary.\n\n"
+                f"ORIGINAL PARAGRAPH 1:\n{paragraphs[0]}"
+            )
+
+            response = self._chat_completion(
+                messages=[
+                    {"role": "system", "content": (
+                        "You add missing set-dressing objects to environment paragraphs. "
+                        "Weave them in naturally. Preserve everything else exactly. "
+                        "Output only the rewritten paragraph, no preamble or explanation."
+                    )},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.2,
+                max_tokens=600,
+            )
+            patched = (response.choices[0].message.content or "").strip()
+            patched = patched.strip('"""').strip("'''").strip('"').strip("'")
+            patched = self._strip_ai_preamble(patched)
+
+            if not patched or len(patched) < 20:
+                return content
+
+            tag_match = re.match(r'^(\[\d+\]\s*)', paragraphs[0])
+            if tag_match and not re.match(r'^\[\d+\]', patched):
+                patched = tag_match.group(1) + patched
+
+            paragraphs[0] = patched
+            _safe_print(f"  [object patch] Added {len(unestablished)} unestablished objects to para 1: {unestablished}")
+            return "\n\n".join(paragraphs)
+
+        except Exception as e:
+            _safe_print(f"  [object patch] Failed: {e}")
+            return content
+
+    def _validate_no_invented_backstory(self, content: str,
+                                         scene_description: str) -> str:
+        """Detect dialogue that references events, history, or lore not present
+        in the scene description, and ask the AI to neutralize it.
+
+        Targets lines like 'Your treasonous family history' or references to
+        events that the scene description never established.
+        """
+        if not content or not scene_description:
+            return content
+
+        # Extract all dialogue lines
+        dialogue_lines = []
+        lines = content.split("\n")
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            # Character name line followed by dialogue
+            if re.match(r'^[A-Z][A-Z\s\'"-]{2,}$', line) and i + 1 < len(lines):
+                next_line = lines[i + 1].strip()
+                if next_line.startswith('"'):
+                    dialogue_lines.append(next_line)
+            elif line.startswith('"') and line.endswith('"'):
+                dialogue_lines.append(line)
+            i += 1
+
+        if not dialogue_lines:
+            return content
+
+        if not self._adapter:
+            return content
+
+        try:
+            dialogue_block = "\n".join(dialogue_lines)
+            prompt = (
+                "Compare the DIALOGUE below against the SCENE DESCRIPTION. "
+                "List any dialogue lines that reference specific events, history, "
+                "backstory, locations, or lore that are NOT mentioned or implied "
+                "in the scene description.\n\n"
+                f"SCENE DESCRIPTION:\n{scene_description}\n\n"
+                f"DIALOGUE LINES:\n{dialogue_block}\n\n"
+                "For each violation, output the format:\n"
+                "VIOLATION: \"<original line>\"\n"
+                "REASON: <what was invented>\n"
+                "FIX: \"<rewritten line that conveys the same dramatic intent without invented backstory>\"\n\n"
+                "If NO violations found, output exactly: NO_VIOLATIONS\n"
+                "Only flag lines that invent SPECIFIC facts (names, events, history). "
+                "Generic threats, taunts, or dramatic statements are fine."
+            )
+
+            response = self._chat_completion(
+                messages=[
+                    {"role": "system", "content": (
+                        "You detect invented backstory in screenplay dialogue. "
+                        "Only flag lines that reference specific events, history, or lore "
+                        "not in the scene description. Generic dramatic dialogue is fine."
+                    )},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,
+                max_tokens=800,
+            )
+            result = (response.choices[0].message.content or "").strip()
+
+            if "NO_VIOLATIONS" in result:
+                return content
+
+            # Parse fixes from the response
+            fix_pairs: List[Tuple[str, str]] = []
+            for block in re.split(r'(?=VIOLATION:)', result):
+                orig_m = re.search(r'VIOLATION:\s*"([^"]+)"', block)
+                fix_m = re.search(r'FIX:\s*"([^"]+)"', block)
+                if orig_m and fix_m:
+                    fix_pairs.append((orig_m.group(1).strip(), fix_m.group(1).strip()))
+
+            if not fix_pairs:
+                return content
+
+            patched = content
+            applied = 0
+            for original, fixed in fix_pairs:
+                if original in patched:
+                    patched = patched.replace(original, fixed, 1)
+                    applied += 1
+                    _safe_print(f"  [backstory fix] Replaced invented dialogue: \"{original[:60]}...\"")
+
+            if applied:
+                _safe_print(f"  [backstory fix] Fixed {applied} invented backstory line(s)")
+
+            return patched
+
+        except Exception as e:
+            _safe_print(f"  [backstory fix] Failed: {e}")
+            return content
+
+    # Extraordinary abilities that must be explicitly established in a
+    # character's identity block, outline, or species before the AI may
+    # use them.  Each entry maps an ability keyword to the regex patterns
+    # that indicate it appears in scene content.
+    _EXTRAORDINARY_ABILITIES: List[Dict[str, Any]] = [
+        {
+            "ability": "flight / wings",
+            "content_patterns": [
+                re.compile(r'\b(?:wings?|wing(?:span|beat|tip)s?)\b', re.I),
+                re.compile(r'\b(?:swoops?|soars?|glides?|flies|flew|flying|airborne)\b', re.I),
+            ],
+            "identity_keywords": [
+                "wings", "winged", "flight", "fly", "avian", "bird",
+                "dragon", "angelic", "feathered", "airborne",
+            ],
+        },
+        {
+            "ability": "teleportation",
+            "content_patterns": [
+                re.compile(r'\b(?:teleports?|teleporting|blinks?\s+(?:out|away|through)|'
+                           r'(?:dis)?appears?\s+in\s+a\s+flash|materializ[es]+|dematerializ[es]+)\b', re.I),
+            ],
+            "identity_keywords": [
+                "teleport", "blink", "phase", "warp", "materialize",
+            ],
+        },
+        {
+            "ability": "shapeshifting",
+            "content_patterns": [
+                re.compile(r'\b(?:shapeshifts?|morphs?\s+into|transforms?\s+into|'
+                           r'shifts?\s+(?:form|shape))\b', re.I),
+            ],
+            "identity_keywords": [
+                "shapeshift", "morph", "transform", "polymorph", "changeling",
+            ],
+        },
+        {
+            "ability": "invisibility",
+            "content_patterns": [
+                re.compile(r'\b(?:turns?\s+invisible|fades?\s+from\s+(?:sight|view)|'
+                           r'becomes?\s+invisible|vanish[es]*\s+(?:from\s+sight|completely))\b', re.I),
+            ],
+            "identity_keywords": [
+                "invisible", "invisibility", "stealth cloak", "vanish",
+            ],
+        },
+    ]
+
+    def _validate_no_invented_abilities(self, content: str,
+                                         screenplay: "Screenplay") -> str:
+        """Detect when the AI gives characters extraordinary abilities not
+        established in their identity block, outline, or species.
+
+        For each violation, uses AI to rewrite the offending passage so the
+        character achieves a similar dramatic result through mundane means.
+        """
+        if not content or not screenplay:
+            return content
+
+        meta = getattr(screenplay, "identity_block_metadata", {}) or {}
+        blocks = getattr(screenplay, "identity_blocks", {}) or {}
+        outline = getattr(screenplay, "story_outline", None) or {}
+        outline_chars = {
+            (c.get("name") or "").strip().upper(): c
+            for c in (outline.get("characters", []) or [])
+            if isinstance(c, dict) and c.get("name")
+        }
+
+        # Build character identity corpus: everything known about each character
+        char_corpus: Dict[str, str] = {}  # CHAR_NAME -> combined text
+        for eid, m in meta.items():
+            if (m.get("type") or "").lower() not in ("character",):
+                continue
+            cname = (m.get("name") or "").strip().upper()
+            if not cname:
+                continue
+            parts = [
+                blocks.get(eid, ""),
+                m.get("user_notes", ""),
+                m.get("physical_appearance", ""),
+            ]
+            oc = outline_chars.get(cname, {})
+            parts.extend([
+                oc.get("outline", ""),
+                oc.get("growth_arc", ""),
+                oc.get("physical_appearance", ""),
+                oc.get("species", ""),
+            ])
+            char_corpus[cname] = " ".join(filter(None, parts)).lower()
+
+        if not char_corpus:
+            return content
+
+        # Scan content for each character + each extraordinary ability
+        violations: List[str] = []
+        for ability_def in self._EXTRAORDINARY_ABILITIES:
+            ability_label = ability_def["ability"]
+            id_keywords = ability_def["identity_keywords"]
+
+            for pattern in ability_def["content_patterns"]:
+                for m in pattern.finditer(content):
+                    match_text = m.group(0)
+                    # Find which character is the subject — scan backward for a CAPS name
+                    context_start = max(0, m.start() - 200)
+                    context = content[context_start:m.end()]
+                    # Find the last CAPS character name before this match
+                    char_matches = list(re.finditer(
+                        r'\b([A-Z][A-Z\s\']{2,}[A-Z])\b', context
+                    ))
+                    if not char_matches:
+                        continue
+                    closest_char = char_matches[-1].group(1).strip()
+
+                    # Check if this character has the ability established
+                    corpus = char_corpus.get(closest_char, "")
+                    if not corpus:
+                        continue
+                    ability_established = any(kw in corpus for kw in id_keywords)
+                    if ability_established:
+                        continue
+
+                    violations.append(
+                        f"{closest_char} performs '{match_text}' ({ability_label}) "
+                        f"but has no established {ability_label} ability"
+                    )
+
+        if not violations:
+            return content
+
+        if not self._adapter:
+            for v in violations:
+                _safe_print(f"  ⚠ [invented ability] {v}")
+            return content
+
+        try:
+            violations_block = "\n".join(f"- {v}" for v in violations)
+            prompt = (
+                "The scene below gives characters extraordinary abilities they don't possess.\n\n"
+                f"VIOLATIONS:\n{violations_block}\n\n"
+                "Rewrite the COMPLETE scene, removing the invented abilities. "
+                "Replace each supernatural action with a plausible mundane alternative that "
+                "achieves a similar dramatic effect. For example:\n"
+                "- Character with 'wings' swooping down → character rappelling, leaping from height, "
+                "swinging on a rope\n"
+                "- Character teleporting → character emerging from hidden passage, stepping from shadows\n\n"
+                "RULES:\n"
+                "- Fix ONLY the flagged abilities — keep everything else IDENTICAL.\n"
+                "- Preserve all character names, dialogue, paragraph structure, markup "
+                "([brackets], _underscores_, *asterisks*, (sfx)).\n"
+                "- The replacement action must be physically possible for a normal human "
+                "(or the character's established species).\n"
+                "- Output ONLY the rewritten scene starting with [1]. "
+                "Do NOT include any introductory text, explanation, or commentary.\n\n"
+                f"SCENE:\n{content}"
+            )
+
+            response = self._chat_completion(
+                messages=[
+                    {"role": "system", "content": (
+                        "You fix screenplay scenes where characters perform actions beyond "
+                        "their established abilities. Replace supernatural actions with "
+                        "plausible alternatives. Preserve all formatting and structure. "
+                        "Output only the scene text, no preamble."
+                    )},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.15,
+                max_tokens=4000,
+            )
+            fixed = (response.choices[0].message.content or "").strip()
+
+            if not fixed or len(fixed) < len(content) * 0.5:
+                return content
+
+            fixed = self._strip_ai_preamble(fixed)
+
+            _safe_print(f"  [invented ability] Fixed {len(violations)} invented ability violation(s)")
+            return fixed
+
+        except Exception as e:
+            _safe_print(f"  [invented ability] Failed: {e}")
+            return content
+
+    def _fix_held_object_continuity(self, content: str) -> str:
+        """Track what each character is holding paragraph-by-paragraph and
+        fix violations where a character uses an object they already put down
+        or grabs something they're already holding.
+
+        Uses AI to detect and fix continuity errors. Complements
+        _validate_held_object_continuity() which only returns warnings.
+        """
+        if not content or not content.strip():
+            return content
+
+        paragraphs = content.split("\n\n")
+        if len(paragraphs) < 3:
+            return content
+
+        if not self._adapter:
+            return content
+
+        try:
+            prompt = (
+                "Analyze the held-object continuity in this screenplay scene. "
+                "Track what each character is HOLDING in their hands, paragraph by paragraph.\n\n"
+                "RULES:\n"
+                "- A character picks up/grabs/draws an object → they are now holding it\n"
+                "- A character puts down/holsters/pockets/tucks/sets aside → they release it\n"
+                "- Two-handed objects (rifles, large items) occupy both hands\n"
+                "- A character CANNOT grab an object they're already holding\n"
+                "- A character CANNOT use an object they already put down (without re-grabbing)\n"
+                "- A character CANNOT freely use a new hand-held item while both hands are full\n\n"
+                "For each violation found, output:\n"
+                "VIOLATION: paragraph [N]: <description of the problem>\n"
+                "FIX: <specific text change to fix it>\n\n"
+                "If NO violations found, output exactly: NO_VIOLATIONS\n\n"
+                f"SCENE:\n{content}"
+            )
+
+            response = self._chat_completion(
+                messages=[
+                    {"role": "system", "content": (
+                        "You are a continuity checker for screenplays. Track what each "
+                        "character is physically holding in their hands across paragraphs. "
+                        "Flag only clear physical impossibilities, not stylistic choices."
+                    )},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,
+                max_tokens=800,
+            )
+            result = (response.choices[0].message.content or "").strip()
+
+            if "NO_VIOLATIONS" in result:
+                return content
+
+            # Count violations found
+            violations = re.findall(r'VIOLATION:', result)
+            if not violations:
+                return content
+
+            # Ask AI to fix the full scene with the violations identified
+            fix_prompt = (
+                f"The following held-object continuity violations were found in this scene:\n\n"
+                f"{result}\n\n"
+                f"Rewrite the COMPLETE scene, fixing ONLY the continuity violations above. "
+                f"Keep everything else IDENTICAL — same characters, dialogue, action, "
+                f"paragraph structure, markup ([brackets], *asterisks*, (sfx), _underscores_).\n"
+                f"Add brief transitional actions where needed (e.g. '*tucks* the [item] into her belt' "
+                f"or '*sets* the [item] on the table').\n"
+                f"Output ONLY the rewritten scene starting with [1]. "
+                f"Do NOT include any introductory text, explanation, or commentary.\n\n"
+                f"SCENE:\n{content}"
+            )
+
+            fix_response = self._chat_completion(
+                messages=[
+                    {"role": "system", "content": (
+                        "You fix held-object continuity errors in screenplays. "
+                        "Add only the minimal transitional actions needed. "
+                        "Preserve all formatting, names, dialogue, and structure. "
+                        "Output only the scene text, no preamble."
+                    )},
+                    {"role": "user", "content": fix_prompt}
+                ],
+                temperature=0.15,
+                max_tokens=4000,
+            )
+            fixed = (fix_response.choices[0].message.content or "").strip()
+
+            if not fixed or len(fixed) < len(content) * 0.5:
+                return content
+
+            fixed = self._strip_ai_preamble(fixed)
+
+            _safe_print(f"  [object continuity] Fixed {len(violations)} held-object violation(s)")
+            return fixed
+
+        except Exception as e:
+            _safe_print(f"  [object continuity] Failed: {e}")
+            return content
+
+    def _build_lighting_prompt(self, environment_changed: bool) -> str:
+        """Return the LIGHTING CONDITIONS prompt section.
+
+        When the environment hasn't changed, only requires a lighting update
+        if conditions have shifted (e.g. time has passed).
+        """
+        if environment_changed:
+            return (
+                "LIGHTING CONDITIONS (MANDATORY — EVERY SCENE):\n"
+                "- Every scene MUST explicitly state the lighting conditions in the environment-establishing paragraph.\n"
+                "- For EXTERIOR scenes, specify the time of day and its visual effect: dawn (soft pink/orange glow "
+                "on the horizon), early morning (pale golden light), midday (bright overhead sun, harsh shadows), "
+                "afternoon (warm angled light), golden hour (rich amber light), dusk (fading purple/orange sky), "
+                "twilight (deep blue, last traces of light), night (moonlit, starlit, or pitch darkness), overcast "
+                "(flat grey diffused light), bright sunshine (vivid, high-contrast light), stormy (dark brooding "
+                "clouds, intermittent lightning).\n"
+                "- For INTERIOR scenes, specify the source and quality of artificial or natural light: fluorescent "
+                "strip lights, warm incandescent lamps, candlelight, firelight, light filtering through windows, "
+                "neon signage, dim overhead bulbs, harsh spotlights, screens casting blue-white glow, or darkness "
+                "with specific light sources. Also state whether daylight enters through windows and its quality.\n"
+                "- Lighting MUST be described in concrete visual terms the camera can capture — never abstract or "
+                "metaphorical.\n"
+                "- If the scene changes location mid-scene, the new location's lighting MUST also be established "
+                "when the setting shifts."
+            )
+        return (
+            "LIGHTING CONDITIONS (SAME LOCATION — UPDATE ONLY IF CHANGED):\n"
+            "- The lighting was already established in the previous scene at this location.\n"
+            "- If time has passed or conditions have changed (e.g. sun has moved, lights switched "
+            "on/off, a storm has rolled in), note the change briefly in the first action paragraph.\n"
+            "- If lighting is unchanged, do NOT re-describe it. A brief reference is acceptable "
+            "(e.g. 'the fluorescent lights still *hum* overhead').\n"
+            "- If the scene changes location mid-scene, the new location's lighting MUST be fully "
+            "established when the setting shifts."
+        )
+
     def _build_chat_context(self, screenplay: Optional[Screenplay], scene: Optional[StoryScene], items: List[StoryboardItem], mentioned_character: Optional[str] = None) -> str:
         """Build a context description for chat.
         
@@ -13557,9 +16602,9 @@ SCENE MARKUP STANDARD (MANDATORY):
 - DIALOGUE: ALL dialogue MUST be enclosed in double quotes " ". Character name on own line (FULL CAPS), dialogue on the VERY NEXT line inside " " — separated by exactly ONE newline (\\n), NEVER a blank line. Example:\nHENRY\n"We're out of time."\nNever unquoted dialogue. Never put a blank line between the character name and their dialogue line.
 - SOUND EFFECTS (SFX): ALL audible events MUST use (lowercase_underscore_format). You MUST use ONLY SFX from this approved list — no others: {self._get_sfx_list_for_prompt()}. If the sound you want is not listed, substitute the closest approved alternative. NEVER use (Meanwhile), (Henry), (Tension). Convert prose sounds to SFX markup. LAYERED SFX: Primary (action-caused, max 1 per action) + Ambient (environmental, max 2 per paragraph, ambient_ prefix).
 - ACTION WORDS (WHITELIST ONLY): ALL visible physical movement MUST be wrapped in *asterisks*. You MUST use ONLY action verbs from this approved whitelist — no others: {self._get_action_verb_list_for_prompt()}. If the ideal verb is not listed, substitute the closest approved alternative (e.g. "clips" → *bump*; "nudges" → *push*). NEVER use feel, think, realize, decide, hope, fear, remember, regret. Intensity modifiers INSIDE markup: *walks (slowly)*, *slams (violently)*. Remove filler verbs: "begins to walk" → "*walks*".
-- LOCATIONS: Title Case + underlined (e.g. _City Hall_, _The Warehouse_, _Common Area_). Vehicle interiors (e.g. "the ship's Common Area", Bridge, Cockpit) are locations — use _underscores_, NOT {{braces}}. Example: "gathers in the ship's _Common Area_". Every location underlined on every mention.
-- OBJECTS (interactable only): [brackets]. Mark objects when a character DIRECTLY interacts with them. Also mark any object that is the direct target of any action verb, or that a character or their body part physically contacts (touches, strikes, bumps, knocks, brushes). Example: His elbow *bumps* the [porcelain vase] on the [entry table]. She *grabs* the [handle]. Objects not directly interacted with must NOT be bracketed. OBJECT INTERACTION EXPANSION: mark when character sits on, perches on, leans on/against, rests feet on, holds, touches, places on, or props feet on. No "chair" or "stool" without brackets when physically interacted with.
-- VEHICLES: {{braces}} — only when character drives/enters/operates. Example: {{motorcycle}}. Interior spaces (Common Area, Bridge) use _underscores_, not {{braces}}. No interaction → no markup.
+- LOCATIONS: Title Case + underlined (e.g. _City Hall_, _The Warehouse_, _Common Area_). Vehicle interiors (e.g. "the ship's Common Area", Bridge, Cockpit) are locations — use _underscores_, NOT {{braces}}. Example: "gathers in the ship's _Common Area_". Every location underlined on every mention. When a character moves to a sub-area, include the sub-area in the markup (e.g. _Laughing Skull Comedy Club Stage_ not just _Laughing Skull Comedy Club_).
+- OBJECTS: [brackets]. ALL named objects mentioned in the scene MUST be wrapped in [brackets] — whether a character interacts with them or not. Background props, set dressing, and passive objects all get [brackets]. EXCEPTION: Clothing, footwear, and accessories WORN by a character are WARDROBE — do NOT use [brackets] for them. Example: His elbow *bumps* the [porcelain vase] on the [entry table]. The [foam tombstones] line the wall. She *grabs* the [handle]. A dusty [workbench] sits in the corner.
+- VEHICLES: {{braces}} — ALL named vehicles mentioned in the scene MUST be wrapped in {{braces}}, whether a character interacts with them or not. Example: {{motorcycle}}, {{patrol car}}. Interior spaces (Common Area, Bridge) use _underscores_, not {{braces}}. NEVER wrap buildings, venues, or locations in {{braces}} — clubs, bars, restaurants, theaters, shops, houses, offices, etc. are ENVIRONMENTS (_underscored_), NOT vehicles. Casual references like "the club" or "the bar" must use plain text or _underscores_ if they refer to a place.
 
 SCREENPLAY MODE: Write only what can be seen or heard. Action-line style; no internal thoughts or metaphor. All dialogue in double quotes " ".
 
@@ -13620,6 +16665,9 @@ ENVIRONMENT ESTABLISHMENT (MANDATORY — FIRST PARAGRAPH):
 - If the scene introduces a NEW environment, provide a full sensory description.
 - If returning to a previously seen environment, a brief re-establishing line is sufficient.
 - The environment paragraph must come BEFORE any character action or dialogue.
+- SPATIAL SCALE: Establish the SIZE of the space (cramped, modest, cavernous, sprawling). If many characters act in the scene, the space MUST be large enough to accommodate them all.
+- ENTRIES AND EXITS: ALL doorways, archways, corridors, and exits that are used anywhere in the scene MUST be described in the environment paragraph. If characters block exits or escape through passages later, those features must be visually established first.
+- PRE-PLAN THE SPACE: Before writing, mentally map all actions in the scene to ensure the described environment is physically plausible for everything that happens.
 
 LIGHTING CONDITIONS (MANDATORY — EVERY SCENE):
 - The scene MUST explicitly state the lighting conditions in the environment-establishing paragraph.
@@ -13645,9 +16693,9 @@ SCENE MARKUP STANDARD (MANDATORY):
 - DIALOGUE: ALL dialogue MUST be enclosed in double quotes " ". Character name on own line (FULL CAPS), dialogue on the VERY NEXT line inside " " — separated by exactly ONE newline (\\n), NEVER a blank line. Never unquoted dialogue. Never put a blank line between the character name and their dialogue line.
 - SOUND EFFECTS (SFX): ALL audible events MUST use (lowercase_underscore_format). You MUST use ONLY SFX from this approved list — no others: {self._get_sfx_list_for_prompt()}. If the sound you want is not listed, substitute the closest approved alternative. NEVER use (Meanwhile), (Henry), (Tension). Convert prose sounds to SFX. LAYERED SFX: Primary (max 1 per action) + Ambient (max 2 per paragraph, ambient_ prefix).
 - ACTION WORDS (WHITELIST ONLY): ALL visible physical movement MUST be wrapped in *asterisks*. You MUST use ONLY action verbs from this approved whitelist — no others: {self._get_action_verb_list_for_prompt()}. If the ideal verb is not listed, substitute the closest approved alternative (e.g. "clips" → *bump*; "nudges" → *push*). NEVER use feel, think, realize, decide, hope, fear, remember. Intensity modifiers INSIDE: *walks (slowly)*, *slams (violently)*. Remove fillers: "begins to walk" → "*walks*".
-- LOCATIONS: Title Case + underlined (e.g. _City Hall_, _The Warehouse_, _Common Area_). Vehicle interiors ("the ship's Common Area", Bridge, Cockpit) are locations — use _underscores_, NOT {{braces}}. Every location underlined on every mention.
-- OBJECTS (interactable only): [brackets]. Mark objects when a character DIRECTLY interacts with them. Also mark any object that is the direct target of any action verb, or that a character or their body part physically contacts (touches, strikes, bumps, knocks, brushes). Example: His elbow *bumps* the [porcelain vase] on the [entry table]. Objects not directly interacted with must NOT be bracketed. OBJECT INTERACTION EXPANSION: mark when character sits on, perches on, leans on/against, rests feet on, holds, touches, places on, or props feet on. No unmarked chair/stool/console when physically interacted with.
-- VEHICLES: {{braces}} — only when a character drives/enters/operates. Example: {{motorcycle}}. Interior spaces use _underscores_, not {{braces}}. No interaction → no markup.
+- LOCATIONS: Title Case + underlined (e.g. _City Hall_, _The Warehouse_, _Common Area_). Vehicle interiors ("the ship's Common Area", Bridge, Cockpit) are locations — use _underscores_, NOT {{braces}}. Every location underlined on every mention. When a character moves to a sub-area, include the sub-area in the markup (e.g. _Laughing Skull Comedy Club Stage_ not just _Laughing Skull Comedy Club_).
+- OBJECTS: [brackets]. ALL named objects mentioned in the scene MUST be wrapped in [brackets] — whether a character interacts with them or not. Background props, set dressing, and passive objects all get [brackets]. Example: His elbow *bumps* the [porcelain vase] on the [entry table]. The [foam tombstones] line the wall. A dusty [workbench] sits in the corner.
+- VEHICLES: {{braces}} — ALL named vehicles mentioned in the scene MUST be wrapped in {{braces}}, whether a character interacts with them or not. Example: {{motorcycle}}, {{patrol car}}. Interior spaces use _underscores_, not {{braces}}. NEVER wrap buildings, venues, or locations in {{braces}} — clubs, bars, restaurants, theaters, shops, houses, offices, etc. are ENVIRONMENTS (_underscored_), NOT vehicles. Casual references like "the club" or "the bar" must use plain text or _underscores_ if they refer to a place.
 
 SCREENPLAY MODE: Write only what can be seen or heard. Action-line style; no internal thoughts or metaphor. All dialogue in double quotes " ".
 
@@ -13669,6 +16717,8 @@ Return ONLY the new scene content, no additional formatting or explanations.
             new_content = response.choices[0].message.content.strip()
             # Auto-correct physical-interaction object markup (sit/lean/perch/rest/prop + unmarked noun → [noun])
             new_content = self._fix_physical_interaction_object_markup(new_content)
+            # ── DUPLICATE-WORD BRACKET CLEANUP ──
+            new_content = self._fix_duplicate_word_before_bracket(new_content)
             # ── SENTENCE INTEGRITY REPAIR ──
             new_content, _ = self._repair_sentence_integrity(new_content)
             # ── CINEMATIC GRAMMAR PASS ──
@@ -13840,6 +16890,8 @@ Return ONLY the new scene content, no additional formatting or explanations.
             
             # Ensure final content has physical-interaction object markup applied (covers reconstructed paragraph-edit result)
             new_content = self._fix_physical_interaction_object_markup(new_content)
+            # ── DUPLICATE-WORD BRACKET CLEANUP ──
+            new_content = self._fix_duplicate_word_before_bracket(new_content)
             # ── SENTENCE INTEGRITY REPAIR ──
             new_content, _ = self._repair_sentence_integrity(new_content)
             # ── CINEMATIC GRAMMAR PASS ──
@@ -13852,24 +16904,57 @@ Return ONLY the new scene content, no additional formatting or explanations.
             screenplay_style_passed, screenplay_style_issues = self._validate_screenplay_style(new_content)
             if not screenplay_style_passed and screenplay_style_issues:
                 for issue in screenplay_style_issues:
-                    print(f"Screenplay style (regenerate): {issue}")
+                    _safe_print(f"Screenplay style (regenerate): {issue}")
             # HELD-OBJECT CONTINUITY VALIDATION (regenerate path)
             held_object_warnings = self._validate_held_object_continuity(new_content)
             if held_object_warnings:
                 for hw in held_object_warnings:
-                    print(f"Held-object continuity (regenerate): {hw}")
+                    _safe_print(f"Held-object continuity (regenerate): {hw}")
                 if scene.metadata is None:
                     scene.metadata = {}
                 existing_hw = scene.metadata.get("held_object_warnings", [])
                 scene.metadata["held_object_warnings"] = existing_hw + held_object_warnings
-            # Enforce full character names throughout regenerated scene content
+            # Fix location/city names written in ALL-CAPS
+            new_content = self._fix_location_names_as_characters(new_content, screenplay)
+            # Enforce full character and entity names throughout regenerated scene content
             new_content = self._enforce_full_character_names(new_content, screenplay)
+            new_content = self._enforce_full_entity_markup_names(new_content, screenplay)
+            # Auto-split paragraph 1 if it mixes environment with character content
+            regen_env_changed = True
+            if previous_scenes:
+                prev_scene = previous_scenes[-1]
+                prev_env_id = getattr(prev_scene, "environment_id", None)
+                cur_env_id = getattr(scene, "environment_id", None)
+                if prev_env_id and cur_env_id and prev_env_id == cur_env_id:
+                    regen_env_changed = False
+            new_content = self._enforce_environment_first_paragraph(
+                new_content, regen_env_changed, screenplay
+            )
+            new_content = self._validate_spatial_completeness(
+                new_content, regen_env_changed
+            )
+            new_content = self._validate_object_establishment(
+                new_content, regen_env_changed
+            )
+            new_content = self._validate_genre_compliance(new_content, screenplay)
+            new_content = self._validate_no_invented_abilities(new_content, screenplay)
+            _scene_desc = getattr(scene, "description", "") or ""
+            new_content = self._validate_no_invented_backstory(new_content, _scene_desc)
+            new_content = self._fix_held_object_continuity(new_content)
+            new_content = self._sanitize_paragraph_tags(new_content)
             # Extract and store consistency digest for continuity in later prompts
             digest = self._extract_consistency_digest(new_content, scene.title, screenplay=screenplay)
             if digest and scene:
                 if scene.metadata is None:
                     scene.metadata = {}
                 scene.metadata["consistency_digest"] = digest
+            # Cross-scene continuity check (warnings only)
+            continuity_warnings = self._validate_cross_scene_continuity(
+                new_content, scene, screenplay
+            )
+            if continuity_warnings:
+                for _cw in continuity_warnings:
+                    _safe_print(f"  ⚠ {_cw}")
             return new_content
         except Exception as e:
             raise Exception(f"Failed to regenerate scene content: {str(e)}")
@@ -13910,6 +16995,7 @@ Regenerate these items incorporating the user's request. Return a JSON array wit
             "duration": 5,
             "storyline": "...",
             "image_prompt": "...",
+            "composition_notes": "Entity positions, facing directions, spatial relationships.",
             "prompt": "...",
             "dialogue": "...",
             "scene_type": "action",
@@ -13960,6 +17046,17 @@ Return ONLY valid JSON. No markdown, no explanations.
                     scene_type=scene_type,
                     camera_notes=item_data.get("camera_notes", "")
                 )
+                new_item.composition_notes = (item_data.get("composition_notes", "") or "").strip()
+                
+                # Dialogue duration floor
+                dialogue_raw = (new_item.dialogue or "").strip()
+                if dialogue_raw:
+                    d_text = re.sub(r'^[A-Z][A-Z\s]+:\s*', '', dialogue_raw)
+                    d_text = re.sub(r'\([^)]*\)', '', d_text).strip()
+                    wc = len(d_text.split())
+                    min_dur = max(4, round(wc / 2.3 + 1.5))
+                    if new_item.duration < min_dur:
+                        new_item.duration = min(30, min_dur)
                 
                 # Calculate render cost
                 render_cost, cost_factors = self._calculate_render_cost(new_item)
@@ -13975,26 +17072,79 @@ Return ONLY valid JSON. No markdown, no explanations.
         except Exception as e:
             raise Exception(f"Failed to regenerate storyboard items: {str(e)}")
     
-    def generate_scene_content(self, scene_description: str, word_count: int, 
-                              screenplay: Screenplay, scene: StoryScene) -> str:
+    @staticmethod
+    def _derive_scene_params(duration_seconds: int, compression_strategy: str = "beat_by_beat",
+                             environment_changed: bool = True) -> dict:
+        """Derive paragraph count and word count from a scene duration.
+
+        Args:
+            duration_seconds: Target scene length in seconds.
+            compression_strategy: One of 'montage', 'beat_by_beat', 'atmospheric_hold'.
+            environment_changed: Whether the environment differs from the previous scene.
+                When False, no dedicated environment paragraph is needed.
+
+        Returns:
+            dict with keys 'paragraphs', 'word_count', 'seconds_per_paragraph'.
+        """
+        duration_seconds = max(10, min(300, duration_seconds))
+
+        if compression_strategy == "montage":
+            spp = 12  # seconds per paragraph — fast cutting
+        elif compression_strategy == "atmospheric_hold":
+            spp = 18  # long, lingering shots
+        else:
+            spp = 8   # beat-by-beat default
+
+        paragraphs = max(2, round(duration_seconds / spp))
+
+        if not environment_changed and paragraphs > 2:
+            # No standalone environment paragraph needed; the brief inline
+            # reference doesn't justify an extra paragraph.
+            pass  # paragraph count stays as-is (action-focused)
+
+        words_per_paragraph = 50
+        word_count = paragraphs * words_per_paragraph
+
+        return {
+            "paragraphs": paragraphs,
+            "word_count": word_count,
+            "seconds_per_paragraph": spp,
+        }
+
+    def generate_scene_content(self, scene_description: str, screenplay: Screenplay,
+                               scene: StoryScene, *, word_count: int = 0,
+                               target_duration: int = 0) -> str:
         """
         Generate full scene content based on scene description.
-        
+
         Source-of-truth hierarchy: (1) Premise, (2) Story Structure, (3) Scene Content, (4) Storyboard.
         Lower layers must not contradict higher layers. Scene content is an EXPANSION of the scene summary only.
-        
+
+        The caller should supply *target_duration* (seconds).  If only
+        *word_count* is supplied (legacy call), it is converted into an
+        approximate duration for backwards compatibility.
+
         Args:
             scene_description: The scene description (3-5 sentences) — CANON, must be followed exactly
-            word_count: Target word count (200, 400, or 600)
             screenplay: The screenplay object for context
             scene: The scene object for context
-        
+            word_count: (deprecated) Target word count — kept for backwards compatibility
+            target_duration: Target scene duration in seconds (preferred)
+
         Returns:
             Tuple of (generated scene content as string, list of drift warnings if any)
         """
         if not self._adapter:
             raise Exception("AI client not initialized. Please configure your API key or local AI server in settings.")
-        
+
+        # Resolve duration: prefer explicit target_duration, fall back to word_count conversion
+        if target_duration > 0:
+            _duration = target_duration
+        elif word_count > 0:
+            _duration = max(30, word_count // 5)  # rough ~5 words/s pacing
+        else:
+            _duration = getattr(scene, "estimated_duration", 60) or 60
+
         # Build context from screenplay
         genres = ", ".join(screenplay.genre) if screenplay.genre else "General"
         atmosphere = screenplay.atmosphere or "Neutral"
@@ -14027,12 +17177,17 @@ Return ONLY valid JSON. No markdown, no explanations.
                         
                         all_character_names.append(char_name)
                         
-                        # Mark primary characters (those in character_focus) and minor characters
                         is_primary = char_name in primary_characters
+                        has_outline = bool((char.get("outline") or "").strip())
+                        has_growth = bool((char.get("growth_arc") or "").strip())
                         if is_primary:
                             role_marker = " [PRIMARY - MUST FEATURE IN THIS SCENE]"
                         elif char_role == "minor":
                             role_marker = " [MINOR - may appear if named in scene summary or fits naturally]"
+                        elif has_outline and has_growth:
+                            role_marker = " [MAIN CHARACTER - include if scene context allows]"
+                        elif has_outline or has_growth:
+                            role_marker = " [SUPPORTING - include if scene context allows]"
                         else:
                             role_marker = ""
                         
@@ -14043,6 +17198,23 @@ Return ONLY valid JSON. No markdown, no explanations.
                         all_characters_info += f"\n{char_name}{role_marker}:\n"
                         if species_note:
                             all_characters_info += species_note
+                        # Extract gender/pronouns for ALL characters to prevent misgendering
+                        _gender_source = char_phys
+                        if not _gender_source:
+                            _ib_key = f"character:{char_name}".lower()
+                            _ib_eid = screenplay.identity_block_ids.get(_ib_key)
+                            if _ib_eid:
+                                _ib_meta = screenplay.identity_block_metadata.get(_ib_eid, {})
+                                _ib_block = screenplay.identity_blocks.get(_ib_eid, "")
+                                _gender_source = _ib_meta.get("physical_appearance") or _ib_block or ""
+                        if _gender_source:
+                            _phys_lower = _gender_source.strip().lower()
+                            if any(kw in _phys_lower for kw in ("female", "woman", " her ", " she ")):
+                                all_characters_info += "  Pronouns: she/her\n"
+                            elif any(kw in _phys_lower for kw in ("male", " man ", " his ", " he ")):
+                                all_characters_info += "  Pronouns: he/him\n"
+                            elif "non-binary" in _phys_lower or "nonbinary" in _phys_lower or "they/them" in _phys_lower:
+                                all_characters_info += "  Pronouns: they/them\n"
                         if char_outline:
                             all_characters_info += f"  Outline: {char_outline}\n"
                         if char_growth:
@@ -14054,23 +17226,26 @@ Return ONLY valid JSON. No markdown, no explanations.
                 outline_char_names = {str(c.get("name", "")).strip().upper() for c in (characters or []) if isinstance(c, dict) and c.get("name")}
                 for cf in (primary_characters or []):
                     if cf and str(cf).strip().upper() not in outline_char_names:
-                        all_characters_info += f"\n{cf.strip()} [PRIMARY - MUST FEATURE IN THIS SCENE]:\n  (Character from character_focus—use this EXACT name.)"
-                if primary_characters:
-                    all_characters_info += "\nCHARACTER RULES:"
-                    all_characters_info += "\n- Characters marked [PRIMARY] MUST appear in this scene."
-                    all_characters_info += "\n- Characters marked [MINOR] who are named in the scene summary MUST appear using their EXACT name."
-                    all_characters_info += "\n- You MAY introduce NEW minor characters if they serve the story naturally (e.g. a shopkeeper, a bystander, a receptionist). Give them a proper name in FULL CAPS."
-                    all_characters_info += "\n- NEVER rename, replace, or substitute any existing character. Use EXACT names (e.g. MARSHAL ELIAS CROSS, not MARSHAL CROSS or MARSHAL SMITH). NEVER substitute similar names (e.g. TIMMONS for TIMOTHY; LUCA for LUCIEN). NEVER add titles or ranks (Captain, Detective, Dr., etc.) to a character name unless that title is already part of the registered name."
-                    all_characters_info += "\n- NEW minor characters must have COMPLETELY DIFFERENT names from existing characters. NEVER create a character whose first name, last name, title, or nickname overlaps with ANY existing character (e.g. if SIR REGINALD 'REG' BARTLETT exists, do NOT create SIR REGINALD FITZSIMMONS or BARTLETT anything or REGINALD anything). No two characters may share any name part."
-                    all_characters_info += "\n- NAME UNIQUENESS: No two characters in the scene may share any part of their name. Check every word in the new name against every word in every existing character name. If ANY word matches, choose a completely different name."
-                else:
-                    all_characters_info += "\nCHARACTER RULES:"
-                    all_characters_info += "\n- Characters marked [PRIMARY] must be featured in this scene."
-                    all_characters_info += "\n- Other characters from the list may appear naturally if they fit the scene's context."
-                    all_characters_info += "\n- You MAY introduce NEW minor characters if they serve the story naturally. Give them a proper name in FULL CAPS."
-                    all_characters_info += "\n- NEVER rename or substitute any existing character. NEVER add titles or ranks (Captain, Detective, Dr., etc.) to names."
-                    all_characters_info += "\n- NEW minor characters must have COMPLETELY DIFFERENT names from existing characters. No two characters may share any part of their name (first name, last name, title, or nickname)."
+                        _cf_pronoun_hint = ""
+                        _cf_key = f"character:{cf.strip()}".lower()
+                        _cf_eid = screenplay.identity_block_ids.get(_cf_key)
+                        if _cf_eid:
+                            _cf_block = (screenplay.identity_blocks.get(_cf_eid, "") or "").lower()
+                            if any(kw in _cf_block for kw in ("female", "woman")):
+                                _cf_pronoun_hint = "\n  Pronouns: she/her"
+                            elif any(kw in _cf_block for kw in ("male", " man ")):
+                                _cf_pronoun_hint = "\n  Pronouns: he/him"
+                        all_characters_info += f"\n{cf.strip()} [PRIMARY - MUST FEATURE IN THIS SCENE]:\n  (Character from character_focus—use this EXACT name.){_cf_pronoun_hint}"
+                all_characters_info += "\nCHARACTER RULES:"
+                all_characters_info += "\n- Characters marked [PRIMARY] MUST appear in this scene."
+                all_characters_info += "\n- Characters marked [MAIN CHARACTER] or [SUPPORTING] SHOULD appear if the scene context allows — they have outline/growth arcs that need screen time to develop."
+                all_characters_info += "\n- Characters marked [MINOR] who are named in the scene summary MUST appear using their EXACT name."
+                all_characters_info += "\n- You MAY introduce NEW minor characters if they serve the story naturally (e.g. a shopkeeper, a bystander, a receptionist). Give them a proper name in FULL CAPS."
+                all_characters_info += "\n- NEVER rename, replace, or substitute any existing character. Use EXACT names (e.g. MARSHAL ELIAS CROSS, not MARSHAL CROSS or MARSHAL SMITH). NEVER substitute similar names (e.g. TIMMONS for TIMOTHY; LUCA for LUCIEN). NEVER add titles or ranks (Captain, Detective, Dr., etc.) to a character name unless that title is already part of the registered name."
+                all_characters_info += "\n- NEW minor characters must have COMPLETELY DIFFERENT names from existing characters. NEVER create a character whose first name, last name, title, or nickname overlaps with ANY existing character (e.g. if SIR REGINALD 'REG' BARTLETT exists, do NOT create SIR REGINALD FITZSIMMONS or BARTLETT anything or REGINALD anything). No two characters may share any name part."
+                all_characters_info += "\n- NAME UNIQUENESS: No two characters in the scene may share any part of their name. Check every word in the new name against every word in every existing character name. If ANY word matches, choose a completely different name."
                 all_characters_info += "\nOWNERSHIP RULE (STRICT): If a character is established as the owner of a location (_underlined_), vehicle ({{braces}}), or object ([brackets]) in their outline or growth arc, this MUST be strictly enforced. Only the owner may use, operate, or possess that entity unless ownership has been explicitly transferred in the story. Do NOT have other characters use an owned vehicle, enter an owned location as if they own it, or take an owned object without the owner's involvement or explicit transfer."
+                all_characters_info += "\nPRONOUN RULE (MANDATORY): If a character's Pronouns are listed above, you MUST use ONLY those pronouns when referring to that character. she/her characters use 'she', 'her', 'hers'. he/him characters use 'he', 'him', 'his'. they/them characters use 'they', 'them', 'their'. NEVER use incorrect pronouns for any character."
                 all_characters_info += "\nHELD-OBJECT CONTINUITY (MANDATORY): Track what each character is HOLDING in their hands throughout the scene. A character holding one object CANNOT use another hand-held object unless they first put down, pocket, holster, tuck, or set aside the current one. Write the transition explicitly (e.g. *tucks* the [detector] under her arm, then *pulls* out her [phone]). Two-handed objects must be fully set down first. Small one-handed items (phone, key, flashlight) may be held simultaneously with one other small item if realistic."
         
         # Build canonical names list (characters + entities from scene) - MUST be used exactly, never altered
@@ -14141,7 +17316,58 @@ Return ONLY valid JSON. No markdown, no explanations.
         # Get previous scenes for continuity
         previous_scenes = self._get_previous_scenes(screenplay, scene)
         previous_scenes_context = self._build_previous_scenes_context(previous_scenes) if previous_scenes else ""
-        
+
+        # Detect whether the environment changed from the immediately preceding scene
+        environment_changed = True  # default: treat as new environment
+        prev_env_name = ""
+        if previous_scenes:
+            prev_scene = previous_scenes[-1]  # most recent
+            prev_env_id = getattr(prev_scene, "environment_id", None)
+            cur_env_id = getattr(scene, "environment_id", None)
+
+            if prev_env_id and cur_env_id and prev_env_id == cur_env_id:
+                # IDs match — but the scene description may have been edited to a
+                # different location since the last generation.  Cross-check by
+                # comparing the primary _underscored_ location in each description.
+                cur_desc_locs = self._extract_locations_from_text(
+                    scene_description, max_locations=3
+                )
+                prev_desc_locs = self._extract_locations_from_text(
+                    getattr(prev_scene, "description", "") or "", max_locations=3
+                )
+                cur_primary = cur_desc_locs[0].lower().strip() if cur_desc_locs else ""
+                prev_primary = prev_desc_locs[0].lower().strip() if prev_desc_locs else ""
+                if cur_primary and prev_primary and cur_primary != prev_primary:
+                    # Description says different location — override the stale ID match
+                    environment_changed = True
+                else:
+                    environment_changed = False
+                    env_meta = screenplay.identity_block_metadata.get(cur_env_id, {})
+                    prev_env_name = env_meta.get("name", "") or ""
+            elif prev_env_id and not cur_env_id:
+                # Current scene has no environment_id yet (first generation) —
+                # still compare descriptions to decide if continuity applies.
+                cur_desc_locs = self._extract_locations_from_text(
+                    scene_description, max_locations=3
+                )
+                prev_env_meta = screenplay.identity_block_metadata.get(prev_env_id, {})
+                prev_env_nm = (prev_env_meta.get("name", "") or "").strip().lower()
+                prev_desc_locs = self._extract_locations_from_text(
+                    getattr(prev_scene, "description", "") or "", max_locations=3
+                )
+                cur_primary = cur_desc_locs[0].lower().strip() if cur_desc_locs else ""
+                prev_primary = prev_desc_locs[0].lower().strip() if prev_desc_locs else ""
+                # Match against environment name OR primary description location
+                if cur_primary and (cur_primary == prev_env_nm or cur_primary == prev_primary):
+                    environment_changed = False
+                    prev_env_name = prev_env_meta.get("name", "") or ""
+
+        # Derive paragraph count and word count from duration + compression strategy
+        compression = getattr(scene, "compression_strategy", "beat_by_beat") or "beat_by_beat"
+        scene_params = self._derive_scene_params(_duration, compression, environment_changed)
+        target_paragraphs = scene_params["paragraphs"]
+        word_count = scene_params["word_count"]
+
         # Presence validation: extract present vs referenced-only entities from summary
         allowed_present, referenced_only = self._extract_allowed_entities_from_summary(scene_description)
         present_list_str = ", ".join(allowed_present) if allowed_present else "(all entities mentioned in summary may appear visually unless listed below as REFERENCED ONLY)"
@@ -14261,6 +17487,69 @@ PREMISE (CANON — DO NOT CHANGE):
                 "- Character wardrobe MUST be described — do NOT skip this."
             )
 
+        # ── Build established environment descriptions for the prompt ──
+        # Collects identity-block / user_notes for every known environment so
+        # the AI stays physically consistent with the established world.
+        _env_parts = []
+        _cur_env_id = getattr(scene, "environment_id", None)
+        _active_env_id = _cur_env_id  # may be overridden below for continuity
+        if not _active_env_id and not environment_changed and previous_scenes:
+            _active_env_id = getattr(previous_scenes[-1], "environment_id", None)
+        for _eid, _emeta in (screenplay.identity_block_metadata or {}).items():
+            if ((_emeta or {}).get("type") or "").lower() != "environment":
+                continue
+            _ename = (_emeta.get("name") or "").strip()
+            if not _ename:
+                continue
+            _edesc = (_emeta.get("identity_block") or "").strip()
+            if not _edesc:
+                _edesc = (_emeta.get("user_notes") or "").strip()
+            if not _edesc:
+                continue
+            _is_active = (_eid == _active_env_id) if _active_env_id else False
+            _env_parts.append((_ename, _edesc, _is_active))
+        established_env_section = ""
+        if _env_parts:
+            _lines = [
+                "ESTABLISHED ENVIRONMENTS (MANDATORY — PHYSICAL REFERENCE):",
+                "The environments below have been established in this story. "
+                "Scene content MUST be physically consistent with these descriptions.",
+            ]
+            for _ename, _edesc, _is_active in _env_parts:
+                _label = "  [CURRENT SCENE LOCATION]" if _is_active else ""
+                _lines.append(f"\n_{_ename}_{_label}:\n{_edesc}")
+            established_env_section = "\n".join(_lines)
+
+        # Build group entity context for the prompt
+        _group_parts = []
+        for _eid, _gmeta in (screenplay.identity_block_metadata or {}).items():
+            if ((_gmeta or {}).get("type") or "").lower() != "group":
+                continue
+            _gname = (_gmeta.get("name") or "").strip()
+            if not _gname:
+                continue
+            _gdesc = (_gmeta.get("identity_block") or "").strip()
+            if not _gdesc:
+                _gdesc = (_gmeta.get("user_notes") or "").strip()
+            _gcount = _gmeta.get("member_count", 3)
+            _gformation = _gmeta.get("formation", "scattered")
+            _gindividuality = _gmeta.get("individuality", "identical")
+            _group_parts.append((_gname, _gdesc, _gcount, _gformation, _gindividuality))
+        group_entity_section = ""
+        if _group_parts:
+            _glines = [
+                "ESTABLISHED GROUPS (collective entities — NOT individual characters):",
+                "Groups below are collective entities. Use their name in FULL CAPS like characters.",
+                "Group members share the same visual identity. Use the group name, not individual member names.",
+            ]
+            for _gname, _gdesc, _gcount, _gformation, _gindiv in _group_parts:
+                _glines.append(
+                    f"\n{_gname} ({_gcount} members, {_gformation} formation, {_gindiv}):"
+                )
+                if _gdesc:
+                    _glines.append(f"  {_gdesc}")
+            group_entity_section = "\n".join(_glines)
+
         prompt = f"""You are a professional screenwriter. Write a full, detailed scene based on the following scene description.
 
 Title: {title}
@@ -14274,12 +17563,16 @@ Plot Point: {scene.plot_point if scene.plot_point else "None"}
 
 {all_characters_info}{new_characters_note}
 {brand_context_section}{ad_guidance_section}
-{previous_scenes_context}
+{previous_scenes_context}{self._build_series_context_for_prompt(screenplay)}
 {premise_section}
 SOURCE OF TRUTH: Hierarchy is (1) Premise, (2) Story Structure, (3) Scene Content, (4) Storyboard. Lower layers must not contradict higher layers. If there is a conflict, the higher layer wins and content must be regenerated.
 
 CANON SCENE SUMMARY — MUST BE FOLLOWED EXACTLY:
 {scene_description}
+
+{established_env_section}
+
+{group_entity_section}
 
 CANONICAL NAMES (MANDATORY — USE EXACTLY, NEVER ALTER):
 You MUST use these exact character and entity names. Do NOT substitute, abbreviate, shorten, or creatively alter them.
@@ -14304,6 +17597,14 @@ SCENE SCOPE — CURRENT MOMENT ONLY:
 - You may ONLY describe: actions occurring in the present scene; characters physically present; information the characters currently know.
 - You MUST NOT: show future outcomes; visualize targets before they are encountered; depict states that occur in later scenes.
 
+DIALOGUE CONTENT — NO INVENTED BACKSTORY OR LORE (MANDATORY):
+- Dialogue MUST ONLY reference events, places, history, and relationships that are established in the Premise, Story Structure, previous scene content, or this scene's canon summary.
+- Do NOT invent past events, historical incidents, prior encounters, or off-screen backstory through dialogue (e.g. do NOT have a character reference a fire, battle, theft, or betrayal at a location that was never established in the story).
+- Do NOT invent new location names, organization names, or proper nouns inside dialogue that are not in the canon.
+- If the scene summary describes an event (e.g. "scrolls burn around them"), that event happens IN THIS SCENE as part of the current action. Do NOT reinterpret it as a reference to a past event at a different location or invent a separate historical event to explain it.
+- Dialogue may express character emotion, intent, demands, threats, and reactions to the CURRENT scene — but it must not introduce new worldbuilding, lore, or narrative history that is not established in the Premise or Story Structure.
+- Characters may speak about what is happening NOW and what is visually present. They may reference established canon only.
+
 TEMPORAL RULES (no future-state visualization):
 - Do NOT describe events, visuals, or states that occur after this scene.
 - Do NOT show the target of a plan unless the summary explicitly says they are present.
@@ -14323,6 +17624,7 @@ RULES — YOU ARE NOT ALLOWED TO:
 - Change tone or outcome
 - Add characters not referenced in the canon summary
 - Add new story direction
+- Invent backstory, history, or lore — not in action lines AND not in dialogue. If it is not in the Premise, Story Structure, or scene summary, it does not exist in this story.
 
 YOU MAY ONLY:
 - Expand the summary descriptively
@@ -14330,27 +17632,35 @@ YOU MAY ONLY:
 - Add atmosphere and pacing
 
 RESTRICTIONS:
-- Do NOT invent new story elements.
+- Do NOT invent new story elements — this includes inventing history, backstory, or off-screen events through dialogue.
 - Do NOT change the sequence of events.
 - Each paragraph must map directly to a moment implied by the summary.
 - The scene content is an EXPANSION of the summary, not a reinterpretation.
+- If the summary describes a cause (e.g. fire, collapse, attack), depict it arising naturally from the current scene's action. Do NOT invent an unrelated prior cause or external origin for it.
 
-ENVIRONMENT ESTABLISHMENT (MANDATORY — FIRST PARAGRAPH):
-- The FIRST paragraph of every scene MUST establish the environment/location.
-- Describe the setting: architecture, surfaces, lighting, atmosphere, key visual features.
-- Use _underscored_ location markup on every mention (e.g. _Foyer_, _Blackwood Manor_).
-- If the scene introduces a NEW environment not seen in previous scenes, the first paragraph must provide a full sensory description: what the space looks like, its condition, lighting, textures, and mood.
-- If the scene takes place in a previously established environment, a brief re-establishing line is sufficient.
-- The environment paragraph must come BEFORE any character action or dialogue.
+{self._build_environment_establishment_prompt(environment_changed, prev_env_name)}
 
-LIGHTING CONDITIONS (MANDATORY — EVERY SCENE):
-- Every scene MUST explicitly state the lighting conditions in the environment-establishing paragraph.
-- For EXTERIOR scenes, specify the time of day and its visual effect: dawn (soft pink/orange glow on the horizon), early morning (pale golden light), midday (bright overhead sun, harsh shadows), afternoon (warm angled light), golden hour (rich amber light), dusk (fading purple/orange sky), twilight (deep blue, last traces of light), night (moonlit, starlit, or pitch darkness), overcast (flat grey diffused light), bright sunshine (vivid, high-contrast light), stormy (dark brooding clouds, intermittent lightning).
-- For INTERIOR scenes, specify the source and quality of artificial or natural light: fluorescent strip lights, warm incandescent lamps, candlelight, firelight, light filtering through windows, neon signage, dim overhead bulbs, harsh spotlights, screens casting blue-white glow, or darkness with specific light sources. Also state whether daylight enters through windows and its quality.
-- Lighting MUST be described in concrete visual terms the camera can capture — never abstract or metaphorical.
-- If the scene changes location mid-scene, the new location's lighting MUST also be established when the setting shifts.
+SPATIAL CONSISTENCY (MANDATORY — DO NOT INVENT PHYSICAL SPACES):
+- The scene MUST take place ONLY in the location(s) described in the scene summary and established environment descriptions above.
+- Do NOT add rooms, floors, levels, wings, balconies, outdoor areas, cliff faces, rooftops, basements, upper storeys, or any other physical spaces that are not described in the established environment or the scene summary.
+- Do NOT relocate the action to a different area mid-scene unless the scene summary explicitly says the characters move to a new location.
+- If a fight, chase, or action sequence occurs, it MUST stay within the physical boundaries of the established environment. Characters cannot crash through walls into new rooms that don't exist, ascend to floors the building doesn't have, or end up on geographical features (cliffs, rooftops, ledges) that were never described.
+- "Expanding descriptively" means adding sensory detail to the EXISTING space (textures, sounds, smells, lighting shifts, damage to surroundings) — it does NOT mean inventing new areas or architectural features.
+
+{self._build_lighting_prompt(environment_changed)}
 
 {wardrobe_instruction_block}
+
+GROUP ENTITIES (MANDATORY IF GROUPS ARE PRESENT):
+- Group entities (e.g. IMPERIAL SOLDIERS, CITY GUARDS) are collective entities with shared visual identity.
+- Write group names in FULL CAPS like individual characters (e.g. IMPERIAL SOLDIERS *burst* through).
+- On their FIRST appearance, describe their shared uniform/armor/appearance in detail.
+- Use the group name for collective actions ("the IMPERIAL SOLDIERS fan out").
+- Individual members should NOT be given unique names — refer to them by group name + role (e.g. "an IMPERIAL SOLDIERS soldier" or "the lead IMPERIAL SOLDIERS soldier").
+- INDIVIDUALITY SETTING — each group above lists its individuality mode:
+  * "identical" = all members are clones/robots/duplicates — same face, body, height.
+  * "slight_variation" = same uniform but DIFFERENT faces, skin tones, builds, heights. Describe visible physical diversity among members (e.g. "a broad-shouldered soldier", "a lean, dark-skinned soldier").
+  * "distinct" = shared faction colours but varied gear and body types. Describe personal differences in equipment and appearance.
 
 OBJECT AND VEHICLE DESCRIPTIONS (MANDATORY — FIRST MENTION):
 - The FIRST time an object [brackets] or vehicle {{braces}} appears in a scene, include a brief visual description.
@@ -14360,6 +17670,7 @@ OBJECT AND VEHICLE DESCRIPTIONS (MANDATORY — FIRST MENTION):
 - Example (vehicle): The {{Interceptor}}, a battered matte-black muscle car with cracked headlights and rust creeping along the wheel arches, *idles* at the kerb.
 - If an object or vehicle was fully described in a previous scene, do NOT repeat the full description — reference it by name/markup only. If its state has changed (damaged, modified), describe only the change.
 - This is essential for generating identity blocks. Every object and vehicle MUST have a visual description on first mention.
+- CLOTHING IS NOT AN OBJECT: Clothing, footwear, and accessories WORN by a character (e.g. blazer, sneakers, dress, hat, gloves, armour) are WARDROBE, not objects. Do NOT wrap them in [brackets]. Describe wardrobe as plain text in the character's first appearance. Only items that exist independently of the character (props, tools, devices, furniture, set dressing) use [brackets].
 
 PARAGRAPH STRUCTURE (REQUIRED FOR STORYBOARD DECOMPOSITION):
 - Write in discrete paragraphs. Use double newlines between paragraphs.
@@ -14388,12 +17699,28 @@ HELD-OBJECT CONTINUITY (MANDATORY — PHYSICAL LOGIC):
 - If a character puts an object down, they must *pick up* or *grab* it again before using it later.
 - This applies within a single scene — every paragraph must be physically consistent with the previous one.
 
+PHYSICAL ACCESS AND ZONE LOGIC (MANDATORY — PARAGRAPH-TO-PARAGRAPH):
+- Track WHERE each character currently is (inside/outside, which room, which area) paragraph by paragraph.
+- A character can ONLY interact with surfaces, objects, and features that are physically reachable from their current zone:
+  - OUTSIDE: can touch exterior walls, ground, snow, vehicles in the yard, exterior doors/windows. CANNOT touch interior floors, interior walls, furniture, or anything inside a building.
+  - INSIDE: can touch interior floors, walls, furniture, fixtures. CANNOT touch outdoor ground, exterior foundation, or yard-level features.
+  - Different rooms/areas within a building are separate zones — a character in the kitchen cannot reach a bedroom shelf.
+- If a character needs to interact with something in a DIFFERENT zone, you MUST first write an explicit transition action: *walks* through the door, *steps* inside, *climbs* through the window, *exits* onto the porch, etc. The transition MUST happen BEFORE the interaction, either earlier in the same paragraph or in a preceding paragraph.
+- NEVER have a character interact with an interior feature while positioned outside (e.g. probing floorboard seams from outside a cabin's foundation) or vice versa. If you find yourself writing such an interaction, insert the missing transition first.
+- When a character changes zone, state it clearly so the reader (and the video pipeline) knows the camera has moved.
+
 SCREENPLAY MODE (MANDATORY — scene content must read like a screenplay, NOT novel prose):
 - Write only what can be SEEN or HEARD. No internal thoughts, no metaphorical language, no abstract emotion. If the camera cannot capture it, do not write it.
 - ACTION LINE STYLE: Short, direct sentences. One action per sentence when possible. Focus on physical movement and interaction.
 - Examples — Correct: [CHARACTER_NAME] opens the [door]. He steps into [LOCATION_FROM_SCENE]. The floorboards (crack). Incorrect: [CHARACTER] hesitates, feeling the weight of his past. Incorrect: The floorboards CRACK (FULL CAPS are only for character names). Incorrect: "protocol: TERMINAL SANCTION" (FULL CAPS used for a non-character label — write as "protocol: Terminal Sanction"). Use the actual character and location names from THIS scene's summary.
 - CHARACTER PRESENCE: Every character present must be named in FULL CAPS and appear in action or dialogue. No implied presence.
 - DIALOGUE FORMAT (MANDATORY): All spoken dialogue MUST be enclosed in double quotes " ". Character name on its own line (FULL CAPS), dialogue on the VERY NEXT line inside " " — separated by exactly ONE newline, NEVER a blank line. Example:\nHENRY\n"We're out of time."\nNever write unquoted dialogue. No single quotes, no bare text — every line of dialogue must be inside " ". Never put a blank line between the character name and their dialogue.
+- BLOCKING AND POSITIONING (MANDATORY): Every paragraph that introduces or repositions characters MUST describe:
+  - Where each character is positioned in the space (e.g. "at the far end of the table", "in the doorway", "centre of the ring").
+  - Which direction they face or look (e.g. "facing the window", "turned away from DETECTIVE NOIR", "looking directly at CAPTAIN VASH").
+  - Their spatial relationship to other characters when more than one is present (e.g. "opposite CAPTAIN VASH", "shoulder-to-shoulder with", "behind").
+  - Body orientation when dramatically relevant (e.g. "back turned to", "in profile", "squared off face-to-face").
+  Do NOT leave positioning implicit. If two or more characters share a paragraph, state where each one is relative to the others and which direction they face. This information is critical for accurate image generation.
 - NO NOVELISTIC LANGUAGE: No metaphors, poetic imagery, emotional interpretation, or adverbs describing internal state. Let action imply emotion.
 - SENTENCE COMPLETENESS (CRITICAL): Every sentence MUST be grammatically complete with subject, verb, and object where required. Do NOT drop words. Do NOT write incomplete phrases. Every sentence must make sense when read aloud. Common errors to AVOID:
   - Missing verbs: "The beam before steadying" (WRONG) → "The beam *flickers* before steadying" (CORRECT)
@@ -14404,25 +17731,27 @@ SCREENPLAY MODE (MANDATORY — scene content must read like a screenplay, NOT no
 
 SCENE MARKUP STANDARD (MANDATORY — use consistently in ALL scene text):
 - CHARACTERS: Write individual character names (human or non-human) in FULL CAPITAL LETTERS using their COMPLETE registered name on every mention. Example: MAYA RIVERA (not MAYA), SIR REGINALD 'REG' BARTLETT (not SIR REGINALD or SIR REG), SHADOWFANG (not SHADOW). The ONLY exception is inside dialogue quotes (" ") where nicknames or short forms are natural speech. Every character present MUST appear in FULL CAPS at least once. FULL CAPS are ONLY for individual character names — NEVER for anything else. This includes: organizations, groups, teams, companies, brands, sound effects, actions, emphasis, codenames, protocols, operations, programs, labels, warnings, signs, titles of documents, or any non-character phrase. Write all non-character text in normal case or Title Case. Example of FORBIDDEN usage: "protocol: TERMINAL SANCTION" or "PROJECT GENESIS" — these must be written as "protocol: Terminal Sanction" or "Project Genesis". Organizations/groups/teams use Title Case only.
-- SOUND EFFECTS (SFX): ALL audible events MUST use (lowercase_underscore_format). You MUST use ONLY SFX from this approved list — no others are permitted: {self._get_sfx_list_for_prompt()}. If the sound you want is not on this list, choose the closest approved alternative. NEVER use (Meanwhile), (Henry), (Tension), emotions, or narrative. Convert prose sounds to SFX markup: "His boots crunch on broken glass" → "(glass_crunch)". LAYERED SFX: Primary SFX (action-caused, max 1 per action) + Ambient SFX (environmental, max 2 per paragraph, use ambient_ prefix): (ambient_wind), (ambient_rain), (ambient_mill_creak). Example: (ambient_mill_creak) MILO *steps* into the _Mill_. His [boots] *step* on broken glass (glass_crunch).
+- SOUND EFFECTS (SFX): ALL audible events MUST use (lowercase_underscore_format). You MUST use ONLY SFX from this approved list — no others are permitted: {self._get_sfx_list_for_prompt()}. If the sound you want is not on this list, choose the closest approved alternative. NEVER use (Meanwhile), (Henry), (Tension), emotions, or narrative. Convert prose sounds to SFX markup: "His boots crunch on broken glass" → "(glass_crunch)". LAYERED SFX: Primary SFX (action-caused, max 1 per action) + Ambient SFX (environmental, max 2 per paragraph, use ambient_ prefix): (ambient_wind), (ambient_rain), (ambient_mill_creak). Example: (ambient_mill_creak) MILO *steps* into the _Mill_. His boots *step* on broken glass (glass_crunch).
 - ACTION WORDS (MANDATORY — WHITELIST ONLY): ALL visible physical movement MUST be wrapped in *asterisks*. You MUST use ONLY action verbs from this approved whitelist — no other action verbs are permitted: {self._get_action_verb_list_for_prompt()}. If the ideal verb is not on this list, you MUST substitute the closest approved alternative (e.g. "clips" → *bump* or *knock*; "nudges" → *push* or *tap*; "brushes" → *touch*; "slips" → *slide*). NEVER use an action verb that is not on this list. NEVER use feel, think, realize, decide, hope, fear, remember, regret. Intensity modifiers go INSIDE markup: *walks (slowly)*, *slams (violently)*, *turns (cautiously)*. Remove filler verbs: "begins to walk" → "*walks*", "starts turning" → "*turns*". Actions must be direct, concrete, visually observable.
-- LOCATIONS / ENVIRONMENTS: Title Case + underlined with underscores. Use ONLY the allowed locations listed above. Every location MUST be underlined on every mention.
+- LOCATIONS / ENVIRONMENTS: Title Case + underlined with underscores. Use ONLY the allowed locations listed above. Every location MUST be underlined on every mention. When a character moves to a sub-area of a location, include the sub-area in the underscore markup to make the name SPECIFIC — e.g. _Laughing Skull Comedy Club Stage_ (not just _Laughing Skull Comedy Club_), _Blackwood Manor Library_ (not just _Blackwood Manor_). Each distinct area the camera sees needs its own unique environment name.
 - VEHICLE INTERIORS = LOCATIONS (underlined), NOT vehicles. When something is referred to as "the ship's X" or "the [vehicle]'s X" (e.g. "the ship's Common Area", "the Stellar Wanderer's Bridge"), X is an interior space/environment — use _underscores_. Example: "The crew of the {{Stellar Wanderer}} gathers in the ship's _Common Area_." Common Area is a location because it is a room/space within the ship. Do NOT use {{braces}} for interior spaces like Common Area, Bridge, Cockpit, Medbay — use _underscores_.
-- VEHICLES (exterior only): Wrap in curly braces. Example: {{Stellar Wanderer}}, {{motorcycle}}. Mark ONLY when referring to the vehicle itself (exterior). One identity = exterior of the craft. Camera outside the craft → VEHICLE.
-- OBJECTS (interactable only): Wrap in square brackets. Mark objects when a character DIRECTLY interacts with them (sits on, leans on, holds, touches, uses, picks up, etc.). Objects that characters do NOT directly interact with must NOT be placed in [brackets] — no background props, no merely visible items.
-  OBJECT INTERACTION EXPANSION (CRITICAL): Mark objects when a character: sits on it, perches on it, leans on or against it, rests feet on it, holds it, touches it, places an item on it, or props feet on it. These are explicit interactions even if described casually.
-  OBJECT AS DIRECT TARGET OF ACTION (CRITICAL): Any object that is the direct object of an action verb MUST be in [brackets]. Any object that a character or a character's body part touches, strikes, impacts, bumps, knocks, or otherwise physically contacts MUST be in [brackets]. This includes incidental contact (e.g. an elbow clipping a vase, a shoulder brushing a shelf, a hip bumping a table).
-  Examples: His elbow *bumps* the [porcelain vase] on the [entry table]. PAN BOLA *leans* back in his [chair], boots propped up on the [console]. She *grabs* the [handle]. He *kicks* the [door]. Her hand *brushes* the [railing].
-  Do NOT write "bumps the vase" or "kicks the door" without brackets — any object receiving a physical action or contact REQUIRES [brackets].
-  Also mark when a character uses, picks up, activates, or manipulates an object. Background props (merely visible, decorative) must NOT be bracketed. Do NOT bracket objects that appear in the scene but are not physically interacted with.
+- VEHICLES (exterior only): Wrap in curly braces. Example: {{Stellar Wanderer}}, {{motorcycle}}. Mark ONLY when referring to the vehicle itself (exterior). One identity = exterior of the craft. Camera outside the craft → VEHICLE. NEVER wrap buildings, venues, or locations in {{braces}} — clubs, bars, restaurants, theaters, shops, houses, offices, etc. are ENVIRONMENTS (_underscored_), NOT vehicles. Casual references like "the club" or "the bar" refer to a place and must use plain text or _underscores_.
+- OBJECTS: Wrap ALL named objects in square brackets — whether a character interacts with them or not. This includes interacted objects, background props, set dressing, and passive items visible in the scene. EXCEPTION: Clothing, footwear, and accessories WORN by a character (blazer, sneakers, dress, hat, gloves, armour, etc.) are WARDROBE — do NOT use [brackets] for them. Describe wardrobe as plain text. Only independent props, tools, devices, furniture, and set dressing use [brackets].
+  Examples: His elbow *bumps* the [porcelain vase] on the [entry table]. PAN BOLA *leans* back in his [chair], boots propped up on the [console]. She *grabs* the [handle]. The [foam tombstones] line the back wall. A dusty [workbench] sits in the corner.
+  Every named object must have [brackets] on every mention so the visual pipeline can detect it.
 - No other entities may use these formats. No entity may use multiple markup types.
 - Example format: [CHARACTER] enters [LOCATION], picks up the [keycard]. Use actual names from the scene summary. Vehicle interiors (Common Area, Bridge, Cockpit) use _underscores_; the vehicle itself uses {{braces}}.
 - DIALOGUE IS MARKUP-FREE (MANDATORY): Text inside double quotes " " is spoken dialogue. NEVER place any cinematic markup inside dialogue. No _underscores_, no [brackets], no {{braces}}, no *asterisks* within " ". Dialogue must contain only plain spoken words.
   Correct: CHLOE BAXTER "Wave to our new subscribers, Marcus!"
   Wrong: CHLOE BAXTER "Wave to our [subscribers], Marcus!"
 
+SCENE DURATION TARGET: {_duration} seconds ({target_paragraphs} paragraphs, ~{word_count} words).
+Each paragraph becomes ONE video clip (~{scene_params["seconds_per_paragraph"]}s each). Write EXACTLY {target_paragraphs} paragraphs — no more, no fewer.
+
 Write a complete scene in SCREENPLAY FORMAT that expands on the canon summary. The scene must read like a screenplay, not novel prose.
+- Write EXACTLY {target_paragraphs} discrete paragraphs (separated by double newlines)
 - Be approximately {word_count} words long
+- Each paragraph = one visual beat = one video clip. Keep paragraphs self-contained.
 - Include only visible action and audible dialogue (what the camera can capture)
 - Use short action lines; one action per sentence when possible
 - Include dialogue if appropriate: character name on its own line (FULL CAPS), dialogue on the VERY NEXT line (one newline, NEVER a blank line). CRITICAL: ALL dialogue MUST be inside double quotes " " — every spoken line (e.g. "We're out of time.", "Go now."). No exceptions.
@@ -14432,6 +17761,7 @@ Write a complete scene in SCREENPLAY FORMAT that expands on the canon summary. T
 Write in screenplay format with discrete paragraphs (double newlines between paragraphs). Include:
 - Setting and environment details (visible only)
 - LIGHTING (MANDATORY): The first paragraph MUST describe the lighting — time of day for exteriors (dawn, morning, midday, golden hour, dusk, night, overcast, sunshine) or light source/quality for interiors (fluorescent, candlelight, window light, neon, dim, etc.)
+- SPATIAL SCALE (MANDATORY): The first paragraph MUST establish the SIZE of the space and describe ALL entries/exits used later in the scene.
 - Character actions and movements (physical, explicit)
 - Dialogue (if any): name on own line, then dialogue in " " — all dialogue must be in double quotes
 - Visual and atmospheric details (what can be seen/heard)
@@ -14448,6 +17778,13 @@ CRITICAL: Generate ONLY the scene content itself. Do NOT include:
 Start directly with the scene description. Begin with the setting/lighting, then characters or action - not with labels or metadata."""
 
         system_msg = "You are a professional screenwriter. CRITICAL: Use character and entity names EXACTLY as specified in the prompt—never substitute, abbreviate, or creatively alter. ALL characters named in the scene description MUST appear—do not omit or replace any. FULL NAME RULE: Always refer to characters by their complete FULL CAPS name (e.g. SIR REGINALD 'REG' BARTLETT, not SIR REGINALD or SIR REG). The ONLY exception is inside dialogue quotes where nicknames/short forms are natural speech. For LOCATIONS: use ONLY the allowed locations listed in the prompt—never invent place names. Use THIS story's locations and characters only—never copy names from other stories." + forbidden_note + " NEVER use temporal words (Once, Soon, Later, Then) as locations. Vehicle interiors (Common Area, Bridge, Cockpit) are LOCATIONS — use _underscores_. LIGHTING (MANDATORY): The first paragraph of every scene MUST explicitly describe lighting conditions — time of day for exteriors (dawn, morning, midday, golden hour, dusk, night, overcast, sunshine) or light source and quality for interiors (fluorescent, candlelight, window light, neon, dim bulbs, screen glow, etc.). Never omit lighting. Scene content must be SCREENPLAY STYLE: only visible action and audible dialogue; no internal thoughts or metaphor; short, direct action lines; dialogue = character name on own line (FULL CAPS), dialogue on the VERY NEXT line (one newline, NEVER a blank line between name and dialogue). CRITICAL: All dialogue MUST be in double quotes. CINEMATIC GRAMMAR (MANDATORY): ACTION — ALL visible physical movement MUST be wrapped in *asterisks*. Use ONLY verbs from the approved whitelist in the prompt — if a verb is not on the list, substitute the closest approved alternative. Intensity modifiers INSIDE: *walks (slowly)*, *slams (violently)*. Remove filler verbs: 'begins to walk' → '*walks*'. NEVER wrap emotional verbs (feel, think, realize, decide). SFX — ALL audible events MUST use ONLY SFX from the approved whitelist in the prompt — if a sound is not on the list, substitute the closest approved alternative. LAYERED SFX: Primary (max 1 per action) + Ambient (max 2 per paragraph, ambient_ prefix). SCENE MARKUP: Characters = FULL CAPS only. Locations = Title Case + underlined. Objects = [brackets] when character directly interacts OR when an object is the direct target of any action or physical contact (including body-part contact like elbows, shoulders, hips). Vehicles = curly braces. OWNERSHIP: If a character owns a location/vehicle/object (per outline), only they may use it unless ownership is explicitly transferred."
+
+        _ss = getattr(screenplay, "story_settings", None) or {}
+        _cr = _ss.get("content_rating", "unrestricted")
+        _cr_directive = _CONTENT_RATING_DIRECTIVES.get(_cr, "")
+        if _cr_directive:
+            system_msg += "\n\n" + _cr_directive
+
         try:
             response = self._chat_completion(
                 model=self.model_settings["model"],
@@ -14515,6 +17852,8 @@ Start directly with the scene description. Begin with the setting/lighting, then
             
             # Auto-correct physical-interaction object markup (sit/lean/perch/rest/prop + unmarked noun → [noun])
             content = self._fix_physical_interaction_object_markup(content)
+            # ── DUPLICATE-WORD BRACKET CLEANUP ──
+            content = self._fix_duplicate_word_before_bracket(content)
             # ── SENTENCE INTEGRITY REPAIR (detect and fix broken/incomplete sentences) ──
             content, integrity_warnings = self._repair_sentence_integrity(content)
             if integrity_warnings:
@@ -14525,7 +17864,7 @@ Start directly with the scene description. Begin with the setting/lighting, then
             # Enforces: action auto-wrap, filler rewrite, intensity modifiers, SFX expansion, layered SFX
             content, grammar_report = enforce_cinematic_grammar(content)
             if grammar_report.was_modified:
-                print(f"CINEMATIC GRAMMAR: {grammar_report.summary()}")
+                _safe_print(f"CINEMATIC GRAMMAR: {grammar_report.summary()}")
             # Dialogue validation: ensure all dialogue is enclosed in double quotes
             content = self._fix_dialogue_quotes(content)
             # Strip cinematic markup from inside dialogue
@@ -14697,8 +18036,30 @@ Start directly with the scene description. Begin with the setting/lighting, then
                 except Exception:
                     pass
             
-            # Enforce full character names throughout scene content
+            # Fix location/city names written in ALL-CAPS (before character name enforcement)
+            content = self._fix_location_names_as_characters(content, screenplay)
+            
+            # Enforce full character and entity names throughout scene content
             content = self._enforce_full_character_names(content, screenplay)
+            content = self._enforce_full_entity_markup_names(content, screenplay)
+            
+            # Auto-split paragraph 1 if it contains character content mixed with environment
+            content = self._enforce_environment_first_paragraph(
+                content, environment_changed, screenplay
+            )
+            content = self._validate_spatial_completeness(
+                content, environment_changed
+            )
+            content = self._validate_object_establishment(
+                content, environment_changed
+            )
+            content = self._validate_genre_compliance(content, screenplay)
+            content = self._validate_no_invented_abilities(content, screenplay)
+            _scene_desc = getattr(scene, "description", "") or ""
+            content = self._validate_no_invented_backstory(content, _scene_desc)
+            content = self._fix_held_object_continuity(content)
+            content = self._deduplicate_dialogue(content)
+            content = self._sanitize_paragraph_tags(content)
             
             # Extract consistency digest for use in later scene prompts (token-efficient continuity)
             digest = self._extract_consistency_digest(content, scene.title, screenplay=screenplay)
@@ -14706,10 +18067,89 @@ Start directly with the scene description. Begin with the setting/lighting, then
                 if scene.metadata is None:
                     scene.metadata = {}
                 scene.metadata["consistency_digest"] = digest
+
+            # Cross-scene continuity: warn if characters couldn't plausibly be here
+            continuity_warnings = self._validate_cross_scene_continuity(
+                content, scene, screenplay
+            )
+            if continuity_warnings:
+                drift_warnings.extend(continuity_warnings)
             
             return (content, drift_warnings)
             
         except Exception as e:
             error_message = str(e)
             raise Exception(f"Failed to generate scene content: {error_message}")
+
+    # ── Episodic Series: Episode Summary Generation ──────────────────
+
+    def generate_episode_summary(self, screenplay) -> Dict[str, Any]:
+        """Generate a summary of the completed episode for the Series Bible.
+
+        Returns a dict with keys: summary, story_arc, timeline_events.
+        """
+        if not self._adapter:
+            raise Exception("AI client not initialized.")
+
+        scenes = screenplay.get_all_scenes()
+        scene_summaries = []
+        for s in scenes:
+            content = ""
+            if s.metadata and isinstance(s.metadata, dict):
+                content = s.metadata.get("generated_content", "") or ""
+            desc = s.description or ""
+            scene_summaries.append(f"Scene {s.scene_number}: {s.title}\n{desc}\n{content[:300]}")
+
+        scene_block = "\n\n".join(scene_summaries) if scene_summaries else "(no scene data)"
+
+        prompt = f"""You are a professional story editor. Summarize the following completed episode for a series bible that tracks continuity across episodes.
+
+Title: {screenplay.title}
+Premise: {screenplay.premise}
+Genres: {', '.join(screenplay.genre) if screenplay.genre else 'General'}
+
+SCENES:
+{scene_block}
+
+Provide a JSON response with:
+1. "summary": A concise 3-5 sentence summary of the episode's plot.
+2. "story_arc": A single sentence describing the episode's narrative arc (e.g. "Character discovers the truth about X and confronts Y").
+3. "timeline_events": A list of 3-8 key events that should be remembered for future episodes. Each event is an object with "event" (short label) and "description" (1-2 sentences).
+
+CRITICAL: Return ONLY valid JSON. No markdown, no code blocks.
+
+{{
+    "summary": "...",
+    "story_arc": "...",
+    "timeline_events": [
+        {{"event": "...", "description": "..."}}
+    ]
+}}"""
+
+        import json as _json
+        response = self._adapter.chat(
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.5,
+            max_tokens=2000,
+        )
+
+        raw = response.get("content", "") if isinstance(response, dict) else str(response)
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+
+        try:
+            result = _json.loads(raw)
+        except _json.JSONDecodeError:
+            result = {
+                "summary": raw[:500],
+                "story_arc": "",
+                "timeline_events": [],
+            }
+
+        return {
+            "summary": result.get("summary", ""),
+            "story_arc": result.get("story_arc", ""),
+            "timeline_events": result.get("timeline_events", []),
+        }
 

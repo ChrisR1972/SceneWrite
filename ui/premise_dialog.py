@@ -1,5 +1,5 @@
 """
-Premise input/generation dialog for MoviePrompterAI.
+Premise input/generation dialog for SceneWrite.
 """
 
 from PyQt6.QtWidgets import (
@@ -19,13 +19,14 @@ class PremiseGenerationThread(QThread):
     finished = pyqtSignal(str)
     error = pyqtSignal(str)
     
-    def __init__(self, ai_generator, genres, atmosphere, workflow_profile=None, brand_context=None):
+    def __init__(self, ai_generator, genres, atmosphere, workflow_profile=None, brand_context=None, rejected_premises=None):
         super().__init__()
         self.ai_generator = ai_generator
         self.genres = genres
         self.atmosphere = atmosphere
         self.workflow_profile = workflow_profile
         self.brand_context = brand_context
+        self.rejected_premises = rejected_premises or []
     
     def run(self):
         """Generate premise in background thread."""
@@ -36,7 +37,8 @@ class PremiseGenerationThread(QThread):
                 self.atmosphere, 
                 return_raw=True,
                 workflow_profile=self.workflow_profile,
-                brand_context=self.brand_context
+                brand_context=self.brand_context,
+                rejected_premises=self.rejected_premises,
             )
             # Ensure premise is not None or empty
             if premise and premise.strip():
@@ -76,6 +78,7 @@ class PremiseDialog(QDialog):
         self.generated_premise = ""
         self.premise_thread: Optional[PremiseGenerationThread] = None
         self.progress_dialog: Optional[QProgressDialog] = None
+        self._rejected_premises: List[str] = []
         self.init_ui()
     
     def init_ui(self):
@@ -195,6 +198,11 @@ class PremiseDialog(QDialog):
         
         atmosphere = self.atmosphere_combo.currentText()
         
+        # Track the current premise as rejected (if regenerating)
+        current = self.generated_premise_display.toPlainText().strip()
+        if current and current not in self._rejected_premises:
+            self._rejected_premises.append(current)
+        
         # Disable button during generation
         self.generate_button.setEnabled(False)
         self.generate_button.setText("Generating...")
@@ -202,10 +210,10 @@ class PremiseDialog(QDialog):
         # Show progress dialog
         self.progress_dialog = QProgressDialog("Generating premise with AI...", None, 0, 0, self)
         self.progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
-        self.progress_dialog.setCancelButton(None)  # Can't cancel
+        self.progress_dialog.setCancelButton(None)
         self.progress_dialog.setWindowTitle("Generating Premise")
-        self.progress_dialog.setMinimumDuration(0)  # Show immediately
-        self.progress_dialog.setValue(0)  # Start at 0
+        self.progress_dialog.setMinimumDuration(0)
+        self.progress_dialog.setValue(0)
         self.progress_dialog.show()
         
         # Process events to ensure dialog appears
@@ -217,8 +225,11 @@ class PremiseDialog(QDialog):
             self.premise_thread.terminate()
             self.premise_thread.wait()
         
-        # Create and start generation thread
-        self.premise_thread = PremiseGenerationThread(self.ai_generator, selected_genres, atmosphere)
+        # Create and start generation thread with rejected premises
+        self.premise_thread = PremiseGenerationThread(
+            self.ai_generator, selected_genres, atmosphere,
+            rejected_premises=list(self._rejected_premises),
+        )
         self.premise_thread.finished.connect(self.on_premise_generated)
         self.premise_thread.error.connect(self.on_premise_error)
         self.premise_thread.start()

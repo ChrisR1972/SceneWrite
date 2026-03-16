@@ -1,5 +1,5 @@
 """
-Persistent Whitelist Manager for MoviePrompterAI Cinematic Markup.
+Persistent Whitelist Manager for SceneWrite Cinematic Markup.
 
 Manages user-added Action verbs and SFX stored in:
   config/ActionWhitelist.json

@@ -2,6 +2,7 @@
 AI Chat Panel for discussing story ideas and making changes.
 """
 
+import os
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QPushButton,
     QLabel, QScrollArea, QMessageBox, QDialog, QDialogButtonBox,
@@ -212,7 +213,38 @@ class AIChatPanel(QWidget):
     # Signals
     changes_applied = pyqtSignal(str, dict)  # change_type, change_data
     context_requested = pyqtSignal()  # Request current context
-    
+
+    # ── Theme-aware colour palettes ──────────────────────────────────
+    _COLORS_LIGHT = {
+        "user_bg":       "#e3f2fd",   "user_fg":       "#000000",
+        "ai_bg":         "#f1f8e9",   "ai_fg":         "#000000",
+        "error_bg":      "#ffebee",   "error_fg":      "#000000",
+        "system_bg":     "#f5f5f5",   "system_fg":     "#555555",
+        "suggestion_bg": "#fff3e0",   "suggestion_border": "#ff9800",
+        "suggestion_fg": "#000000",
+        "btn_apply":     "#4caf50",   "btn_preview":   "#2196f3",
+        "btn_dismiss":   "#f44336",   "btn_fg":        "#ffffff",
+    }
+    _COLORS_DARK = {
+        "user_bg":       "#1a3a5c",   "user_fg":       "#e0e0e0",
+        "ai_bg":         "#2e3d2e",   "ai_fg":         "#e0e0e0",
+        "error_bg":      "#4a1c1c",   "error_fg":      "#f5c6c6",
+        "system_bg":     "#383838",   "system_fg":     "#aaaaaa",
+        "suggestion_bg": "#3d3020",   "suggestion_border": "#ff9800",
+        "suggestion_fg": "#e0e0e0",
+        "btn_apply":     "#2e7d32",   "btn_preview":   "#1565c0",
+        "btn_dismiss":   "#c62828",   "btn_fg":        "#ffffff",
+    }
+
+    @staticmethod
+    def _is_dark_theme() -> bool:
+        from config import config
+        return (config.theme or "").lower() == "dark"
+
+    @classmethod
+    def _colors(cls) -> dict:
+        return cls._COLORS_DARK if cls._is_dark_theme() else cls._COLORS_LIGHT
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.screenplay: Optional[Screenplay] = None
@@ -248,7 +280,7 @@ class AIChatPanel(QWidget):
         
         self.suggestions_list = QTextEdit()
         self.suggestions_list.setReadOnly(True)
-        self.suggestions_list.setMaximumHeight(150)
+        self.suggestions_list.setMaximumHeight(120)
         self.suggestions_list.setPlaceholderText("Suggestions will appear here...")
         suggestions_layout.addWidget(self.suggestions_list)
         
@@ -266,7 +298,7 @@ class AIChatPanel(QWidget):
         
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
-        scroll_area.setMinimumHeight(300)
+        scroll_area.setMinimumHeight(100)
         # Prevent horizontal scrollbars - force word wrapping
         scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
@@ -307,7 +339,7 @@ class AIChatPanel(QWidget):
         
         chat_layout.addWidget(scroll_area)
         chat_group.setLayout(chat_layout)
-        layout.addWidget(chat_group)
+        layout.addWidget(chat_group, 1)
         
         self.scroll_area = scroll_area
         
@@ -315,38 +347,32 @@ class AIChatPanel(QWidget):
         from PyQt6.QtCore import QTimer
         QTimer.singleShot(100, self._update_chat_container_width)
         
-        # Input area
-        input_layout = QHBoxLayout()
+        # Input area — full width
         self.message_input = QTextEdit()
         self.message_input.setPlaceholderText("Type your message here... (Press Ctrl+Enter to send)")
         self.message_input.setMaximumHeight(100)
         self.message_input.setMinimumHeight(60)
-        # Add key press event handler for Enter key
         self.message_input.keyPressEvent = self.message_input_key_press
-        input_layout.addWidget(self.message_input)
-        
+        layout.addWidget(self.message_input)
+
+        # Action buttons
+        button_layout = QHBoxLayout()
+
         self.send_button = QPushButton("Send")
         self.send_button.setFixedWidth(80)
         self.send_button.clicked.connect(self.send_message)
         self.send_button.setEnabled(False)
-        # Make button always clickable even when focus is elsewhere
         self.send_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        # Ensure button can receive clicks even when other widgets have focus
         self.send_button.setAutoDefault(False)
         self.send_button.setDefault(False)
-        input_layout.addWidget(self.send_button)
-        
-        layout.addLayout(input_layout)
-        
-        # Action buttons
-        button_layout = QHBoxLayout()
-        
+        button_layout.addWidget(self.send_button)
+
         self.clear_button = QPushButton("Clear Chat")
         self.clear_button.clicked.connect(self.clear_chat)
         button_layout.addWidget(self.clear_button)
-        
+
         button_layout.addStretch()
-        
+
         layout.addLayout(button_layout)
         
         # Enable send button when there's text
@@ -388,7 +414,8 @@ class AIChatPanel(QWidget):
     def set_screenplay(self, screenplay: Optional[Screenplay]):
         """Set the current screenplay."""
         self.screenplay = screenplay
-        # Removed automatic chat clearing at startup
+        self.current_scene = None
+        self.selected_items = []
         self.update_context_label()
     
     def set_ai_generator(self, ai_generator: Optional[AIGenerator]):
@@ -433,7 +460,15 @@ class AIChatPanel(QWidget):
         
         if analysis.get("dialogue_heavy_scenes"):
             suggestions.append(f"💬 {len(analysis['dialogue_heavy_scenes'])} dialogue-heavy scene(s) could be cheaper as static shots.")
-        
+
+        if analysis.get("pending_identity_blocks"):
+            count = analysis["pending_identity_blocks"]
+            suggestions.append(f"🆔 {count} identity block(s) need review. Ask me to approve or edit them.")
+
+        if analysis.get("missing_outline_characters"):
+            names = analysis["missing_outline_characters"]
+            suggestions.append(f"📝 Character(s) without outlines: {', '.join(names[:3])}. Ask me to write one.")
+
         if not suggestions:
             suggestions.append("✓ No suggestions at this time. Your screenplay looks good!")
         
@@ -474,15 +509,41 @@ class AIChatPanel(QWidget):
                 if unused:
                     analysis["unused_characters"] = unused
         
-        # Analyze pacing
+        # Analyze pacing — check for consecutive runs of same pacing
         if all_scenes:
-            pacing_counts = {"Fast": 0, "Medium": 0, "Slow": 0}
-            for scene in all_scenes:
-                pacing = getattr(scene, "pacing", "Medium") or "Medium"
-                pacing_counts[pacing] = pacing_counts.get(pacing, 0) + 1
-            
-            if pacing_counts.get("Fast", 0) >= 3:
-                analysis["pacing_issues"] = "Multiple fast scenes in a row - consider variation"
+            pacing_sequence = [
+                getattr(s, "pacing", "Medium") or "Medium" for s in all_scenes
+            ]
+            issues = []
+            # Detect consecutive runs of 3+ same pacing
+            run_start = 0
+            while run_start < len(pacing_sequence):
+                run_val = pacing_sequence[run_start]
+                run_end = run_start + 1
+                while run_end < len(pacing_sequence) and pacing_sequence[run_end] == run_val:
+                    run_end += 1
+                run_len = run_end - run_start
+                if run_len >= 3:
+                    label = run_val.lower()
+                    issues.append(
+                        f"{run_len} consecutive {label}-paced scenes "
+                        f"(scenes {run_start + 1}-{run_end})"
+                    )
+                run_start = run_end
+            # Overall distribution check
+            total = len(pacing_sequence)
+            fast_pct = pacing_sequence.count("Fast") / total * 100 if total else 0
+            slow_pct = pacing_sequence.count("Slow") / total * 100 if total else 0
+            if fast_pct > 60:
+                issues.append(
+                    f"{fast_pct:.0f}% of scenes are fast-paced — consider more breathers"
+                )
+            if slow_pct > 50:
+                issues.append(
+                    f"{slow_pct:.0f}% of scenes are slow-paced — consider more momentum"
+                )
+            if issues:
+                analysis["pacing_issues"] = "; ".join(issues)
         
         # Scene optimization
         if self.current_scene:
@@ -497,7 +558,26 @@ class AIChatPanel(QWidget):
                             if getattr(item, "dialogue", "") and len(getattr(item, "dialogue", "")) > 50]
             if len(dialogue_items) > len(scene.storyboard_items) * 0.7:  # 70%+ dialogue
                 analysis["dialogue_heavy_scenes"].append(scene.title)
-        
+
+        # Pending identity blocks
+        try:
+            pending = self.screenplay.get_pending_identity_blocks() if self.screenplay else []
+            if pending:
+                analysis["pending_identity_blocks"] = len(pending)
+        except Exception:
+            pass
+
+        # Characters missing outlines
+        if hasattr(self.screenplay, "story_outline") and isinstance(self.screenplay.story_outline, dict):
+            characters = self.screenplay.story_outline.get("characters", [])
+            missing = []
+            for c in characters:
+                if isinstance(c, dict) and c.get("name"):
+                    if not c.get("outline"):
+                        missing.append(c["name"])
+            if missing:
+                analysis["missing_outline_characters"] = missing
+
         return analysis
     
     def update_context_label(self):
@@ -552,7 +632,7 @@ class AIChatPanel(QWidget):
         if not self.ai_generator:
             QMessageBox.warning(self, "AI Not Available", "AI generator is not configured. Please set up your API key in settings.")
             return
-        
+
         # Check if this is an instruction request (these work even without AI client)
         user_lower = message.lower()
         instruction_keywords = [
@@ -563,10 +643,11 @@ class AIChatPanel(QWidget):
             "tell me about", "explain the app", "app instructions", "app guide", "app tutorial"
         ]
         is_instruction_request = any(keyword in user_lower for keyword in instruction_keywords)
-        
-        # For instruction requests, proceed even if client isn't initialized
-        # For other requests, check if client is available
-        if not is_instruction_request and not self.ai_generator.client:
+
+        # Check if the AI backend is actually usable (client or adapter must exist).
+        # Anthropic and Ollama Cloud set client=None but use _adapter instead.
+        ai_ready = getattr(self.ai_generator, 'client', None) or getattr(self.ai_generator, '_adapter', None)
+        if not is_instruction_request and not ai_ready:
             QMessageBox.warning(self, "AI Not Available", "AI generator is not configured. Please set up your API key in settings.\n\nNote: You can still ask for app usage instructions!")
             return
         
@@ -667,13 +748,25 @@ class AIChatPanel(QWidget):
         # Ensure label wraps and doesn't cause horizontal scrolling
         label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         
+        c = self._colors()
         if role == "user":
-            message_frame.setStyleSheet("background-color: #e3f2fd; border-radius: 8px;")
+            message_frame.setStyleSheet(
+                f"background-color: {c['user_bg']}; color: {c['user_fg']}; border-radius: 8px;"
+            )
             label.setText(f"<b>You:</b><br>{content}")
             message_layout.setAlignment(Qt.AlignmentFlag.AlignRight)
+        elif role == "system":
+            message_frame.setStyleSheet(
+                f"background-color: {c['system_bg']}; color: {c['system_fg']}; border-radius: 8px;"
+            )
+            label.setText(f"<i>{content}</i>")
+            message_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
         else:
-            color = "#ffebee" if is_error else "#f1f8e9"
-            message_frame.setStyleSheet(f"background-color: {color}; border-radius: 8px;")
+            bg = c["error_bg"] if is_error else c["ai_bg"]
+            fg = c["error_fg"] if is_error else c["ai_fg"]
+            message_frame.setStyleSheet(
+                f"background-color: {bg}; color: {fg}; border-radius: 8px;"
+            )
             label.setText(f"<b>AI:</b><br>{content}")
             message_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
         
@@ -704,19 +797,17 @@ class AIChatPanel(QWidget):
             "description": description,
             "id": suggestion_id
         })
-        # Debug: Log what's being stored
-        if change_type == "edit_character_outline":
-            print(f"DEBUG add_suggestion: Storing character outline suggestion")
-            print(f"DEBUG add_suggestion: change_data keys: {list(stored_change_data.keys())}")
-            print(f"DEBUG add_suggestion: character_name: {stored_change_data.get('character_name')}")
-            print(f"DEBUG add_suggestion: has_outline: {bool(stored_change_data.get('character_outline'))}")
-            print(f"DEBUG add_suggestion: has_growth: {bool(stored_change_data.get('character_growth_arc'))}")
+        
         
         # Create suggestion frame
         from PyQt6.QtWidgets import QSizePolicy
         suggestion_frame = QFrame()
         suggestion_frame.setFrameStyle(QFrame.Shape.Box)
-        suggestion_frame.setStyleSheet("background-color: #fff3e0; border-left: 4px solid #ff9800; border-radius: 4px; padding: 10px;")
+        c = self._colors()
+        suggestion_frame.setStyleSheet(
+            f"background-color: {c['suggestion_bg']}; color: {c['suggestion_fg']}; "
+            f"border-left: 4px solid {c['suggestion_border']}; border-radius: 4px; padding: 10px;"
+        )
         # Ensure frame respects container width and wraps content
         suggestion_frame.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         suggestion_layout = QVBoxLayout(suggestion_frame)
@@ -732,18 +823,20 @@ class AIChatPanel(QWidget):
         button_layout = QHBoxLayout()
         button_layout.addStretch()
         
+        btn_style = "padding: 5px 15px; border-radius: 4px; color: {fg}; background-color: {bg};"
+
         apply_btn = QPushButton("Apply")
-        apply_btn.setStyleSheet("background-color: #4caf50; color: white; padding: 5px 15px; border-radius: 4px;")
+        apply_btn.setStyleSheet(btn_style.format(fg=c["btn_fg"], bg=c["btn_apply"]))
         apply_btn.clicked.connect(lambda checked, sid=suggestion_id: self.handle_suggestion_action(sid, "apply"))
         button_layout.addWidget(apply_btn)
-        
+
         preview_btn = QPushButton("Preview")
-        preview_btn.setStyleSheet("background-color: #2196f3; color: white; padding: 5px 15px; border-radius: 4px;")
+        preview_btn.setStyleSheet(btn_style.format(fg=c["btn_fg"], bg=c["btn_preview"]))
         preview_btn.clicked.connect(lambda checked, sid=suggestion_id: self.handle_suggestion_action(sid, "preview"))
         button_layout.addWidget(preview_btn)
-        
+
         dismiss_btn = QPushButton("Dismiss")
-        dismiss_btn.setStyleSheet("background-color: #f44336; color: white; padding: 5px 15px; border-radius: 4px;")
+        dismiss_btn.setStyleSheet(btn_style.format(fg=c["btn_fg"], bg=c["btn_dismiss"]))
         dismiss_btn.clicked.connect(lambda checked, sid=suggestion_id: self.handle_suggestion_action(sid, "dismiss"))
         button_layout.addWidget(dismiss_btn)
         
@@ -773,16 +866,6 @@ class AIChatPanel(QWidget):
             change_type = suggestion.get("change_type", "edit_scene")
             change_data = suggestion.get("change_data", {})
             
-            # Debug: Log suggestion data
-            print(f"DEBUG handle_suggestion_action: change_type={change_type}")
-            print(f"DEBUG handle_suggestion_action: suggestion keys: {list(suggestion.keys())}")
-            print(f"DEBUG handle_suggestion_action: change_data type: {type(change_data)}, keys={list(change_data.keys()) if isinstance(change_data, dict) else 'not a dict'}")
-            if change_type == "edit_character_outline" and isinstance(change_data, dict):
-                print(f"DEBUG handle_suggestion_action: character_name={change_data.get('character_name')}")
-                print(f"DEBUG handle_suggestion_action: has_outline={bool(change_data.get('character_outline'))}")
-                print(f"DEBUG handle_suggestion_action: has_growth={bool(change_data.get('character_growth_arc'))}")
-                if change_data.get('character_outline'):
-                    print(f"DEBUG handle_suggestion_action: outline preview: {change_data.get('character_outline')[:100]}...")
             
             if not isinstance(change_data, dict):
                 QMessageBox.warning(self, "Error", f"Invalid change data. Type: {type(change_data)}")
@@ -1456,18 +1539,14 @@ class AIChatPanel(QWidget):
     def get_before_data(self, change_type: str, change_data: dict) -> Any:
         """Get the current state before changes."""
         if change_type == "edit_character_outline":
-            # Get current character outline
             character_name = change_data.get("character_name", "")
             if not character_name and self.screenplay and self.screenplay.story_outline:
-                # Try to extract from context
                 characters = self.screenplay.story_outline.get("characters", [])
                 if characters and isinstance(characters, list):
-                    # Use first character if available
                     for char in characters:
                         if isinstance(char, dict):
                             character_name = char.get("name", "")
                             break
-            
             if character_name and self.screenplay and self.screenplay.story_outline:
                 characters = self.screenplay.story_outline.get("characters", [])
                 for char in characters:
@@ -1475,63 +1554,122 @@ class AIChatPanel(QWidget):
                         outline = char.get("outline", "")
                         growth_arc = char.get("growth_arc", "")
                         result = f"Character: {character_name}\n\n"
-                        if outline:
-                            result += f"Current Outline:\n{outline}\n\n"
-                        else:
-                            result += "Current Outline: (none)\n\n"
-                        if growth_arc:
-                            result += f"Current Growth Arc:\n{growth_arc}"
-                        else:
-                            result += "Current Growth Arc: (none)"
+                        result += f"Current Outline:\n{outline}\n\n" if outline else "Current Outline: (none)\n\n"
+                        result += f"Current Growth Arc:\n{growth_arc}" if growth_arc else "Current Growth Arc: (none)"
                         return result
             return f"Character: {character_name if character_name else 'Unknown'}\n\n(No existing outline found)"
+
         elif change_type in ["regenerate_scene", "edit_scene"]:
             if self.current_scene:
-                # Check if this is a character_focus edit
                 edits = change_data.get("edits", {})
                 if isinstance(edits, dict) and "character_focus" in edits:
-                    # Return current character focus for preview
                     try:
-                        if self.current_scene and self.current_scene.character_focus:
-                            # Ensure all items are strings before joining
+                        if self.current_scene.character_focus:
                             char_focus_strs = [str(cf).strip() for cf in self.current_scene.character_focus if cf]
                             return f"Character Focus: {', '.join(char_focus_strs) if char_focus_strs else '(none)'}"
-                        else:
-                            return "Character Focus: (none)"
-                    except Exception as e:
-                        # Fallback if there's any error
-                        return f"Character Focus: {str(self.current_scene.character_focus) if self.current_scene and self.current_scene.character_focus else '(none)'}"
-                
-                # Get the existing generated content
+                        return "Character Focus: (none)"
+                    except Exception:
+                        return f"Character Focus: {str(self.current_scene.character_focus) if self.current_scene.character_focus else '(none)'}"
                 if self.current_scene.metadata and self.current_scene.metadata.get("generated_content"):
                     return self.current_scene.metadata.get("generated_content")
-                # Fallback to description if no generated content
                 return self.current_scene.description if self.current_scene.description else "(No content)"
             return "(No scene selected)"
+
         elif change_type in ["regenerate_items", "edit_items"]:
             return [item.prompt for item in self.selected_items] if self.selected_items else []
+
+        elif change_type == "remove_items":
+            if self.selected_items:
+                return [f"[{i+1}] {item.prompt[:80]}" for i, item in enumerate(self.selected_items)]
+            return "(No items selected)"
+
+        elif change_type == "add_items":
+            if self.current_scene:
+                count = len(self.current_scene.storyboard_items) if self.current_scene.storyboard_items else 0
+                return f"Current scene has {count} storyboard item(s)"
+            return "(No scene selected)"
+
+        elif change_type == "edit_premise":
+            if self.screenplay:
+                parts = []
+                if self.screenplay.title:
+                    parts.append(f"Title: {self.screenplay.title}")
+                if self.screenplay.premise:
+                    parts.append(f"Premise: {self.screenplay.premise}")
+                if self.screenplay.genre:
+                    genres = self.screenplay.genre if isinstance(self.screenplay.genre, list) else [self.screenplay.genre]
+                    parts.append(f"Genres: {', '.join(genres)}")
+                if self.screenplay.atmosphere:
+                    parts.append(f"Atmosphere: {self.screenplay.atmosphere}")
+                return "\n".join(parts) if parts else "(No premise data)"
+            return "(No screenplay loaded)"
+
+        elif change_type == "edit_story_outline":
+            if self.screenplay and self.screenplay.story_outline:
+                parts = []
+                outline = self.screenplay.story_outline
+                if outline.get("main_storyline"):
+                    parts.append(f"Main Storyline:\n{outline['main_storyline'][:300]}")
+                if outline.get("subplots"):
+                    parts.append(f"Subplots:\n{outline['subplots'][:300]}")
+                if outline.get("conclusion"):
+                    parts.append(f"Conclusion:\n{outline['conclusion'][:300]}")
+                return "\n\n".join(parts) if parts else "(Empty story outline)"
+            return "(No story outline)"
+
+        elif change_type == "regenerate_framework":
+            if self.screenplay and self.screenplay.acts:
+                act_count = len(self.screenplay.acts)
+                scene_count = sum(len(a.scenes) for a in self.screenplay.acts)
+                return f"Current framework: {act_count} act(s), {scene_count} scene(s)"
+            return "(No framework)"
+
+        elif change_type == "edit_series_bible":
+            if self.screenplay and getattr(self.screenplay, "series_metadata", None):
+                bible_path = (self.screenplay.series_metadata or {}).get("series_bible_path", "")
+                if bible_path and os.path.exists(bible_path):
+                    try:
+                        from core.series_bible import SeriesBible
+                        bible = SeriesBible.load(bible_path)
+                        wc = bible.world_context or {}
+                        parts = []
+                        for key in ("setting_description", "time_period", "rules_and_lore", "tone"):
+                            val = wc.get(key, "")
+                            if val:
+                                parts.append(f"{key.replace('_', ' ').title()}: {val[:200]}")
+                        return "\n".join(parts) if parts else "(Empty world context)"
+                    except Exception:
+                        pass
+            return "(No series bible)"
+
+        elif change_type in ("edit_identity_block", "approve_identity_block"):
+            entity_name = change_data.get("entity_name", "")
+            entity_type = change_data.get("entity_type", "")
+            if entity_name and self.screenplay:
+                ib = self.screenplay.get_identity_block_by_name(entity_name, entity_type)
+                if ib:
+                    return f"{entity_name} ({entity_type}):\n{ib[:300]}"
+                meta = self.screenplay.identity_block_metadata or {}
+                for eid, m in meta.items():
+                    if isinstance(m, dict) and (m.get("name") or "").strip().lower() == entity_name.strip().lower():
+                        notes = m.get("user_notes", "") or m.get("identity_block", "")
+                        status = m.get("status", "placeholder")
+                        return f"{entity_name} ({entity_type}) [{status}]:\n{notes[:300] if notes else '(no description)'}"
+            return f"{entity_name if entity_name else 'Unknown'}: (no identity block found)"
+
         return ""
     
     def get_after_data(self, change_type: str, change_data: dict) -> Any:
         """Get the proposed state after changes."""
         if change_type == "edit_character_outline":
-            # Get proposed character outline
             character_name = change_data.get("character_name", "")
             new_outline = change_data.get("character_outline", "")
             new_growth_arc = change_data.get("character_growth_arc", "")
-            
             result = f"Character: {character_name if character_name else 'Unknown'}\n\n"
-            if new_outline:
-                result += f"New Outline:\n{new_outline}\n\n"
-            else:
-                result += "New Outline: (unchanged)\n\n"
-            if new_growth_arc:
-                result += f"New Growth Arc:\n{new_growth_arc}"
-            else:
-                result += "New Growth Arc: (unchanged)"
+            result += f"New Outline:\n{new_outline}\n\n" if new_outline else "New Outline: (unchanged)\n\n"
+            result += f"New Growth Arc:\n{new_growth_arc}" if new_growth_arc else "New Growth Arc: (unchanged)"
             return result
-        
-        # Check if this is a character_focus edit (even if change_type is wrong)
+
         edits = change_data.get("edits", {})
         if isinstance(edits, dict) and "character_focus" in edits:
             character_focus = edits["character_focus"]
@@ -1539,29 +1677,25 @@ class AIChatPanel(QWidget):
                 if isinstance(character_focus, str):
                     return f"Character Focus: {character_focus.strip()}"
                 elif isinstance(character_focus, list):
-                    # Ensure all items are strings before joining
                     character_focus_strs = [str(cf).strip() for cf in character_focus if cf]
                     return f"Character Focus: {', '.join(character_focus_strs) if character_focus_strs else '(none)'}"
-                else:
-                    return f"Character Focus: {str(character_focus)}"
-            except Exception as e:
-                # Fallback if there's any error formatting
                 return f"Character Focus: {str(character_focus)}"
-        
-        # Also check if change_type is add_items but might be a character edit
+            except Exception:
+                return f"Character Focus: {str(character_focus)}"
+
         if change_type == "add_items":
-            # Check if new_items might contain character information
             new_items = change_data.get("new_items", [])
             if isinstance(new_items, list) and len(new_items) > 0:
-                # Try to infer if this is character-related
-                # For now, return a placeholder - preview might not be fully supported for add_items
                 return f"Add {len(new_items)} item(s)"
             return "Add items"
-        
+
+        if change_type == "remove_items":
+            if self.selected_items:
+                return f"Remove {len(self.selected_items)} item(s)"
+            return "Remove items"
+
         if change_type in ["regenerate_scene", "edit_scene"]:
             new_content = change_data.get("new_content", "")
-            
-            # For paragraph edits, ensure we return the full merged scene content for preview
             if new_content and self.current_scene:
                 user_request = change_data.get("user_request", "").lower()
                 paragraph_index = change_data.get("paragraph_index")
@@ -1572,83 +1706,108 @@ class AIChatPanel(QWidget):
                         "alternatives", "version", "versions"
                     ])
                 )
-                
                 if is_paragraph_edit:
-                    # Get existing scene content
                     existing_content = ""
                     if self.current_scene.metadata and self.current_scene.metadata.get("generated_content"):
                         existing_content = self.current_scene.metadata["generated_content"]
                     else:
                         existing_content = self.current_scene.description
-                    
                     if existing_content:
                         import re
                         existing_paragraphs = [p.strip() for p in re.sub(r'^\[\d+\]\s+', '', existing_content, flags=re.MULTILINE).split('\n\n') if p.strip()]
                         new_paragraphs = [p.strip() for p in re.sub(r'^\[\d+\]\s+', '', new_content, flags=re.MULTILINE).split('\n\n') if p.strip()]
-                        
-                        # If new content has fewer paragraphs, it's likely just a paragraph option
-                        # Merge it into the full scene content
                         if len(new_paragraphs) < len(existing_paragraphs) and len(existing_paragraphs) > 1:
-                            # Extract paragraph index if not provided
                             if paragraph_index is None:
                                 paragraph_index = 0
                                 para_match = re.search(r'\[(\d+)\]|paragraph\s+(\d+)|paragragh\s+(\d+)', user_request)
                                 if para_match:
                                     para_num = int(para_match.group(1) or para_match.group(2) or para_match.group(3))
                                     paragraph_index = para_num - 1
-                                elif "second" in user_request or "paragraph 2" in user_request:
+                                elif "second" in user_request:
                                     paragraph_index = 1
-                                elif "third" in user_request or "paragraph 3" in user_request:
+                                elif "third" in user_request:
                                     paragraph_index = 2
-                                elif "fourth" in user_request or "paragraph 4" in user_request:
+                                elif "fourth" in user_request:
                                     paragraph_index = 3
-                                elif "fifth" in user_request or "paragraph 5" in user_request:
+                                elif "fifth" in user_request:
                                     paragraph_index = 4
-                            
-                            if paragraph_index < 0:
-                                paragraph_index = 0
-                            if paragraph_index >= len(existing_paragraphs):
-                                paragraph_index = len(existing_paragraphs) - 1
-                            
-                            # Merge: replace only the specified paragraph
-                            # If new_paragraphs has the same count, the content is already complete
+                            paragraph_index = max(0, min(paragraph_index or 0, len(existing_paragraphs) - 1))
                             if len(new_paragraphs) == len(existing_paragraphs):
-                                # Full scene was provided - use it directly
                                 return '\n\n'.join(new_paragraphs)
                             else:
-                                # Only a single paragraph was provided - merge it into existing content
                                 reconstructed = existing_paragraphs.copy()
                                 replacement = new_paragraphs[0] if new_paragraphs else new_content.strip()
                                 if replacement and paragraph_index < len(reconstructed):
                                     reconstructed[paragraph_index] = replacement
                                 return '\n\n'.join(reconstructed)
-            
             return new_content
-        elif change_type == "regenerate_items":
+
+        if change_type == "regenerate_items":
             return change_data.get("new_items", [])
+
+        if change_type == "edit_premise":
+            parts = []
+            if change_data.get("title"):
+                parts.append(f"Title: {change_data['title']}")
+            if change_data.get("premise"):
+                parts.append(f"Premise: {change_data['premise']}")
+            if change_data.get("genres"):
+                genres = change_data["genres"]
+                if isinstance(genres, list):
+                    parts.append(f"Genres: {', '.join(genres)}")
+                else:
+                    parts.append(f"Genres: {genres}")
+            if change_data.get("atmosphere"):
+                parts.append(f"Atmosphere: {change_data['atmosphere']}")
+            return "\n".join(parts) if parts else "(no changes)"
+
+        if change_type == "edit_story_outline":
+            parts = []
+            if change_data.get("main_storyline"):
+                parts.append(f"Main Storyline:\n{change_data['main_storyline'][:300]}")
+            if change_data.get("subplots"):
+                parts.append(f"Subplots:\n{change_data['subplots'][:300]}")
+            if change_data.get("conclusion"):
+                parts.append(f"Conclusion:\n{change_data['conclusion'][:300]}")
+            return "\n\n".join(parts) if parts else "(no changes)"
+
+        if change_type == "regenerate_framework":
+            return "The entire framework will be regenerated. This is destructive."
+
+        if change_type == "edit_series_bible":
+            parts = []
+            for key in ("setting_description", "time_period", "rules_and_lore", "tone"):
+                val = change_data.get(key, "")
+                if val:
+                    parts.append(f"{key.replace('_', ' ').title()}: {val[:200]}")
+            return "\n".join(parts) if parts else "(no changes)"
+
+        if change_type in ("edit_identity_block", "approve_identity_block"):
+            entity_name = change_data.get("entity_name", "")
+            entity_type = change_data.get("entity_type", "")
+            if change_type == "approve_identity_block":
+                return f"{entity_name} ({entity_type}): Mark as approved"
+            user_notes = change_data.get("user_notes", "")
+            return f"{entity_name} ({entity_type}):\n{user_notes[:300]}" if user_notes else f"{entity_name}: (no changes)"
+
         return ""
     
     def apply_change(self, change_type: str, change_data: dict):
         """Apply a change to the screenplay."""
         try:
-            # Handle character outline edits - they don't need generation
+            # --- Direct-apply change types (no AI generation needed) ---
+
             if change_type == "edit_character_outline":
-                # Verify we have the necessary data
                 character_name = change_data.get("character_name", "")
                 character_outline = change_data.get("character_outline", "")
                 character_growth_arc = change_data.get("character_growth_arc", "")
-                
-                # Debug: Check if data exists
+
                 if not character_name:
-                    # Try to extract from user_request or description if available
                     user_request = change_data.get("user_request", "")
                     description = change_data.get("description", "")
-                    
-                    # Try to find character name from context
                     if self.screenplay and self.screenplay.story_outline:
                         characters = self.screenplay.story_outline.get("characters", [])
                         if characters and isinstance(characters, list):
-                            # Look for character name in user request or description
                             import re
                             search_text = (user_request + " " + description).lower()
                             for char in characters:
@@ -1658,44 +1817,90 @@ class AIChatPanel(QWidget):
                                         character_name = char_name
                                         change_data["character_name"] = character_name
                                         break
-                
+
                 if not character_name:
                     QMessageBox.warning(self, "Error", "No character name provided. Please specify which character's outline to edit.")
                     return
-                
                 if not character_outline and not character_growth_arc:
                     QMessageBox.warning(self, "Error", "No character outline or growth arc provided in the suggestion.")
                     return
-                
-                # Debug: Log what we're about to apply
-                print(f"DEBUG apply_change: character_name={character_name}, outline_len={len(character_outline) if character_outline else 0}, growth_len={len(character_growth_arc) if character_growth_arc else 0}")
-                print(f"DEBUG apply_change: change_data keys before emit: {list(change_data.keys())}")
-                
-                # Ensure all data is in change_data
+
                 change_data["character_name"] = character_name
                 if character_outline:
                     change_data["character_outline"] = character_outline
                 if character_growth_arc:
                     change_data["character_growth_arc"] = character_growth_arc
-                
-                print(f"DEBUG apply_change: About to emit signal with change_type={change_type}")
-                print(f"DEBUG apply_change: Final change_data keys: {list(change_data.keys())}")
-                if character_outline:
-                    print(f"DEBUG apply_change: character_outline preview: {character_outline[:100]}...")
-                
-                # Emit signal to apply the change (main window will handle it)
+
                 self.changes_applied.emit(change_type, change_data)
-                print(f"DEBUG apply_change: Signal emitted successfully")
                 self.add_message("system", f"Character outline for {character_name} has been updated.")
                 return
-            
-            # For regenerate operations, we need to call AI methods first if not already generated
+
+            if change_type == "edit_premise":
+                has_data = any(change_data.get(k) for k in ("premise", "title", "genres", "atmosphere"))
+                if not has_data:
+                    QMessageBox.warning(self, "Error", "No premise data provided.")
+                    return
+                self.changes_applied.emit(change_type, change_data)
+                self.add_message("system", "Story premise updated.")
+                return
+
+            if change_type == "edit_story_outline":
+                has_data = any(change_data.get(k) for k in ("main_storyline", "subplots", "conclusion"))
+                if not has_data:
+                    QMessageBox.warning(self, "Error", "No story outline data provided.")
+                    return
+                self.changes_applied.emit(change_type, change_data)
+                self.add_message("system", "Story outline updated.")
+                return
+
+            if change_type == "edit_series_bible":
+                has_data = any(change_data.get(k) for k in ("setting_description", "time_period", "rules_and_lore", "tone"))
+                if not has_data:
+                    QMessageBox.warning(self, "Error", "No series bible data provided.")
+                    return
+                self.changes_applied.emit(change_type, change_data)
+                self.add_message("system", "Series Bible updated.")
+                return
+
+            if change_type == "edit_identity_block":
+                entity_name = change_data.get("entity_name", "")
+                if not entity_name:
+                    QMessageBox.warning(self, "Error", "No entity name provided.")
+                    return
+                self.changes_applied.emit(change_type, change_data)
+                self.add_message("system", f"Identity block for {entity_name} updated.")
+                return
+
+            if change_type == "approve_identity_block":
+                entity_name = change_data.get("entity_name", "")
+                if not entity_name:
+                    QMessageBox.warning(self, "Error", "No entity name provided.")
+                    return
+                self.changes_applied.emit(change_type, change_data)
+                self.add_message("system", f"Identity block for {entity_name} approved.")
+                return
+
+            if change_type == "remove_items":
+                if not self.selected_items:
+                    QMessageBox.warning(self, "Error", "No storyboard items selected to remove.")
+                    return
+                self.changes_applied.emit(change_type, change_data)
+                self.add_message("system", f"Removed {len(self.selected_items)} storyboard item(s).")
+                return
+
+            if change_type == "regenerate_framework":
+                if not change_data.get("confirm"):
+                    QMessageBox.warning(self, "Error", "Framework regeneration not confirmed.")
+                    return
+                self.changes_applied.emit(change_type, change_data)
+                self.add_message("system", "Framework regeneration started...")
+                return
+
+            # --- AI-generation change types ---
+
             if change_type in ["regenerate_scene", "edit_scene"] and self.current_scene and self.ai_generator:
-                # Only generate if not already generated (e.g., during preview)
-                # If new_content exists, we'll let on_chat_changes_applied handle merging for paragraph edits
                 if "new_content" not in change_data or not change_data.get("new_content"):
                     user_request = change_data.get("user_request", "")
-                    # If user_request is empty, try to build it from edits or description
                     if not user_request or change_type == "edit_scene":
                         edits = change_data.get("edits", {})
                         if isinstance(edits, dict) and "new_content" in edits:
@@ -1705,46 +1910,53 @@ class AIChatPanel(QWidget):
                                 user_request = f"Use this content: {new_content[:100]}"
                         elif isinstance(edits, list) and edits:
                             user_request = "Apply these changes: " + " ".join(str(e) for e in edits[:2])
-                        
-                        # Fallback to description if still empty
                         if not user_request:
                             description = change_data.get("description", "")
                             if description:
                                 user_request = description
                             else:
                                 user_request = "Edit this scene" if change_type == "edit_scene" else "Regenerate this scene"
-                    
+
                     new_content = self.ai_generator.regenerate_scene_content(
                         self.current_scene, user_request, self.screenplay
                     )
                     change_data["new_content"] = new_content
+
             elif change_type == "regenerate_items" and self.selected_items and self.ai_generator and self.current_scene:
-                # Only generate if not already generated (e.g., during preview)
                 if "new_items" not in change_data or not change_data.get("new_items"):
                     user_request = change_data.get("user_request", "Regenerate these items")
                     new_items = self.ai_generator.regenerate_storyboard_items(
                         self.current_scene, self.selected_items, user_request, self.screenplay
                     )
                     change_data["new_items"] = new_items
-            
-            # Verify we have the necessary data before emitting
-            if change_type == "edit_character_outline":
-                # Already handled above
-                pass
-            elif change_type in ["regenerate_scene", "edit_scene"]:
-                # Check if this is a character_focus edit - those don't need new_content
+
+            elif change_type == "add_items" and self.current_scene and self.ai_generator:
+                if "new_items" not in change_data or not change_data.get("new_items"):
+                    user_request = change_data.get("user_request", "Add storyboard items")
+                    new_items = self.ai_generator.regenerate_storyboard_items(
+                        self.current_scene, [], user_request, self.screenplay
+                    )
+                    change_data["new_items"] = new_items
+
+            # --- Validation before emit ---
+
+            if change_type in ["regenerate_scene", "edit_scene"]:
                 edits = change_data.get("edits", {})
-                is_char_focus_edit = isinstance(edits, dict) and "character_focus" in edits
-                
-                if not is_char_focus_edit and not change_data.get("new_content"):
+                is_prop_edit = isinstance(edits, dict) and any(
+                    k in edits for k in ("character_focus", "description", "title", "estimated_duration")
+                )
+                if not is_prop_edit and not change_data.get("new_content"):
                     QMessageBox.warning(self, "Error", "No content to apply. Please try again.")
                     return
             elif change_type == "regenerate_items":
                 if not change_data.get("new_items"):
                     QMessageBox.warning(self, "Error", "No items to apply. Please try again.")
                     return
-            
-            # Emit signal to apply changes
+            elif change_type == "add_items":
+                if not change_data.get("new_items"):
+                    QMessageBox.warning(self, "Error", "No items to add. Please try again.")
+                    return
+
             self.changes_applied.emit(change_type, change_data)
             self.add_message("system", f"Changes applied: {change_type.replace('_', ' ')}")
         except Exception as e:
