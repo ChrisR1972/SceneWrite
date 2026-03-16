@@ -381,34 +381,13 @@ async function buildMacOS(project, stagingDir, outputDir, logFn) {
   }
 
   const frameworksDir = path.join(contentsDir, 'Frameworks');
-  fs.mkdirSync(frameworksDir, { recursive: true });
-
-  function findPythonLib(searchDir) {
-    if (!fs.existsSync(searchDir)) return null;
-    for (const name of fs.readdirSync(searchDir)) {
-      if (name === 'Python' || name === 'Python3' ||
-          /^libpython3\.\d+/i.test(name) ||
-          /^python3\.\d+/i.test(name)) {
-        const full = path.join(searchDir, name);
-        if (fs.statSync(full).isFile()) return full;
-      }
-    }
-    return null;
-  }
-
   const internalDir = path.join(macosDir, '_internal');
-  let pythonLib = findPythonLib(internalDir) || findPythonLib(macosDir);
-
-  if (pythonLib) {
-    const dest = path.join(frameworksDir, 'Python');
-    fs.copyFileSync(pythonLib, dest);
-    logFn(`Copied ${path.basename(pythonLib)} to Contents/Frameworks/Python`);
+  if (fs.existsSync(internalDir)) {
+    fs.symlinkSync('MacOS/_internal', frameworksDir);
+    logFn('Linked Contents/Frameworks -> MacOS/_internal');
   } else {
-    logFn('Warning: Python shared library not found in _internal/ or MacOS/');
-    if (fs.existsSync(internalDir)) {
-      logFn('  _internal/ contents: ' + fs.readdirSync(internalDir).slice(0, 20).join(', '));
-    }
-    logFn('  MacOS/ contents: ' + fs.readdirSync(macosDir).slice(0, 20).join(', '));
+    fs.mkdirSync(frameworksDir, { recursive: true });
+    logFn('Warning: _internal/ not found, created empty Frameworks/');
   }
 
   const executablePath = path.join(macosDir, project.macos.executable);
