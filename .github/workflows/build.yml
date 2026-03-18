@@ -70,6 +70,18 @@ jobs:
           choco install nsis -y
           echo "C:\Program Files (x86)\NSIS" >> $env:GITHUB_PATH
 
+      - name: Sync version into SceneWrite.mpsc
+        run: |
+          VERSION=$(python -c "exec(open('config.py').read().split('class')[0]); print(APP_VERSION)")
+          echo "Syncing version to $VERSION"
+          python -c "
+          import json, sys
+          with open('SceneWrite.mpsc', 'r') as f: data = json.load(f)
+          data['appVersion'] = '$VERSION'
+          with open('SceneWrite.mpsc', 'w') as f: json.dump(data, f, indent=2)
+          "
+        shell: bash
+
       - name: Build with PyInstaller
         run: pyinstaller --clean --noconfirm screenplay_tool.spec
         shell: bash
