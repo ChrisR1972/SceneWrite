@@ -3600,8 +3600,18 @@ class StoryFrameworkView(QWidget):
         """Handle edits to the identity block text area."""
         if getattr(self, '_loading_char_selection', False):
             return
+        if not self.screenplay:
+            return
         entity_id = self._get_current_char_entity_id()
-        if entity_id and self.screenplay:
+        if not entity_id:
+            row = self.char_details_list.currentRow()
+            story_outline = getattr(self.screenplay, 'story_outline', {})
+            characters = story_outline.get("characters", []) if isinstance(story_outline, dict) else []
+            if 0 <= row < len(characters) and isinstance(characters[row], dict):
+                char_name = str(characters[row].get("name", "")).strip()
+                if char_name:
+                    entity_id = self.screenplay.create_placeholder_identity_block(char_name, "character")
+        if entity_id:
             ib_text = self.char_identity_block_edit.toPlainText().strip()
             self.screenplay.update_identity_block_metadata(entity_id, identity_block=ib_text)
         self._update_identity_block_buttons()
@@ -4199,6 +4209,8 @@ class StoryFrameworkView(QWidget):
             return
 
         entity_id = self._get_current_char_entity_id()
+        if not entity_id:
+            entity_id = self.screenplay.create_placeholder_identity_block(char_name, "character")
         scene_context = ""
         if self.current_scene:
             scene_context = getattr(self.current_scene, "description", "") or ""
@@ -4263,6 +4275,8 @@ class StoryFrameworkView(QWidget):
             return
 
         entity_id = self._get_current_char_entity_id()
+        if not entity_id:
+            entity_id = self.screenplay.create_placeholder_identity_block(char_name, "character")
 
         progress = QProgressDialog(
             f"Approving and generating reference prompt for {char_name}...", None, 0, 0, self)

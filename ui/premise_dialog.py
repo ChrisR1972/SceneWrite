@@ -19,7 +19,7 @@ class PremiseGenerationThread(QThread):
     finished = pyqtSignal(str)
     error = pyqtSignal(str)
     
-    def __init__(self, ai_generator, genres, atmosphere, workflow_profile=None, brand_context=None, rejected_premises=None):
+    def __init__(self, ai_generator, genres, atmosphere, workflow_profile=None, brand_context=None, rejected_premises=None, series_premise=None, episode_number=0, total_episodes=0, episode_plan=None):
         super().__init__()
         self.ai_generator = ai_generator
         self.genres = genres
@@ -27,6 +27,10 @@ class PremiseGenerationThread(QThread):
         self.workflow_profile = workflow_profile
         self.brand_context = brand_context
         self.rejected_premises = rejected_premises or []
+        self.series_premise = series_premise
+        self.episode_number = episode_number
+        self.total_episodes = total_episodes
+        self.episode_plan = episode_plan
     
     def run(self):
         """Generate premise in background thread."""
@@ -39,6 +43,10 @@ class PremiseGenerationThread(QThread):
                 workflow_profile=self.workflow_profile,
                 brand_context=self.brand_context,
                 rejected_premises=self.rejected_premises,
+                series_premise=self.series_premise,
+                episode_number=self.episode_number,
+                total_episodes=self.total_episodes,
+                episode_plan=self.episode_plan,
             )
             # Ensure premise is not None or empty
             if premise and premise.strip():

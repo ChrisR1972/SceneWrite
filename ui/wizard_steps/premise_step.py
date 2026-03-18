@@ -263,6 +263,38 @@ class PremiseStepWidget(QWidget):
         self._length = length
         self._intent = intent
         self.update_ui_for_profile()
+
+    def set_series_info(self, series_premise: str = "", episode_number: int = 0, total_episodes: int = 0, episode_plan=None):
+        """Set series context so the premise generator can ground episodes in the series arc."""
+        self._series_premise = series_premise
+        self._episode_number = episode_number
+        self._total_episodes = total_episodes
+        self._episode_plan = episode_plan
+
+    def lock_series_settings(self, genres: List[str], atmosphere: str, main_char_count: int = 0):
+        """Lock genre, atmosphere, and character count for series episodes 2+.
+
+        These are series-level decisions established in Episode 1 and stored in
+        the series bible. They should not change between episodes.
+        """
+        self._series_locked = True
+        self._locked_genres = list(genres)
+        self._locked_atmosphere = atmosphere
+
+        for cb in self.genre_checkboxes:
+            cb.setChecked(cb.text() in genres)
+            cb.setEnabled(False)
+        self.genre_group.setTitle(f"Series Genres (locked): {', '.join(genres)}")
+
+        self.atmosphere_combo.setCurrentText(atmosphere)
+        self.atmosphere_combo.setEnabled(False)
+        self.atmosphere_label.setText(f"Series Tone (locked):")
+
+        self.character_count_spinbox.setVisible(False)
+        self.character_count_label.setVisible(False)
+        self.character_count_hint.setText(
+            f"Main characters are carried forward from the Series Bible ({main_char_count} established)."
+        )
     
     def _update_character_count_hint(self, value: int):
         """Update the character count hint label when spinbox changes."""
@@ -449,6 +481,10 @@ class PremiseStepWidget(QWidget):
             workflow_profile=profile,
             brand_context=brand_context,
             rejected_premises=list(self._rejected_premises),
+            series_premise=getattr(self, '_series_premise', None),
+            episode_number=getattr(self, '_episode_number', 0),
+            total_episodes=getattr(self, '_total_episodes', 0),
+            episode_plan=getattr(self, '_episode_plan', None),
         )
         self.premise_thread.finished.connect(self.on_premise_generated)
         self.premise_thread.error.connect(self.on_premise_error)

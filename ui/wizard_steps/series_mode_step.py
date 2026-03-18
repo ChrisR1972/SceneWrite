@@ -8,7 +8,7 @@ series, or adding a new episode to an existing series.
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QRadioButton,
     QButtonGroup, QComboBox, QGroupBox, QLineEdit, QPushButton,
-    QMessageBox, QSizePolicy,
+    QMessageBox, QSizePolicy, QSpinBox, QTextEdit,
 )
 from PyQt6.QtCore import pyqtSignal
 from typing import Optional, Dict, Any
@@ -66,12 +66,41 @@ class SeriesModeStepWidget(QWidget):
         # New series options
         self.new_series_group = QGroupBox("Series Details")
         ns_layout = QVBoxLayout(self.new_series_group)
+        ns_layout.setSpacing(8)
+        ns_layout.setContentsMargins(10, 14, 10, 10)
+
         ns_row = QHBoxLayout()
         ns_row.addWidget(QLabel("Series Title:"))
         self.series_title_edit = QLineEdit()
         self.series_title_edit.setPlaceholderText("Enter the title for your new series...")
         ns_row.addWidget(self.series_title_edit)
         ns_layout.addLayout(ns_row)
+
+        ep_count_row = QHBoxLayout()
+        ep_count_row.addWidget(QLabel("Planned Episodes:"))
+        self.episode_count_spin = QSpinBox()
+        self.episode_count_spin.setRange(2, 24)
+        self.episode_count_spin.setValue(6)
+        self.episode_count_spin.setToolTip(
+            "How many episodes in this series. The AI will distribute the "
+            "story arc across this many episodes instead of resolving everything at once."
+        )
+        ep_count_row.addWidget(self.episode_count_spin)
+        ep_count_row.addStretch()
+        ns_layout.addLayout(ep_count_row)
+
+        ns_layout.addWidget(QLabel("Series Premise:"))
+        self.series_premise_edit = QTextEdit()
+        self.series_premise_edit.setPlaceholderText(
+            "Describe the overarching concept for the entire series. "
+            "This is the big-picture idea that spans all episodes, not the plot of a single episode.\n\n"
+            "Example: An alien DJ named Nova Slate uses music to abduct humans for his dying "
+            "civilization, while a detective and a sound engineer close in on the truth."
+        )
+        self.series_premise_edit.setMinimumHeight(90)
+        self.series_premise_edit.setMaximumHeight(150)
+        ns_layout.addWidget(self.series_premise_edit)
+
         self.new_series_group.hide()
         layout.addWidget(self.new_series_group)
 
@@ -112,6 +141,8 @@ class SeriesModeStepWidget(QWidget):
 
         self.button_group.buttonClicked.connect(self._on_mode_changed)
         self.series_title_edit.textChanged.connect(lambda: self.mode_changed.emit())
+        self.series_premise_edit.textChanged.connect(lambda: self.mode_changed.emit())
+        self.episode_count_spin.valueChanged.connect(lambda: self.mode_changed.emit())
         self.episode_title_edit.textChanged.connect(lambda: self.mode_changed.emit())
 
     def _on_mode_changed(self):
@@ -145,6 +176,12 @@ class SeriesModeStepWidget(QWidget):
     def get_new_series_title(self) -> str:
         return self.series_title_edit.text().strip()
 
+    def get_episode_count(self) -> int:
+        return self.episode_count_spin.value()
+
+    def get_series_premise(self) -> str:
+        return self.series_premise_edit.toPlainText().strip()
+
     def get_selected_series_folder(self) -> str:
         idx = self.series_combo.currentIndex()
         if 0 <= idx < len(self._series_list):
@@ -159,7 +196,7 @@ class SeriesModeStepWidget(QWidget):
         if mode == self.MODE_STANDALONE:
             return True
         if mode == self.MODE_NEW_SERIES:
-            return bool(self.get_new_series_title())
+            return bool(self.get_new_series_title()) and bool(self.get_series_premise())
         if mode == self.MODE_NEW_EPISODE:
             return bool(self.get_selected_series_folder()) and bool(self._series_list)
         return False

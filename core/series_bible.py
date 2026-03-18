@@ -79,8 +79,25 @@ class SeriesBible:
         #     "goals": str,
         # }
 
+        # Series-level genre and atmosphere (locked after first episode)
+        self.genres: List[str] = []
+
         # Target episode duration for the series (0 = no custom duration)
         self.episode_duration_seconds: int = 0
+
+        # Planned series structure
+        self.planned_episode_count: int = 0
+        self.series_premise: str = ""
+        self.season_arc: List[Dict[str, Any]] = []
+        # Each entry: {
+        #     "episode_number": int,
+        #     "title_suggestion": str,
+        #     "episode_focus": str,
+        #     "plot_points": List[str],
+        #     "resolves": str,
+        #     "carries_forward": str,
+        #     "cliffhanger_or_hook": str,
+        # }
 
         # Chronological events auto-populated from episode summaries
         self.timeline_events: List[Dict[str, Any]] = []
@@ -106,7 +123,7 @@ class SeriesBible:
         # }
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d: Dict[str, Any] = {
             "series_title": self.series_title,
             "version": self.version,
             "created_at": self.created_at,
@@ -118,8 +135,18 @@ class SeriesBible:
             "factions_or_groups": self.factions_or_groups,
             "timeline_events": self.timeline_events,
             "episode_history": self.episode_history,
-            **({"episode_duration_seconds": self.episode_duration_seconds} if self.episode_duration_seconds > 0 else {}),
         }
+        if self.genres:
+            d["genres"] = self.genres
+        if self.episode_duration_seconds > 0:
+            d["episode_duration_seconds"] = self.episode_duration_seconds
+        if self.planned_episode_count > 0:
+            d["planned_episode_count"] = self.planned_episode_count
+        if self.series_premise:
+            d["series_premise"] = self.series_premise
+        if self.season_arc:
+            d["season_arc"] = self.season_arc
+        return d
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "SeriesBible":
@@ -139,7 +166,11 @@ class SeriesBible:
         bible.factions_or_groups = data.get("factions_or_groups", [])
         bible.timeline_events = data.get("timeline_events", [])
         bible.episode_history = data.get("episode_history", [])
+        bible.genres = data.get("genres", [])
         bible.episode_duration_seconds = data.get("episode_duration_seconds", 0)
+        bible.planned_episode_count = data.get("planned_episode_count", 0)
+        bible.series_premise = data.get("series_premise", "")
+        bible.season_arc = data.get("season_arc", [])
         return bible
 
     def save_to_file(self, filepath: str) -> None:
@@ -175,26 +206,91 @@ class SeriesBible:
                 return ep
         return None
 
+    # Common title prefixes stripped for fuzzy character matching
+    _TITLE_PREFIXES = (
+        "detective ", "dr. ", "dr ", "professor ", "prof. ", "prof ",
+        "captain ", "capt. ", "capt ", "sergeant ", "sgt. ", "sgt ",
+        "lieutenant ", "lt. ", "lt ", "officer ", "agent ", "general ",
+        "colonel ", "major ", "inspector ", "sheriff ", "judge ",
+        "king ", "queen ", "prince ", "princess ", "lord ", "lady ",
+        "sir ", "father ", "mother ", "sister ", "brother ", "elder ",
+        "chief ", "coach ", "ranger ", "senator ", "governor ", "mayor ",
+        "dj ", "mc ",
+    )
+
+    @staticmethod
+    def _normalize_char_name(name: str) -> str:
+        """Strip title prefixes and whitespace for fuzzy matching."""
+        n = name.strip().lower()
+        for prefix in SeriesBible._TITLE_PREFIXES:
+            if n.startswith(prefix):
+                n = n[len(prefix):].strip()
+                break
+        return n
+
     def get_character_by_name(self, name: str) -> Optional[Dict[str, Any]]:
         name_lower = name.strip().lower()
+        name_norm = self._normalize_char_name(name)
         for char in self.main_characters:
-            if char.get("name", "").strip().lower() == name_lower:
+            existing = char.get("name", "").strip().lower()
+            existing_norm = self._normalize_char_name(existing)
+            if existing == name_lower or existing_norm == name_norm:
+                return char
+            if existing_norm and name_norm and (
+                existing_norm in name_norm or name_norm in existing_norm
+            ):
                 return char
         return None
 
+    @staticmethod
+    def _normalize_location_name(name: str) -> str:
+        """Strip leading articles and whitespace for fuzzy location matching."""
+        import re
+        n = name.strip().lower()
+        n = re.sub(r"^(the|a|an)\s+", "", n).strip()
+        return n
+
     def get_location_by_name(self, name: str) -> Optional[Dict[str, Any]]:
         name_lower = name.strip().lower()
+        name_norm = self._normalize_location_name(name)
         for loc in self.recurring_locations:
-            if loc.get("name", "").strip().lower() == name_lower:
+            existing = loc.get("name", "").strip().lower()
+            existing_norm = self._normalize_location_name(existing)
+            if existing == name_lower or existing_norm == name_norm:
+                return loc
+            if existing_norm and name_norm and (
+                existing_norm in name_norm or name_norm in existing_norm
+            ):
                 return loc
         return None
 
     # ── Mutation helpers ─────────────────────────────────────────────
 
+    # Fields that must not change once set (visual consistency across episodes)
+    _IMMUTABLE_ONCE_SET = {"physical_appearance", "species", "growth_arc"}
+
     def add_character(self, character: Dict[str, Any]) -> None:
         existing = self.get_character_by_name(character.get("name", ""))
         if existing:
-            existing.update(character)
+            new_role = character.get("role", "")
+            old_role = existing.get("role", "")
+            for key, value in character.items():
+                if key == "role":
+                    if old_role == "main" and new_role == "minor":
+                        continue
+                if key == "name":
+                    if len(str(value)) <= len(str(existing.get("name", ""))):
+                        continue
+                if isinstance(value, str) and not value.strip():
+                    continue
+                if isinstance(value, list) and not value:
+                    continue
+                # Never overwrite immutable fields once they have content
+                if key in self._IMMUTABLE_ONCE_SET:
+                    old_val = existing.get(key, "")
+                    if isinstance(old_val, str) and old_val.strip():
+                        continue
+                existing[key] = value
         else:
             self.main_characters.append(character)
         self.updated_at = datetime.datetime.now().isoformat()
@@ -202,7 +298,15 @@ class SeriesBible:
     def add_location(self, location: Dict[str, Any]) -> None:
         existing = self.get_location_by_name(location.get("name", ""))
         if existing:
-            existing.update(location)
+            for key, value in location.items():
+                if key == "name":
+                    if len(str(value)) <= len(str(existing.get("name", ""))):
+                        continue
+                if isinstance(value, str) and not value.strip():
+                    continue
+                if isinstance(value, list) and not value:
+                    continue
+                existing[key] = value
         else:
             self.recurring_locations.append(location)
         self.updated_at = datetime.datetime.now().isoformat()
@@ -237,6 +341,10 @@ class SeriesBible:
         """Build a condensed context string for injection into AI prompts."""
         parts = []
         parts.append(f"SERIES: {self.series_title}")
+        if self.planned_episode_count > 0:
+            parts.append(f"PLANNED EPISODES: {self.planned_episode_count}")
+        if self.series_premise:
+            parts.append(f"SERIES PREMISE: {self.series_premise}")
 
         if self.world_context.get("setting_description"):
             parts.append(f"\nWORLD SETTING: {self.world_context['setting_description']}")

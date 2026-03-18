@@ -528,7 +528,7 @@ class AIGenerator:
             **kwargs
         )
 
-    def generate_premise(self, genres: List[str], atmosphere: str, return_raw: bool = False, workflow_profile=None, brand_context=None, rejected_premises: Optional[List[str]] = None) -> str:
+    def generate_premise(self, genres: List[str], atmosphere: str, return_raw: bool = False, workflow_profile=None, brand_context=None, rejected_premises: Optional[List[str]] = None, series_premise: Optional[str] = None, episode_number: int = 0, total_episodes: int = 0, episode_plan: Optional[Dict[str, Any]] = None) -> str:
         """Generate a story premise from genre and atmosphere selections.
         
         Args:
@@ -539,6 +539,10 @@ class AIGenerator:
             brand_context: BrandContext object for promotional workflows
             rejected_premises: Previously generated premises the user rejected;
                 the AI must avoid these themes, settings, and concepts entirely
+            series_premise: Overarching series concept to ground the episode premise
+            episode_number: Which episode this premise is for (1-based)
+            total_episodes: Total planned episodes in the series
+            episode_plan: Season arc plan for this specific episode (focus, plot_points, resolves, etc.)
         """
         
         if not self._adapter:
@@ -693,6 +697,45 @@ GENRE MIXING - MULTIPLE GENRES SELECTED:
                     f"{_numbered}\n"
                 )
 
+            # Build series context block for episode premise generation
+            _series_block = ""
+            if series_premise and episode_number > 0:
+                _ep_plan_block = ""
+                if episode_plan:
+                    _ep_focus = episode_plan.get("episode_focus", "")
+                    _ep_points = episode_plan.get("plot_points", [])
+                    _ep_resolves = episode_plan.get("resolves", "")
+                    _ep_carries = episode_plan.get("carries_forward", "")
+                    _ep_hook = episode_plan.get("cliffhanger_or_hook", "")
+                    _points_str = "\n".join(f"  - {p}" for p in _ep_points) if _ep_points else ""
+                    _ep_plan_block = f"""
+PLANNED SCOPE FOR THIS EPISODE (you MUST stay within this scope):
+  Focus: {_ep_focus}
+  Key plot points:
+{_points_str}
+  What this episode resolves: {_ep_resolves}
+  What remains UNRESOLVED for future episodes: {_ep_carries}
+  Episode ends with: {_ep_hook}
+"""
+                _is_finale = (episode_number == total_episodes)
+                _series_block = f"""
+EPISODIC SERIES CONTEXT — THIS IS CRITICAL:
+This premise is for EPISODE {episode_number} of {total_episodes} in a planned series.
+
+SERIES PREMISE (the overarching concept spanning ALL {total_episodes} episodes):
+{series_premise}
+{_ep_plan_block}
+STRICT EPISODE SCOPE RULES:
+- Generate a premise ONLY for what happens in THIS episode — not the whole series
+- The premise must cover ONLY the episode focus and plot points listed above
+- Do NOT include the series climax, final confrontation, or resolution of the main series conflict
+- Do NOT reveal the antagonist's true nature, backstory, or motivations beyond what the episode plan specifies
+- Do NOT describe events from later episodes (no final showdowns, no capturing the villain, no resolving the mystery)
+- The premise should end on the episode's hook or cliffhanger, NOT on a resolution
+- Keep the premise to 1-3 sentences describing ONLY this episode's events
+{"- This is the SERIES FINALE — you may resolve the main conflict" if _is_finale else "- This is a MID-SERIES episode — the main conflict MUST remain open"}
+"""
+
             prompt = f"""
 You are a professional screenwriter and story creator. Generate a compelling, cinematic story premise based on the following:
 
@@ -701,6 +744,7 @@ Atmosphere/Tone: {atmosphere}
 
 {genre_instruction}
 {_avoidance_block}
+{_series_block}
 Create a story premise that:
 - Is 1-3 sentences long
 - Is engaging and suitable for visual storytelling
@@ -1461,7 +1505,75 @@ That's it. Nothing else.
                 raise Exception(f"Failed to generate premise: Connection error. Please check your internet connection and API settings. Details: {error_message}")
             raise Exception(f"Failed to generate premise: {error_message}")
     
-    def generate_story_outline(self, premise: str, genres: List[str], atmosphere: str, title: str = "", workflow_profile=None, character_count: Optional[int] = None, length: str = "medium") -> Dict[str, Any]:
+    def generate_season_arc(self, series_premise: str, episode_count: int, genres: List[str], atmosphere: str) -> List[Dict[str, Any]]:
+        """Generate a high-level season arc that distributes the story across multiple episodes.
+
+        Returns a list of per-episode plans so the AI knows what to resolve
+        in each episode and what to hold back for later.
+        """
+        genre_str = ", ".join(genres) if genres else "Drama"
+        prompt = f"""You are a professional TV series showrunner planning a {episode_count}-episode season.
+
+SERIES PREMISE: {series_premise}
+GENRES: {genre_str}
+ATMOSPHERE/TONE: {atmosphere or 'Not specified'}
+TOTAL EPISODES: {episode_count}
+
+Plan the full season arc. For each episode, define:
+- A suggested title
+- The episode's primary focus / self-contained conflict
+- Key plot points for that episode (2-4 bullet points)
+- What gets resolved in this episode (episode-level conflict only)
+- What carries forward unresolved to future episodes
+- The cliffhanger or hook that leads into the next episode
+
+CRITICAL RULES:
+- The SERIES-LEVEL conflict must NOT be resolved until the FINAL episode.
+- Each episode must have its own self-contained mini-conflict that resolves within the episode.
+- Character arcs should develop GRADUALLY across episodes, not complete in one.
+- Episode 1 (pilot) introduces the world, characters, and central premise — it should end with a hook, NOT a resolution.
+- The penultimate episode should contain the biggest twist or setback.
+- The final episode contains the climax and series resolution.
+- Tension and stakes must ESCALATE across episodes.
+
+Return ONLY valid JSON — an array of {episode_count} objects:
+[
+  {{
+    "episode_number": 1,
+    "title_suggestion": "Pilot episode title",
+    "episode_focus": "What this episode is primarily about (2-3 sentences)",
+    "plot_points": ["point 1", "point 2", "point 3"],
+    "resolves": "What episode-level conflict gets wrapped up",
+    "carries_forward": "What remains unresolved for future episodes",
+    "cliffhanger_or_hook": "How this episode ends to pull viewers into the next"
+  }}
+]"""
+
+        response = self._chat_completion(
+            model=self.model_settings["model"],
+            messages=[
+                {"role": "system", "content": "You are a professional TV series showrunner and story architect. Return ONLY valid JSON with no markdown fences or extra text."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=min(self.model_settings["max_tokens"] * 2, 4000),
+        )
+
+        content = response.choices[0].message.content
+        if not content:
+            raise Exception("AI returned empty response for season arc generation.")
+
+        content = content.strip()
+        if content.startswith("```"):
+            content = re.sub(r"^```(?:json)?\s*", "", content)
+            content = re.sub(r"\s*```$", "", content)
+
+        arc = json.loads(content)
+        if not isinstance(arc, list):
+            raise Exception("Season arc response is not a JSON array.")
+        return arc
+
+    def generate_story_outline(self, premise: str, genres: List[str], atmosphere: str, title: str = "", workflow_profile=None, character_count: Optional[int] = None, length: str = "medium", series_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Generate a comprehensive story outline with subplots, character outlines, character growth arcs, and conclusion.
         
         Args:
@@ -1693,7 +1805,104 @@ CHARACTER NAME UNIQUENESS (MANDATORY):
     "subplots": "Detailed description of 2-4 SUBPLOTS and secondary storylines that are SEPARATE from the main storyline. Each subplot should be 2-3 sentences. Explain how they relate to the main narrative and how they will be resolved. Format as a SINGLE STRING, not an array. DO NOT repeat the main storyline here.","""
             
             conclusion_number = "2" if is_micro_narrative else "3"
-            
+
+            # Build series-aware context injection
+            series_section = ""
+            conclusion_instructions = ""
+            is_mid_series_episode = False
+            if series_context:
+                ep_num = series_context.get("episode_number", 1)
+                total_eps = series_context.get("total_episodes", 1)
+                s_premise = series_context.get("series_premise", "")
+                bible_summary = series_context.get("series_bible_summary", "")
+                season_arc = series_context.get("season_arc", [])
+                is_finale = (ep_num == total_eps)
+                is_mid_series_episode = not is_finale
+
+                this_ep_plan = None
+                for ep_plan in season_arc:
+                    if ep_plan.get("episode_number") == ep_num:
+                        this_ep_plan = ep_plan
+                        break
+
+                series_section = f"\n{'='*60}\n"
+                series_section += f"MANDATORY EPISODIC SERIES CONSTRAINTS\n"
+                series_section += f"{'='*60}\n"
+                series_section += f"This is EPISODE {ep_num} of {total_eps} in a planned series.\n"
+                if s_premise:
+                    series_section += f"Series Premise: {s_premise}\n"
+
+                if this_ep_plan:
+                    series_section += f"\nEPISODE {ep_num} PLAN — YOUR OUTLINE MUST STAY WITHIN THIS SCOPE:\n"
+                    series_section += f"  Focus: {this_ep_plan.get('episode_focus', '')}\n"
+                    series_section += f"  Plot Points:\n"
+                    for pp in this_ep_plan.get("plot_points", []):
+                        series_section += f"    - {pp}\n"
+                    series_section += f"  What THIS episode resolves: {this_ep_plan.get('resolves', '')}\n"
+                    series_section += f"  What MUST remain unresolved: {this_ep_plan.get('carries_forward', '')}\n"
+                    series_section += f"  Episode must end with: {this_ep_plan.get('cliffhanger_or_hook', '')}\n"
+
+                if not is_finale:
+                    series_section += f"""
+ABSOLUTE PROHIBITIONS FOR THIS EPISODE:
+- Do NOT include a final confrontation or climax with the main antagonist
+- Do NOT resolve the series-level mystery or central conflict
+- Do NOT complete any character's full arc — show only THIS episode's growth
+- Do NOT reveal the antagonist's full backstory, true motives, or endgame
+- Do NOT have characters "save the day" or "stop the villain" — that comes later
+- Subplots must SET UP threads for future episodes, not RESOLVE entire arcs
+- The story must feel INCOMPLETE by design — this is one chapter of {total_eps}
+"""
+                else:
+                    series_section += "\nThis is the SERIES FINALE — resolve the main conflict and complete character arcs.\n"
+
+                if bible_summary:
+                    series_section += f"\n{bible_summary}\n"
+
+                # Enforce canonical character names from the bible
+                bible_chars = series_context.get("bible_characters") or []
+                if bible_chars:
+                    series_section += "\nMANDATORY CHARACTER NAMES (use these EXACT names in the characters array):\n"
+                    for bc in bible_chars:
+                        bc_name = bc.get("name", "")
+                        bc_role = bc.get("role", "")
+                        if bc_name:
+                            series_section += f"  - {bc_name} ({bc_role})\n"
+                    series_section += "You MUST use the exact character names listed above. Do NOT shorten, abbreviate, or drop prefixes (e.g. use 'DJ NOVA SLATE' not 'NOVA SLATE').\n"
+
+                series_section += f"{'='*60}\n"
+
+                if is_finale:
+                    conclusion_instructions = f"""{conclusion_number}. FINAL CONCLUSION (SERIES FINALE):
+   - This is the FINAL EPISODE of the series — resolve the series-level conflict
+   - Bring all major character arcs to completion
+   - Address the series premise and deliver the thematic payoff
+   - Should be 4-6 sentences with specific details
+   - CRITICAL: You MUST provide a conclusion - this field cannot be empty"""
+                else:
+                    conclusion_instructions = f"""{conclusion_number}. EPISODE ENDING (this is NOT a finale — {total_eps - ep_num} episodes remain):
+   - Resolve ONLY the mini-conflict specific to this episode (see "What THIS episode resolves" above)
+   - The series villain must NOT be defeated, captured, or fully confronted
+   - Major mysteries must remain unsolved — reveal only small clues
+   - End with: {this_ep_plan.get('cliffhanger_or_hook', 'a hook or cliffhanger') if this_ep_plan else 'a hook or cliffhanger'}
+   - Should be 4-6 sentences describing the episode ending and hook
+   - CRITICAL: You MUST provide an episode ending - this field cannot be empty"""
+            else:
+                conclusion_instructions = f"""{conclusion_number}. FINAL CONCLUSION:
+   - Describe how the main story resolves in detail
+   - Explain how key conflicts are resolved
+   - Describe the final state of the world/characters
+   - Include any themes or messages that are conveyed
+   - Should be 4-6 sentences with specific details
+   - CRITICAL: You MUST provide a conclusion - this field cannot be empty"""
+
+            conclusion_field_name = "episode_ending" if is_mid_series_episode else "conclusion"
+            conclusion_desc = (
+                "Episode ending: resolve ONLY the episode-level mini-conflict. End with a cliffhanger or hook for the next episode. Do NOT resolve the series conflict (4-6 sentences)."
+                if is_mid_series_episode
+                else "Final conclusion describing story resolution, conflict resolution, final state, and themes (4-6 sentences)."
+            )
+
             prompt = f"""
 You are a professional screenwriter and story structure expert. Expand the following story premise into a comprehensive story outline:
 
@@ -1701,7 +1910,7 @@ You are a professional screenwriter and story structure expert. Expand the follo
 Genres: {genre_text}
 Atmosphere/Tone: {atmosphere}
 {char_count_block}
-
+{series_section}
 Create a detailed story outline that includes:
 
 1. MAIN STORYLINE:
@@ -1711,22 +1920,17 @@ Create a detailed story outline that includes:
    - Include key plot points, conflicts, and story beats
    - Should be 5-8 sentences describing the core story progression in detail
    - This is the PRIMARY story, not a subplot
-   - CRITICAL: This must be a SUBSTANTIAL expansion of the premise, not a brief summary
+   - CRITICAL: This must be a SUBSTANTIAL expansion of the premise, not a brief summary{
+    chr(10) + "   - SERIES CONSTRAINT: Cover ONLY the plot points listed in the episode plan above. Do NOT jump ahead to events from later episodes." if is_mid_series_episode else ""}
 {subplots_section}
-{conclusion_number}. FINAL CONCLUSION:
-   - Describe how the main story resolves in detail
-   - Explain how key conflicts are resolved
-   - Describe the final state of the world/characters
-   - Include any themes or messages that are conveyed
-   - Should be 4-6 sentences with specific details
-   - CRITICAL: You MUST provide a conclusion - this field cannot be empty
+{conclusion_instructions}
 
 CRITICAL: You MUST return ONLY valid JSON. No markdown, no explanations, no code blocks.
 
 Format your response as a JSON object with this EXACT structure:
 {{
     "main_storyline": "Detailed expansion of the premise into the main story arc. Describe the primary narrative journey from beginning to end, including key plot points, conflicts, and story beats (5-8 sentences). This is the PRIMARY story.",{subplots_json}
-    "conclusion": "Final conclusion describing story resolution, conflict resolution, final state, and themes (4-6 sentences)."{char_json_block}
+    "{conclusion_field_name}": "{conclusion_desc}"{char_json_block}
 }}
 
 ENTITY MARKUP RULES (MANDATORY):
@@ -1747,9 +1951,15 @@ NARRATIVE GENERATION CONSTRAINT:
 - Example incorrect: GHOST GUYS PARANORMAL INVESTIGATORS (organization must not be in full caps). Or MIDNIGHT FALLS (locations must not be full caps).
 
 CRITICAL REQUIREMENTS FOR ALL FIELDS:
-- "main_storyline": MUST be 5-8 sentences expanding the premise into a detailed story arc. DO NOT just repeat the premise - EXPAND it with plot points, conflicts, and story beats.
-- "subplots": MUST contain 2-4 distinct subplots, each 2-3 sentences. This field MUST NOT be empty. Write all subplots as a single continuous text string (not an array).
-- "conclusion": MUST be 4-6 sentences describing how the story resolves. This field MUST NOT be empty.
+- "main_storyline": MUST be 5-8 sentences expanding the premise into a detailed story arc. DO NOT just repeat the premise - EXPAND it with plot points, conflicts, and story beats.{
+    ' Stay WITHIN the episode plan scope — do not include events from future episodes.' if is_mid_series_episode else ''
+}
+- "subplots": MUST contain 2-4 distinct subplots, each 2-3 sentences. This field MUST NOT be empty. Write all subplots as a single continuous text string (not an array).{
+    ' Subplots must PLANT SEEDS for future episodes — they should open questions, not answer them. Do NOT resolve subplot arcs that span the series.' if is_mid_series_episode else ''
+}
+- "{conclusion_field_name}": MUST be 4-6 sentences. This field MUST NOT be empty.{
+    ' This MUST be an episode ending with a hook/cliffhanger — NOT a series conclusion.' if is_mid_series_episode else ''
+}
 
 CRITICAL: The "subplots" field MUST be a STRING, not an array. Write all subplots as a single continuous text string.
 
@@ -1759,18 +1969,22 @@ IMPORTANT JSON RULES:
 - No trailing commas before closing braces or brackets
 - Ensure proper nesting of all brackets and braces
 - All text fields should be comprehensive and detailed
-- DO NOT leave any field empty - all fields (main_storyline, subplots, conclusion) MUST have substantial content
+- DO NOT leave any field empty - all fields (main_storyline, subplots, {conclusion_field_name}) MUST have substantial content
 """
         
         try:
+            _conclusion_or_ending = "episode_ending" if is_mid_series_episode else "conclusion"
+            system_msg = f"You are a professional screenwriter and story structure expert. All fields (main_storyline, subplots, {_conclusion_or_ending}) must be fully populated. CHARACTER OUTLINES AND GROWTH ARCS: Each must be 6-10 sentences — substantial and detailed. Avoid brief or shallow descriptions. ENTITY MARKUP: Individual characters (human or non-human) = FULL CAPS only (e.g. MAYA RIVERA, SHADOWFANG). Locations = Title Case + UNDERLINED (e.g. _Midnight Falls_, _City Hall_, _Common Area_). Vehicle interiors (the ship's Common Area, Bridge, Cockpit) are locations — use _underscores_, NOT curly braces. Only the vehicle itself uses curly braces. All locations must be underlined on every mention; characters never underlined. Locations never in full caps. ORGANIZATIONS/GROUPS/TEAMS/COMPANIES/BRANDS: NEVER in FULL CAPS — always Title Case (e.g. Ghost Guys Paranormal Investigators, Neurotech Industries). FULL CAPS is strictly reserved for individual character names. AI/SYNTHETIC ENTITIES: When the story includes an AI or computer system (e.g. AEON), always write 'the AI AEON' or 'AI AEON' — never just 'AEON' in full caps. AI entities are not human characters. MAIN CHARACTERS: The main characters in the characters array MUST each be explicitly named in the main_storyline. All must appear by name. CRITICAL: Do NOT invent characters — every character in the array MUST appear by name in the main_storyline. Never add made-up characters. NON-HUMAN CHARACTERS: Characters can be any species (dragons, elves, robots, animals, etc.). They still use FULL CAPS for their names and follow the same markup rules as human characters. NAME UNIQUENESS: Every character must have a completely unique name. No two characters may share any part of their name (first name, last name, title, or nickname). For example, QUEEN SERAPHINA and SERAPHINA LIGHTBRINGER is forbidden because both share SERAPHINA."
+            if is_mid_series_episode:
+                system_msg += f" SERIES EPISODE RULES: This is a mid-series episode. The JSON MUST use the key 'episode_ending' — do NOT use 'conclusion'. You MUST NOT resolve the series-level conflict. You MUST NOT defeat/capture/confront the main antagonist. You MUST NOT complete character arcs — show only this episode's partial growth. Subplots plant seeds for future episodes. The episode_ending field must describe a cliffhanger or hook that leaves the audience wanting more. Think of this as writing ONE chapter of a novel, not the whole book. The main villain MUST escape, remain hidden, or grow stronger — never be stopped."
             response = self._chat_completion(
                 model=self.model_settings["model"],
                 messages=[
-                    {"role": "system", "content": "You are a professional screenwriter and story structure expert. All fields (main_storyline, subplots, conclusion) must be fully populated. CHARACTER OUTLINES AND GROWTH ARCS: Each must be 6-10 sentences — substantial and detailed. Avoid brief or shallow descriptions. ENTITY MARKUP: Individual characters (human or non-human) = FULL CAPS only (e.g. MAYA RIVERA, SHADOWFANG). Locations = Title Case + UNDERLINED (e.g. _Midnight Falls_, _City Hall_, _Common Area_). Vehicle interiors (the ship's Common Area, Bridge, Cockpit) are locations — use _underscores_, NOT curly braces. Only the vehicle itself uses curly braces. All locations must be underlined on every mention; characters never underlined. Locations never in full caps. ORGANIZATIONS/GROUPS/TEAMS/COMPANIES/BRANDS: NEVER in FULL CAPS — always Title Case (e.g. Ghost Guys Paranormal Investigators, Neurotech Industries). FULL CAPS is strictly reserved for individual character names. AI/SYNTHETIC ENTITIES: When the story includes an AI or computer system (e.g. AEON), always write 'the AI AEON' or 'AI AEON' — never just 'AEON' in full caps. AI entities are not human characters. MAIN CHARACTERS: The main characters in the characters array MUST each be explicitly named in the main_storyline. All must appear by name. CRITICAL: Do NOT invent characters — every character in the array MUST appear by name in the main_storyline. Never add made-up characters. NON-HUMAN CHARACTERS: Characters can be any species (dragons, elves, robots, animals, etc.). They still use FULL CAPS for their names and follow the same markup rules as human characters. NAME UNIQUENESS: Every character must have a completely unique name. No two characters may share any part of their name (first name, last name, title, or nickname). For example, QUEEN SERAPHINA and SERAPHINA LIGHTBRINGER is forbidden because both share SERAPHINA."},
+                    {"role": "system", "content": system_msg},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.7,
-                max_tokens=max(self.model_settings["max_tokens"], 8000)  # Allow for detailed outline + long character outlines/growth arcs (6-10 sentences each)
+                max_tokens=min(max(self.model_settings["max_tokens"], 4000), 4096)
             )
             
             content = response.choices[0].message.content
@@ -1961,6 +2175,8 @@ IMPORTANT JSON RULES:
                             c["species"] = normalized
             else:
                 outline_data["characters"] = []
+            if "episode_ending" in outline_data and "conclusion" not in outline_data:
+                outline_data["conclusion"] = outline_data.pop("episode_ending")
             if "conclusion" not in outline_data:
                 outline_data["conclusion"] = ""
             else:
@@ -1975,7 +2191,8 @@ IMPORTANT JSON RULES:
                             premise, genres, atmosphere, title,
                             outline_data.get("main_storyline", ""),
                             outline_data.get("subplots", ""),
-                            outline_data.get("characters", [])
+                            outline_data.get("characters", []),
+                            series_context=series_context,
                         )
                         outline_data["conclusion"] = conclusion
                     except Exception as e:
@@ -3756,8 +3973,8 @@ IMPORTANT JSON RULES:
                 break  # one report per overlap type
         return (len(issues) == 0, issues)
     
-    def regenerate_conclusion(self, premise: str, genres: List[str], atmosphere: str, title: str = "", main_storyline: str = "", subplots: str = "", characters: List[Dict[str, Any]] = None) -> str:
-        """Regenerate just the conclusion based on the premise, main storyline, subplots, and characters."""
+    def regenerate_conclusion(self, premise: str, genres: List[str], atmosphere: str, title: str = "", main_storyline: str = "", subplots: str = "", characters: List[Dict[str, Any]] = None, series_context: Optional[Dict[str, Any]] = None) -> str:
+        """Regenerate just the conclusion (or episode ending for mid-series episodes)."""
         
         if not self._adapter:
             raise Exception("AI client not initialized. Please configure your API key or local AI server in settings.")
@@ -3774,8 +3991,46 @@ IMPORTANT JSON RULES:
         
         main_storyline_text = f"\nMain Storyline: {main_storyline}" if main_storyline else ""
         subplots_text = f"\nSubplots: {subplots}" if subplots else ""
-        
-        prompt = f"""
+
+        is_mid_series = False
+        series_block = ""
+        if series_context:
+            ep_num = series_context.get("episode_number", 1)
+            total_eps = series_context.get("total_episodes", 1)
+            is_mid_series = (ep_num != total_eps)
+            if is_mid_series:
+                ep_plan = None
+                for plan in (series_context.get("season_arc") or []):
+                    if plan.get("episode_number") == ep_num:
+                        ep_plan = plan
+                        break
+                series_block = f"\n\nSERIES CONTEXT: This is Episode {ep_num} of {total_eps}."
+                if ep_plan:
+                    series_block += f"\nThis episode resolves: {ep_plan.get('resolves', 'a local mini-conflict only')}"
+                    series_block += f"\nMust remain unresolved: {ep_plan.get('carries_forward', 'the series-level conflict')}"
+                    series_block += f"\nEnd with: {ep_plan.get('cliffhanger_or_hook', 'a cliffhanger or hook')}"
+
+        if is_mid_series:
+            prompt = f"""
+You are a professional screenwriter. Generate an EPISODE ENDING for a mid-series episode:
+
+{title_text}Premise: {premise}
+Genres: {genre_text}
+Atmosphere/Tone: {atmosphere}{main_storyline_text}{character_summary}{subplots_text}{series_block}
+
+Create a detailed episode ending (4-6 sentences) that:
+- Resolves ONLY the episode-level mini-conflict (NOT the series conflict)
+- Does NOT defeat, capture, or fully confront the main antagonist
+- Leaves major mysteries unsolved — reveal only small clues
+- Ends with a cliffhanger or hook that makes viewers want the next episode
+- Characters must NOT "save the day" or achieve final victory
+
+ENTITY MARKUP (MANDATORY): Characters = FULL CAPS only (e.g. MAYA RIVERA, ELIAS CROSS). Locations = Title Case + UNDERLINED (e.g. _Midnight Falls_, _City Hall_). All locations MUST be underlined on every mention. Characters must NEVER be underlined.
+
+Return ONLY the episode ending text, no additional formatting, no quotes, no labels.
+"""
+        else:
+            prompt = f"""
 You are a professional screenwriter and story structure expert. Generate a comprehensive final conclusion for this story:
 
 {title_text}Premise: {premise}
@@ -3795,10 +4050,13 @@ Return ONLY the conclusion text, no additional formatting, no quotes, no labels.
 """
         
         try:
+            sys_msg = "You are a professional screenwriter. ENTITY MARKUP: Characters = FULL CAPS only. Locations = Title Case + UNDERLINED (_Midnight Falls_, _City Hall_). All locations underlined on every mention; characters never underlined."
+            if is_mid_series:
+                sys_msg += " This is a MID-SERIES episode. Do NOT write a series finale. Write an episode ending with a cliffhanger."
             response = self._chat_completion(
                 model=self.model_settings["model"],
                 messages=[
-                    {"role": "system", "content": "You are a professional screenwriter. ENTITY MARKUP: Characters = FULL CAPS only. Locations = Title Case + UNDERLINED (_Midnight Falls_, _City Hall_). All locations underlined on every mention; characters never underlined."},
+                    {"role": "system", "content": sys_msg},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.7,

@@ -9,7 +9,7 @@ import shutil
 import sys
 from typing import Optional, Dict, Any
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 UPDATE_URL = "https://scenewrite.app/updates/latest.json"
 # License API — use workers.dev URL for testing, switch to api.scenewrite.app for production
 LICENSE_API_BASE = "https://api.scenewrite.app"

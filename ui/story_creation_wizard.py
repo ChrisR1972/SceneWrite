@@ -139,6 +139,7 @@ class StoryCreationWizard(QDialog):
         # Page 0: Step 0 - series mode selection (no scroll)
         self.series_mode_step = SeriesModeStepWidget()
         self.series_mode_step.mode_changed.connect(self.update_navigation)
+        self.series_mode_step.mode_changed.connect(self._resize_step0_for_mode)
         self.content_stack.addWidget(self.series_mode_step)
         
         # Page 1: Step 1 - length/intent only, no scroll area
@@ -217,10 +218,25 @@ class StoryCreationWizard(QDialog):
         """Resize wizard window: compact for Steps 0-1, full size for Steps 2-4."""
         if step_index <= 1:
             self.setMinimumSize(420, 180)
-            self.resize(540, 320 if step_index == 0 else 260)
+            if step_index == 0:
+                self._resize_step0_for_mode()
+            else:
+                self.resize(540, 260)
         else:
             self.setMinimumSize(self._full_width, self._full_height)
             self.resize(self._full_width, self._full_height)
+
+    def _resize_step0_for_mode(self):
+        """Resize step 0 based on whether series details or episode picker is visible."""
+        if self.current_step != 0:
+            return
+        mode = self.series_mode_step.get_mode()
+        if mode == SeriesModeStepWidget.MODE_NEW_SERIES:
+            self.resize(600, 520)
+        elif mode == SeriesModeStepWidget.MODE_NEW_EPISODE:
+            self.resize(600, 400)
+        else:
+            self.resize(540, 320)
     
     def update_navigation(self):
         """Update navigation buttons based on current step."""
@@ -295,6 +311,30 @@ class StoryCreationWizard(QDialog):
             self.custom_duration_seconds = self.length_intent_step.get_custom_duration_seconds()
             self.intent = self.length_intent_step.get_intent()
             self.premise_step.set_length_intent(self.length, self.intent)
+            if self.series_bible and self.series_bible.series_premise:
+                ep_num = self.series_bible.get_next_episode_number()
+                total = self.series_bible.planned_episode_count or 6
+                ep_plan = None
+                for plan in (self.series_bible.season_arc or []):
+                    if plan.get("episode_number") == ep_num:
+                        ep_plan = plan
+                        break
+                self.premise_step.set_series_info(
+                    series_premise=self.series_bible.series_premise,
+                    episode_number=ep_num,
+                    total_episodes=total,
+                    episode_plan=ep_plan,
+                )
+                # Lock genre, atmosphere, and character count for episodes 2+
+                if self.series_mode == SeriesModeStepWidget.MODE_NEW_EPISODE:
+                    bible_genres = getattr(self.series_bible, "genres", []) or []
+                    bible_tone = self.series_bible.world_context.get("tone", "")
+                    main_char_count = len([
+                        c for c in self.series_bible.main_characters
+                        if c.get("role") == "main"
+                    ])
+                    if bible_genres and bible_tone:
+                        self.premise_step.lock_series_settings(bible_genres, bible_tone, main_char_count)
         
         elif self.current_step == 2:
             # Moving from premise to outline
@@ -307,10 +347,32 @@ class StoryCreationWizard(QDialog):
             self.intent = premise_data.get("intent", "General Story")
             self.character_count = premise_data.get("character_count", 4)
             self.brand_context = premise_data.get("brand_context")
-            
+
+            # For series episodes 2+, use bible main char count so the AI
+            # generates entries for each existing character (with episode-specific arcs)
+            if (self.series_mode == SeriesModeStepWidget.MODE_NEW_EPISODE
+                    and self.series_bible and self.series_bible.main_characters):
+                bible_main_count = len([
+                    c for c in self.series_bible.main_characters
+                    if c.get("role") == "main"
+                ])
+                if bible_main_count > 0:
+                    self.character_count = bible_main_count
+
             workflow_profile = WorkflowProfileManager.get_profile(self.length, self.intent)
-            
+
+            series_context = self._build_series_context()
+
             if WorkflowProfileManager.requires_story_outline(workflow_profile):
+                # Pass bible characters to outline step for series episodes
+                bible_chars_for_outline = None
+                if (self.series_mode == SeriesModeStepWidget.MODE_NEW_EPISODE
+                        and self.series_bible and self.series_bible.main_characters):
+                    bible_chars_for_outline = [
+                        dict(c) for c in self.series_bible.main_characters
+                        if c.get("role") == "main"
+                    ]
+
                 self.outline_step.set_premise(
                     self.premise,
                     self.title,
@@ -318,8 +380,11 @@ class StoryCreationWizard(QDialog):
                     self.atmosphere,
                     self.character_count,
                     self.length,
-                    self.intent
+                    self.intent,
+                    series_context=series_context,
                 )
+                if bible_chars_for_outline:
+                    self.outline_step.set_bible_characters(bible_chars_for_outline)
             else:
                 self.story_outline = {}
                 self.current_step = 4
@@ -353,6 +418,8 @@ class StoryCreationWizard(QDialog):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to create series folder:\n{e}")
             return
+        self.series_bible.planned_episode_count = self.series_mode_step.get_episode_count()
+        self.series_bible.series_premise = self.series_mode_step.get_series_premise()
     
     def _init_new_episode(self) -> bool:
         """Load bible for a new episode. Returns False on failure."""
@@ -370,12 +437,71 @@ class StoryCreationWizard(QDialog):
         # Pre-fill atmosphere from bible
         if self.series_bible.world_context.get("tone"):
             self.atmosphere = self.series_bible.world_context["tone"]
+        # Pre-fill genres from bible
+        if getattr(self.series_bible, "genres", None):
+            self.genres = list(self.series_bible.genres)
         # Pre-fill custom duration from bible
         if getattr(self.series_bible, "episode_duration_seconds", 0) > 0:
             self.custom_duration_seconds = self.series_bible.episode_duration_seconds
             self.length_intent_step.set_custom_duration(self.series_bible.episode_duration_seconds)
+
+        # Guard: warn if all planned episodes have already been generated
+        planned = self.series_bible.planned_episode_count or 0
+        next_ep = self.series_bible.get_next_episode_number()
+        if planned > 0 and next_ep > planned:
+            reply = QMessageBox.question(
+                self, "Series Complete",
+                f"This series is planned for {planned} episodes and all {planned} have been generated.\n\n"
+                f"Do you want to create Episode {next_ep} beyond the planned count?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return False
+
         return True
     
+    def _build_series_context(self) -> Optional[Dict[str, Any]]:
+        """Build the series_context dict for series episodes, or None for standalone."""
+        if not self.series_bible or self.series_mode == SeriesModeStepWidget.MODE_STANDALONE:
+            return None
+
+        bible = self.series_bible
+
+        if not bible.season_arc and bible.series_premise and self.ai_generator:
+            try:
+                _safe_print("Generating season arc for new series...")
+                arc = self.ai_generator.generate_season_arc(
+                    series_premise=bible.series_premise,
+                    episode_count=bible.planned_episode_count or 6,
+                    genres=self.genres,
+                    atmosphere=self.atmosphere,
+                )
+                bible.season_arc = arc
+                import os
+                bible_path = os.path.join(self.series_folder, "series_bible.json")
+                bible.save_to_file(bible_path)
+                _safe_print(f"Season arc generated: {len(arc)} episodes planned")
+            except Exception as e:
+                _safe_print(f"Season arc generation failed: {e}")
+                QMessageBox.warning(
+                    self, "Season Arc",
+                    f"Could not generate season arc (the episode will still work):\n{e}"
+                )
+
+        ep_num = bible.get_next_episode_number()
+        return {
+            "season_arc": bible.season_arc,
+            "episode_number": ep_num,
+            "total_episodes": bible.planned_episode_count or len(bible.season_arc) or 1,
+            "series_premise": bible.series_premise,
+            "series_bible_summary": bible.get_series_summary_for_ai(),
+            "bible_characters": [
+                {"name": c.get("name", ""), "role": c.get("role", ""), "species": c.get("species", "")}
+                for c in bible.main_characters if c.get("name")
+            ],
+        }
+
     def _proceed_from_outline_to_framework(self):
         """Complete transition from outline step to framework generation. Generates missing physical appearances first if needed."""
         # Use outline's (possibly edited) premise
@@ -385,10 +511,13 @@ class StoryCreationWizard(QDialog):
             self.premise_step.generated_premise_display.setPlainText(edited_premise)
         # Get outline data (syncs UI to outline_data)
         self.story_outline = self.outline_step.get_outline_data()
+        # Enforce bible character data before framework generation
+        self._enforce_bible_characters_on_outline()
 
         def do_transition():
             # Re-fetch outline data (may have been updated by batch physical generation)
             self.story_outline = self.outline_step.get_outline_data()
+            self._enforce_bible_characters_on_outline()
             self.framework_step.start_generation(
                 self.premise, self.title, self.genres, self.atmosphere,
                 self.story_outline, self.length, self.intent, self.brand_context,
@@ -426,6 +555,9 @@ class StoryCreationWizard(QDialog):
 
         self.generated_screenplay = screenplay
         # Store story outline in screenplay
+        screenplay.story_outline = self.story_outline
+        # Enforce bible character data before building the registry
+        self._enforce_bible_characters_on_outline()
         screenplay.story_outline = self.story_outline
         # Build and freeze Character Registry: single source of truth for characters.
         # Sanitize: remove corporations (e.g. NEUROTECH), merge surname-only duplicates (e.g. MAYFIELD → LUCILLE MAYFIELD).
@@ -526,6 +658,31 @@ class StoryCreationWizard(QDialog):
                     cleaned_lower.add(name.lower())
 
         screenplay.character_registry = list(dict.fromkeys(cleaned))  # preserve order, dedupe
+
+        # Correct registry names to canonical bible names (e.g. "NOVA SLATE" → "DJ NOVA SLATE")
+        if self.series_bible:
+            from core.series_bible import SeriesBible as _SB
+            corrected_registry = []
+            corrected_lower = set()
+            for rname in screenplay.character_registry:
+                bible_char = self.series_bible.get_character_by_name(rname)
+                canonical = bible_char.get("name", rname) if bible_char else rname
+                if canonical.lower() not in corrected_lower:
+                    corrected_registry.append(canonical)
+                    corrected_lower.add(canonical.lower())
+            screenplay.character_registry = corrected_registry
+
+            # Also correct character_focus in scenes to use canonical names
+            for act in (screenplay.acts or []):
+                for scene in (act.scenes or []):
+                    if scene.character_focus:
+                        corrected_focus = []
+                        for cf in scene.character_focus:
+                            cf_name = (cf or "").strip()
+                            bc = self.series_bible.get_character_by_name(cf_name) if cf_name else None
+                            corrected_focus.append(bc.get("name", cf_name) if bc else cf_name)
+                        scene.character_focus = corrected_focus
+
         screenplay.character_registry_frozen = True
         # Store length, intent, and custom duration for Premise tab / workflow profile
         screenplay.story_length = self.length
@@ -559,6 +716,8 @@ class StoryCreationWizard(QDialog):
                         existing_characters=existing_chars,
                     )
                     phys = (result.get("physical_appearance", "") or "").strip()
+                    if self._is_ai_refusal(phys):
+                        phys = ""
                 except Exception as e:
                     _safe_print(f"  Warning: could not generate appearance for minor character {display_name}: {e}")
                 from core.ai_generator import infer_species_from_text
@@ -619,10 +778,136 @@ class StoryCreationWizard(QDialog):
                 "status": "draft",
                 "filename": SeriesManager.build_episode_filename(ep_num, ep_title),
             })
+
+            # Auto-populate bible with characters, locations, and world context
+            self._auto_populate_bible(screenplay)
+
             SeriesManager.save_series_bible(self.series_folder, self.series_bible)
 
         self.update_navigation()
     
+    def _enforce_bible_characters_on_outline(self):
+        """For series episodes, overwrite AI-generated character data with canonical bible values.
+
+        The AI often drifts on names (DJ NOVA SLATE → NOVA SLATE), physical appearances,
+        species, and roles. This method enforces the bible as the single source of truth
+        for persistent character identity while keeping the AI's episode-specific outline
+        and growth_arc.
+        """
+        if not self.series_bible or self.series_mode == SeriesModeStepWidget.MODE_STANDALONE:
+            return
+
+        from core.series_bible import SeriesBible as _SB
+        bible = self.series_bible
+        outline_chars = self.story_outline.get("characters", [])
+        if not outline_chars:
+            return
+
+        # Immutable fields that come from the bible (visual consistency across episodes)
+        _BIBLE_FIELDS = ("name", "physical_appearance", "species", "role")
+
+        for char in outline_chars:
+            if not isinstance(char, dict) or not char.get("name"):
+                continue
+            bible_char = bible.get_character_by_name(char.get("name", ""))
+            if bible_char:
+                for field in _BIBLE_FIELDS:
+                    bible_val = bible_char.get(field, "")
+                    if isinstance(bible_val, str) and bible_val.strip():
+                        char[field] = bible_val
+
+        self.story_outline["characters"] = outline_chars
+
+    @staticmethod
+    def _is_ai_refusal(text: str) -> bool:
+        """Detect AI refusal messages masquerading as generated content."""
+        if not text or not isinstance(text, str):
+            return False
+        t = text.strip().lower()
+        refusal_markers = [
+            "i apologize", "i cannot generate", "i don't have any information",
+            "does not explicitly appear", "doesn't appear in the given",
+            "cannot create a description", "not present in any of the given",
+            "without making up details", "without inventing",
+        ]
+        return any(marker in t for marker in refusal_markers)
+
+    def _auto_populate_bible(self, screenplay: Screenplay):
+        """Populate the series bible with characters, locations, and world context from the generated screenplay."""
+        from core.series_bible import SeriesBible as _SB
+
+        bible = self.series_bible
+        if not bible:
+            return
+
+        outline_chars = self.story_outline.get("characters", [])
+
+        # Deduplicate outline characters before adding to bible.
+        # The AI sometimes generates "DETECTIVE MAYA CHEN" and "MAYA CHEN"
+        # as separate entries — keep the longer/more detailed one.
+        deduped_chars: list = []
+        for char in outline_chars:
+            if not isinstance(char, dict) or not char.get("name"):
+                continue
+            name = char.get("name", "").strip()
+            norm = _SB._normalize_char_name(name)
+            merged = False
+            for kept in deduped_chars:
+                kept_norm = _SB._normalize_char_name(kept.get("name", ""))
+                if kept_norm == norm or (kept_norm and norm and (
+                    kept_norm in norm or norm in kept_norm
+                )):
+                    # Merge: keep the longer name and richer data
+                    if len(name) > len(kept.get("name", "")):
+                        kept["name"] = name
+                    for field in ("outline", "growth_arc", "physical_appearance", "species"):
+                        new_val = (char.get(field, "") or "").strip()
+                        old_val = (kept.get(field, "") or "").strip()
+                        if new_val and len(new_val) > len(old_val):
+                            kept[field] = new_val
+                    if char.get("role") == "main":
+                        kept["role"] = "main"
+                    merged = True
+                    break
+            if not merged:
+                deduped_chars.append(dict(char))
+
+        for char in deduped_chars:
+            phys = char.get("physical_appearance", "")
+            if self._is_ai_refusal(phys):
+                phys = ""
+            bible.add_character({
+                "name": char.get("name", ""),
+                "role": char.get("role", "main"),
+                "species": char.get("species", "human"),
+                "physical_appearance": phys,
+                "personality_traits": [],
+                "relationships": [],
+                "growth_arc": char.get("growth_arc", ""),
+            })
+
+        storyline = self.story_outline.get("main_storyline", "") or ""
+        subplots = self.story_outline.get("subplots", "") or ""
+        combined = f"{storyline} {subplots}"
+        import re as _re
+        loc_matches = _re.findall(r"_([^_]+)_", combined)
+        seen_locs = set()
+        for loc_name in loc_matches:
+            loc_name = loc_name.strip()
+            if not loc_name or loc_name.lower() in seen_locs:
+                continue
+            seen_locs.add(loc_name.lower())
+            bible.add_location({"name": loc_name, "description": ""})
+
+        if not bible.world_context.get("setting_description") and self.atmosphere:
+            bible.world_context["tone"] = self.atmosphere
+        if not bible.world_context.get("setting_description") and self.genres:
+            bible.world_context["setting_description"] = f"A {', '.join(self.genres)} story."
+
+        # Store genres in bible (locked for all future episodes)
+        if not bible.genres and self.genres:
+            bible.genres = list(self.genres)
+
     def finish_wizard(self):
         """Complete the wizard and emit the screenplay."""
         if not self.generated_screenplay:

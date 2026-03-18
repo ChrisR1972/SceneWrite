@@ -56,7 +56,7 @@ class StoryOutlineGenerationThread(QThread):
     finished = pyqtSignal(dict)  # Emits outline data
     error = pyqtSignal(str)
     
-    def __init__(self, ai_generator, premise, title, genres, atmosphere, workflow_profile=None, character_count=None, length="medium"):
+    def __init__(self, ai_generator, premise, title, genres, atmosphere, workflow_profile=None, character_count=None, length="medium", series_context=None):
         super().__init__()
         self.ai_generator = ai_generator
         self.premise = premise
@@ -66,12 +66,14 @@ class StoryOutlineGenerationThread(QThread):
         self.workflow_profile = workflow_profile
         self.character_count = character_count
         self.length = length
-    
+        self.series_context = series_context
+
     def run(self):
         """Generate outline in background thread."""
         try:
             outline = self.ai_generator.generate_story_outline(
-                self.premise, self.genres, self.atmosphere, self.title, self.workflow_profile, self.character_count, self.length
+                self.premise, self.genres, self.atmosphere, self.title, self.workflow_profile, self.character_count, self.length,
+                series_context=self.series_context,
             )
             # Validate outline structure
             if not isinstance(outline, dict):
@@ -224,6 +226,9 @@ class StoryOutlineStepWidget(QWidget):
         self.workflow_profile: Optional[WorkflowProfile] = None
         self.length: str = "medium"
         self.intent: str = "General Story"
+        self.series_context: Optional[Dict[str, Any]] = None
+        self._bible_characters: List[Dict[str, Any]] = []
+        self._bible_char_names_lower: set = set()
         self.init_ui()
     
     def init_ui(self):
@@ -409,10 +414,10 @@ class StoryOutlineStepWidget(QWidget):
         # Characters section (conditional - hidden for promotional)
         self.characters_group = QGroupBox("Main Characters (Outline and Growth Arc)")
         characters_layout = QVBoxLayout()
-        characters_hint = QLabel("Main characters (from Step 2) get outline and growth arc here. They must appear first in the storyline and in Character Details. Minor characters may appear in the storyline/subplots by name and role only—no outline or arc.")
-        characters_hint.setStyleSheet("color: #666; font-size: 10px; font-weight: bold;")
-        characters_hint.setWordWrap(True)
-        characters_layout.addWidget(characters_hint)
+        self._characters_hint = QLabel("Main characters (from Step 2) get outline and growth arc here. They must appear first in the storyline and in Character Details. Minor characters may appear in the storyline/subplots by name and role only—no outline or arc.")
+        self._characters_hint.setStyleSheet("color: #666; font-size: 10px; font-weight: bold;")
+        self._characters_hint.setWordWrap(True)
+        characters_layout.addWidget(self._characters_hint)
         
         # Generate Character Details button (names are filled when conclusion is generated; details on demand)
         if self.ai_generator:
@@ -552,6 +557,16 @@ class StoryOutlineStepWidget(QWidget):
                     self.generate_character_details_button.setToolTip(
                         "AI will generate physical appearance for all main characters."
                     )
+            elif self._bible_characters:
+                self.characters_group.setTitle("Series Characters (Name & Appearance locked from Bible)")
+                self.char_outline_label.show()
+                self.char_outline_edit.show()
+                self.char_growth_label.show()
+                self.char_growth_edit.show()
+                if hasattr(self, 'generate_character_details_button'):
+                    self.generate_character_details_button.setToolTip(
+                        "AI will generate episode-specific outline and growth arc. Name and appearance are locked from the Series Bible."
+                    )
             else:
                 self.characters_group.setTitle("Main Characters (Outline and Growth Arc)")
                 self.char_outline_label.show()
@@ -569,7 +584,7 @@ class StoryOutlineStepWidget(QWidget):
             self.visual_motifs_group.hide()
             self.call_to_action_group.hide()
     
-    def set_premise(self, premise: str, title: str, genres: List[str], atmosphere: str, character_count: int = 4, length: str = "medium", intent: str = "General Story"):
+    def set_premise(self, premise: str, title: str, genres: List[str], atmosphere: str, character_count: int = 4, length: str = "medium", intent: str = "General Story", series_context=None):
         """Set premise data for outline generation."""
         self.premise = premise
         self.title = title
@@ -578,6 +593,7 @@ class StoryOutlineStepWidget(QWidget):
         self.character_count = character_count
         self.length = length
         self.intent = intent
+        self.series_context = series_context
         self.workflow_profile = WorkflowProfileManager.get_profile(length, intent)
         
         # Update UI based on workflow profile
@@ -594,6 +610,41 @@ class StoryOutlineStepWidget(QWidget):
         self.premise_meta_label.setText(f"Title: {safe_title} | Genres: {safe_genres} | Atmosphere: {safe_atmosphere}")
         self.premise_text.setPlainText(processed_premise if processed_premise else "")
     
+    def set_bible_characters(self, bible_chars: List[Dict[str, Any]]):
+        """Store bible main characters for series episodes 2+.
+
+        These characters will be injected into the outline after AI generation,
+        and their name + physical_appearance fields will be read-only in the editor.
+        """
+        from core.series_bible import SeriesBible as _SB
+        self._bible_characters = list(bible_chars) if bible_chars else []
+        self._bible_char_names_lower = set()
+        for c in self._bible_characters:
+            name = c.get("name", "")
+            if name:
+                self._bible_char_names_lower.add(name.strip().lower())
+                norm = _SB._normalize_char_name(name)
+                if norm:
+                    self._bible_char_names_lower.add(norm.lower())
+        if self._bible_characters:
+            names = [c.get("name", "") for c in self._bible_characters if c.get("name")]
+            self._characters_hint.setText(
+                f"Series main characters ({', '.join(names)}) are locked from the Series Bible. "
+                f"Name and physical appearance cannot be changed. "
+                f"The AI will generate episode-specific outline and growth arc for each."
+            )
+            self.update_ui_for_profile()
+
+    def _is_bible_character(self, name: str) -> bool:
+        """Check if a character name matches one from the series bible."""
+        if not self._bible_characters or not name:
+            return False
+        from core.series_bible import SeriesBible as _SB
+        name_lower = name.strip().lower()
+        norm = _SB._normalize_char_name(name)
+        return (name_lower in self._bible_char_names_lower
+                or (norm and norm.lower() in self._bible_char_names_lower))
+
     def generate_outline(self):
         """Generate story outline using AI."""
         if not self.ai_generator:
@@ -628,7 +679,8 @@ class StoryOutlineStepWidget(QWidget):
         
         # Create and start generation thread (pass character_count for exact N character declaration)
         self.outline_thread = StoryOutlineGenerationThread(
-            self.ai_generator, self.premise, self.title, self.genres, self.atmosphere, self.workflow_profile, getattr(self, 'character_count', 4), self.length
+            self.ai_generator, self.premise, self.title, self.genres, self.atmosphere, self.workflow_profile, getattr(self, 'character_count', 4), self.length,
+            series_context=getattr(self, 'series_context', None),
         )
         self.outline_thread.finished.connect(self.on_outline_generated)
         self.outline_thread.error.connect(self.on_outline_error)
@@ -750,6 +802,41 @@ class StoryOutlineStepWidget(QWidget):
             if current_item:
                 self.on_character_selected(current_item, None)
     
+    def _populate_bible_characters(self):
+        """Inject bible main characters into the outline, merging AI-generated episode arcs.
+
+        Bible characters provide the canonical name and physical_appearance (read-only).
+        The AI's outline and growth_arc for the episode are preserved if the AI generated
+        entries that match the bible characters by name.
+        """
+        from core.series_bible import SeriesBible as _SB
+
+        # Build a lookup from the AI-generated character list
+        ai_chars = self.outline_data.get("characters") or []
+        ai_map: dict = {}
+        for c in (ai_chars if isinstance(ai_chars, list) else []):
+            if isinstance(c, dict) and c.get("name"):
+                norm = _SB._normalize_char_name(str(c["name"]).strip())
+                if norm:
+                    ai_map[norm.lower()] = c
+
+        result = []
+        for bc in self._bible_characters:
+            name = bc.get("name", "")
+            norm = _SB._normalize_char_name(name)
+            ai_match = ai_map.get(norm.lower()) if norm else None
+            result.append({
+                "name": name,
+                "outline": (ai_match.get("outline", "") if ai_match else "") or "",
+                "growth_arc": (ai_match.get("growth_arc", "") if ai_match else "") or "",
+                "physical_appearance": bc.get("physical_appearance", ""),
+                "role": bc.get("role", "main"),
+                "species": bc.get("species", ""),
+            })
+
+        self.outline_data["characters"] = result
+        self._apply_characters_to_ui(result)
+
     def _deduplicate_characters(self, characters: list) -> list:
         """Remove duplicate characters (exact match or same person, e.g. LYRA vs LYRA DAVIS)."""
         if not characters or not isinstance(characters, list):
@@ -784,8 +871,14 @@ class StoryOutlineStepWidget(QWidget):
         
         Prefers the ai_generator's processed characters (already extracted and deduplicated).
         Only re-extracts when the incoming character list is empty, has placeholders, or has duplicates.
+        For series episodes 2+, bible characters are injected directly with locked identity fields.
         """
         if not self.outline_data:
+            return
+
+        # For series episodes 2+, inject bible characters with their locked identity
+        if self._bible_characters:
+            self._populate_bible_characters()
             return
         
         main_storyline = str(self.outline_data.get("main_storyline", "")).strip()
@@ -1913,16 +2006,36 @@ TASK: Create a new character that fits naturally into this story. The character 
                     self.char_outline_edit.setPlainText(str(char.get("outline", "")))
                     self.char_growth_edit.setPlainText(str(char.get("growth_arc", "")))
                     self.char_physical_edit.setPlainText(str(char.get("physical_appearance", "")))
+
+                    # Lock name and physical appearance for bible characters
+                    is_bible = self._is_bible_character(str(char.get("name", "")))
+                    self.char_name_edit.setReadOnly(is_bible)
+                    self.char_physical_edit.setReadOnly(is_bible)
+                    if is_bible:
+                        locked_style = "background-color: #f0f0f0; color: #555;"
+                        self.char_name_edit.setStyleSheet(locked_style)
+                        self.char_physical_edit.setStyleSheet(locked_style)
+                    else:
+                        self.char_name_edit.setStyleSheet("")
+                        self.char_physical_edit.setStyleSheet("")
                 else:
                     self.char_name_edit.clear()
                     self.char_outline_edit.clear()
                     self.char_growth_edit.clear()
                     self.char_physical_edit.clear()
+                    self.char_name_edit.setReadOnly(False)
+                    self.char_physical_edit.setReadOnly(False)
+                    self.char_name_edit.setStyleSheet("")
+                    self.char_physical_edit.setStyleSheet("")
             else:
                 self.char_name_edit.clear()
                 self.char_outline_edit.clear()
                 self.char_growth_edit.clear()
                 self.char_physical_edit.clear()
+                self.char_name_edit.setReadOnly(False)
+                self.char_physical_edit.setReadOnly(False)
+                self.char_name_edit.setStyleSheet("")
+                self.char_physical_edit.setStyleSheet("")
         except Exception as e:
             # Prevent crash on error
             _safe_print(f"Error loading character: {e}")
