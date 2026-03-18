@@ -72,7 +72,7 @@ jobs:
 
       - name: Sync version into SceneWrite.mpsc
         run: |
-          VERSION=$(python -c "exec(open('config.py').read().split('class')[0]); print(APP_VERSION)")
+          VERSION=$(python -c "import re; print(re.search(r'APP_VERSION\s*=\s*\"(.+?)\"', open('config.py').read()).group(1))")
           echo "Syncing version to $VERSION"
           python -c "
           import json, sys
@@ -127,7 +127,7 @@ jobs:
             echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
             echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
           else
-            VERSION=$(python -c "exec(open('config.py').read().split('class')[0]); print(APP_VERSION)")
+            VERSION=$(python -c "import re; print(re.search(r'APP_VERSION\s*=\s*\"(.+?)\"', open('config.py').read()).group(1))")
             echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
             echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           fi
